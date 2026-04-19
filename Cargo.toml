@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-rtmp"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-rtmp"
+homepage = "https://github.com/OxideAV/oxideav-rtmp"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust RTMP (ingest + push) for oxideav — server accepts publishers, client pushes to remote servers, with a pluggable key-verification hook"
+readme = "README.md"
+keywords = ["multimedia", "rtmp", "streaming", "live", "pure-rust"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+# Pure-Rust, zero external deps. Std only (`std::net::TcpListener`,
+# `std::thread::spawn`). Both sides of the wire live in this crate.
