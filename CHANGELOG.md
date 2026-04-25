@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-rtmp/releases/tag/v0.0.1) - 2026-04-19
+
+### Other
+
+- Initial commit: pure-Rust RTMP ingest + push
+
 ### Added
 
 - Initial release: pure-Rust RTMP with zero external dependencies.
