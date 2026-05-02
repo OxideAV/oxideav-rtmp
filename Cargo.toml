@@ -13,5 +13,8 @@ keywords = ["multimedia", "rtmp", "streaming", "live", "pure-rust"]
 categories = ["multimedia", "network-programming"]
 
 [dependencies]
-# Pure-Rust, zero external deps. Std only (`std::net::TcpListener`,
-# `std::thread::spawn`). Both sides of the wire live in this crate.
+# Protocol layer is std-only (`std::net::TcpListener`, `std::thread::spawn`).
+# `oxideav-core` is pulled in solely so we can implement the
+# `PacketSource` trait the workspace's `SourceRegistry` consumes —
+# a tiny dependency-light foundation crate, no third-party transitives.
+oxideav-core = "0.1"

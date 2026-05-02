@@ -31,6 +31,7 @@
 //! * AMF3, shared objects, RTMFP, RTMP Encrypted, and the Adobe
 //!   digest-verified handshake variant.
 
+pub mod adapter;
 pub mod amf;
 pub mod chunk;
 pub mod client;
@@ -40,6 +41,10 @@ pub mod handshake;
 pub mod message;
 pub mod server;
 
+pub use adapter::{
+    audio_codec_id, audio_to_packet, open_rtmp, register, video_codec_id, video_to_packet,
+    RtmpPacketSource, AUDIO_STREAM_INDEX, RTMP_TIME_BASE, VIDEO_STREAM_INDEX,
+};
 pub use client::{RtmpClient, RtmpUrl};
 pub use error::{Error, Result};
 pub use flv::{AudioTag, VideoTag};

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SourceRegistry` integration via `register(registry)`.** New
+  `RtmpPacketSource` adapter implements
+  `oxideav_core::PacketSource`, wrapping an `RtmpSession` and
+  emitting `oxideav_core::Packet`s on stream 0 (audio) and
+  stream 1 (video) with `TimeBase 1/1000` (RTMP's native
+  millisecond unit). Codec ids resolved from the first audio +
+  video tags via `audio_codec_id` / `video_codec_id`
+  (`aac`/`mp3`/`pcm_*`/`speex`/`nellymoser` for audio,
+  `h264`/`h263`/`vp6f`/`vp6a`/`flashsv`/`flashsv2` for video).
+  AVC composition-time offsets are applied to PTS;
+  sequence-header packets carry the `header` flag and
+  AVCDecoderConfigurationRecord / AudioSpecificConfig in
+  `CodecParameters::extradata`. Listen-style opener:
+  `rtmp://host:port/app/stream-name` URIs bind a one-shot
+  listener that accepts one publisher and validates the
+  announced app + stream-name against the URL path. The
+  historical `RtmpServer::accept` / `RtmpClient::connect` API is
+  unchanged — registry support is purely additive.
+- New integration test (`tests/packet_source.rs`) round-trips a
+  synthetic publisher → registry opener → `PacketSource` flow,
+  asserting stream descriptors, packet ordering, pts/dts, and
+  the `header` / `keyframe` flags.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.1...v0.0.2) - 2026-04-25
 
 ### Other

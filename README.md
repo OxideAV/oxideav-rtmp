@@ -76,6 +76,31 @@ client.close()?;
   Speex, …) work end-to-end but the framing helpers focus on
   `VIDEO_CODEC_AVC` + `AUDIO_FORMAT_AAC`.
 
+## Pipeline integration (`SourceRegistry`)
+
+Wire `rtmp://` URIs into the workspace's
+[`oxideav_core::SourceRegistry`] so the pipeline executor reads
+RTMP streams via the same dispatch as `file://` and `http(s)://`:
+
+```rust
+use oxideav_core::SourceRegistry;
+let mut reg = SourceRegistry::new();
+oxideav_rtmp::register(&mut reg);
+// `rtmp://host:port/app/stream-name` opens a one-shot listener
+// that accepts a single publisher and surfaces it as a
+// `PacketSource` (audio = stream 0, video = stream 1, both with
+// time_base 1/1000). Codec ids are auto-detected from the
+// publisher's first audio + video tags (h264, aac, mp3, h263,
+// vp6f / vp6a, flashsv / flashsv2).
+let _src = reg.open("rtmp://0.0.0.0:1935/live/secret-key")?;
+```
+
+The opener is **listen-style**: each `open()` binds the URL's
+`host:port`, accepts one publisher, validates the announced
+`app` + `stream_name` against the URL path (rejects on
+mismatch), then hands packets to the registry. For multi-client
+service, keep using [`RtmpServer::serve`] directly.
+
 ## Reusable building blocks
 
 The lower-level modules are public so callers can compose something
