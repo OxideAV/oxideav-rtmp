@@ -71,10 +71,16 @@ client.close()?;
 - **AMF0 command flow.** AMF3, shared objects, RTMFP, and the
   Adobe digest-verified handshake are not implemented; they're
   essentially unused in modern ingest workflows.
-- **H.264 + AAC** are the expected payloads. The crate passes
-  through FLV tag bytes verbatim, so other codecs (MP3, H.263,
-  Speex, …) work end-to-end but the framing helpers focus on
-  `VIDEO_CODEC_AVC` + `AUDIO_FORMAT_AAC`.
+- **H.264 + AAC** are the canonical legacy payloads, plus
+  **Enhanced RTMP v1** (Veovera 2023) FourCC video codecs:
+  `hvc1` (HEVC / H.265), `av01` (AV1), `vp09` (VP9). Sequence-start
+  (HEVCDecoderConfigurationRecord / `AV1CodecConfigurationRecord` /
+  `VPCodecConfigurationRecord`), `CodedFrames`, `CodedFramesX`
+  (CTS=0 omitted), `SequenceEnd`, and the HDR `PacketTypeMetadata`
+  (`colorInfo`) frames all round-trip via `flv::parse_video` /
+  `flv::build_video`. The crate passes through FLV tag bytes
+  verbatim, so additional codecs (MP3, H.263, Speex, …) keep
+  working too.
 
 ## Pipeline integration (`SourceRegistry`)
 
@@ -90,8 +96,10 @@ oxideav_rtmp::register(&mut reg);
 // that accepts a single publisher and surfaces it as a
 // `PacketSource` (audio = stream 0, video = stream 1, both with
 // time_base 1/1000). Codec ids are auto-detected from the
-// publisher's first audio + video tags (h264, aac, mp3, h263,
-// vp6f / vp6a, flashsv / flashsv2).
+// publisher's first audio + video tags (h264, hevc, av1, vp9 in
+// Enhanced-RTMP FourCC mode; h264, h263, vp6f / vp6a, flashsv /
+// flashsv2 for legacy single-byte codec ids; aac, mp3, pcm_*,
+// speex, nellymoser for audio).
 let _src = reg.open("rtmp://0.0.0.0:1935/live/secret-key")?;
 ```
 

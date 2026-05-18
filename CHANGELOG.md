@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Enhanced RTMP v1 video framing** (Veovera 2023). `flv::parse_video`
+  / `flv::build_video` now recognise the `IsExHeader` flag in the
+  high bit of the video-tag header byte and handle the
+  `FourCC`-based extended header (`hvc1` / `av01` / `vp09`) per
+  `enhanced-rtmp-v1.pdf` §"Defining Additional Video Codecs",
+  Table 4. All five `PacketType` values round-trip:
+  `SequenceStart` (codec configuration record — `HEVCDecoder
+  ConfigurationRecord` / `AV1CodecConfigurationRecord` /
+  `VPCodecConfigurationRecord`), `CodedFrames`, `CodedFramesX`
+  (the SI24=0 wire-size optimisation), `SequenceEnd`, and
+  `PacketTypeMetadata` (HDR `colorInfo`). The SI24
+  `CompositionTime` is emitted only for the one shape that
+  carries it — HEVC × `CodedFrames` — matching the spec's
+  "CompositionTime Offset is implied to equal zero" exception
+  for the non-HEVC FourCCs and `CodedFramesX`. New `VideoTag`
+  fields `ex_packet_type: Option<u8>` and `fourcc: Option<[u8;
+  4]>` are the discriminators; legacy publishers leave both
+  `None` and the parser/builder follow the pre-2023 single-byte
+  `CodecID` path unchanged.
+- **FourCC → `CodecId` mapping.** New
+  `adapter::video_fourcc_codec_id([u8; 4]) -> CodecId` resolves
+  `hvc1`/`av01`/`vp09` to `"hevc"`/`"av1"`/`"vp9"`, and the new
+  dispatcher `adapter::video_codec_id_for_tag(&VideoTag) ->
+  CodecId` selects legacy vs FourCC off `tag.fourcc.is_some()`.
+  `video_codec_params` now copies the body of any Enhanced-RTMP
+  `PacketTypeSequenceStart` tag into `CodecParameters.extradata`
+  (matching the existing AVC behaviour), so downstream HEVC /
+  AV1 / VP9 decoders pick up their configuration record without
+  re-parsing the packet stream.
+- **Packet flags propagated for Enhanced RTMP**. `video_to_packet`
+  now sets `flags.header = true` for both legacy AVC
+  sequence-headers and Enhanced-RTMP `PacketTypeSequenceStart`,
+  preserves the keyframe bit for `CodedFrames(X)`, and
+  suppresses `keyframe` while setting `header` for
+  `PacketTypeMetadata` (per spec: "presence of
+  PacketTypeMetadata means that FrameType flags at the top of
+  this table should be ignored"). The HEVC × `CodedFrames`
+  SI24 CTS is applied to `pts` the same way AVC's CTS is, so a
+  B-frame publisher with a non-zero composition-time offset
+  gets the correct `dts != pts` split on the consumer side.
+- New `EX_PACKET_TYPE_*` / `FOURCC_*` / `VIDEO_IS_EX_HEADER`
+  public constants in `flv` so callers composing
+  `VideoTag` literals (e.g. an Enhanced-RTMP-aware push
+  client) don't have to repeat the spec's magic numbers.
+- New integration test (`tests/enhanced_rtmp_video.rs`)
+  exercises wire-byte → `Packet` flow for HEVC keyframes, HEVC
+  negative-CTS, AV1 CodedFrames, VP9 SequenceStart, and a
+  build-parse-build idempotence sweep across all six
+  FourCC × PacketType combinations the spec defines.
+
+### Notes
+
+- The `connect` command's `fourCcList` advertisement (Enhanced
+  RTMP v1 Table 5) is **not** populated by the client yet — a
+  publisher using `RtmpClient::connect` will negotiate as a
+  legacy AVC-only client. Manually-composed `VideoTag` literals
+  with `fourcc = Some(..)` going through `flv::build_video` still
+  produce correct wire bytes; only the high-level publish helper
+  declines to opt in until a future round adds a configurable
+  codec list to `RtmpClient`.
+- AMF3 message bodies are still not parsed (TagType 15 /
+  Command type 17 / Data type 15 / Shared-Object type 16). The
+  legacy RTMP 1.0 AMF0 flow is what every commodity ingest
+  endpoint negotiates, but a follow-up round can lift the
+  `amf` module to AMF3 once the `docs/streaming/rtmp/amf3-*.pdf`
+  spec is transcribed.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.2...v0.0.3) - 2026-05-03
 
 ### Other

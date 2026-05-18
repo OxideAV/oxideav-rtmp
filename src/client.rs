@@ -186,6 +186,8 @@ impl RtmpClient {
             avc_packet_type: Some(flv::AVC_PACKET_TYPE_SEQUENCE_HEADER),
             composition_time: 0,
             body: avc_c.to_vec(),
+            ex_packet_type: None,
+            fourcc: None,
         };
         self.send_video_tag(0, &tag)
     }
@@ -204,6 +206,8 @@ impl RtmpClient {
             avc_packet_type: Some(flv::AVC_PACKET_TYPE_NALU),
             composition_time: 0,
             body: body.to_vec(),
+            ex_packet_type: None,
+            fourcc: None,
         };
         self.send_video_tag(timestamp_ms, &tag)
     }

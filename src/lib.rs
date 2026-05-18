@@ -42,8 +42,9 @@ pub mod message;
 pub mod server;
 
 pub use adapter::{
-    audio_codec_id, audio_to_packet, open_rtmp, register, video_codec_id, video_to_packet,
-    RtmpPacketSource, AUDIO_STREAM_INDEX, RTMP_TIME_BASE, VIDEO_STREAM_INDEX,
+    audio_codec_id, audio_to_packet, open_rtmp, register, video_codec_id, video_codec_id_for_tag,
+    video_fourcc_codec_id, video_to_packet, RtmpPacketSource, AUDIO_STREAM_INDEX, RTMP_TIME_BASE,
+    VIDEO_STREAM_INDEX,
 };
 pub use client::{RtmpClient, RtmpUrl};
 pub use error::{Error, Result};

@@ -76,9 +76,8 @@ use crate::flv::{
     self, AudioTag, VideoTag, AAC_PACKET_TYPE_SEQUENCE_HEADER, AUDIO_FORMAT_AAC,
     AUDIO_FORMAT_ADPCM, AUDIO_FORMAT_G711_ALAW, AUDIO_FORMAT_G711_MULAW, AUDIO_FORMAT_MP3,
     AUDIO_FORMAT_NELLYMOSER, AUDIO_FORMAT_NELLYMOSER_16K_MONO, AUDIO_FORMAT_NELLYMOSER_8K_MONO,
-    AUDIO_FORMAT_PCM_LE, AUDIO_FORMAT_PCM_LE_8BIT, AUDIO_FORMAT_SPEEX,
-    AVC_PACKET_TYPE_SEQUENCE_HEADER, VIDEO_CODEC_AVC, VIDEO_CODEC_H263, VIDEO_CODEC_SCREEN,
-    VIDEO_CODEC_SCREEN_V2, VIDEO_CODEC_VP6, VIDEO_CODEC_VP6A,
+    AUDIO_FORMAT_PCM_LE, AUDIO_FORMAT_PCM_LE_8BIT, AUDIO_FORMAT_SPEEX, VIDEO_CODEC_AVC,
+    VIDEO_CODEC_H263, VIDEO_CODEC_SCREEN, VIDEO_CODEC_SCREEN_V2, VIDEO_CODEC_VP6, VIDEO_CODEC_VP6A,
 };
 use crate::server::{RtmpServer, RtmpSession, StreamPacket};
 
@@ -368,16 +367,33 @@ pub fn audio_to_packet(timestamp_ms: u32, tag: &AudioTag) -> Packet {
 /// nibble; sequence-header packets are flagged `header`.
 pub fn video_to_packet(timestamp_ms: u32, tag: &VideoTag) -> Packet {
     let dts = timestamp_ms as i64;
-    let pts = if tag.codec_id == VIDEO_CODEC_AVC {
+    // CTS lives in two places on the wire — AVC's 3-byte
+    // SI24 (legacy), and HEVC × Enhanced-RTMP `CodedFrames`'s
+    // SI24 (per Enhanced RTMP v1 Table 4, the only Enhanced
+    // shape that carries CTS). `parse_video` normalises both
+    // into `tag.composition_time`; AV1 and VP9 leave it zero.
+    let has_cts =
+        tag.codec_id == VIDEO_CODEC_AVC || (tag.fourcc.is_some() && tag.composition_time != 0);
+    let pts = if has_cts {
         dts + tag.composition_time as i64
     } else {
         dts
     };
-    let is_avc_seq_header = tag.codec_id == VIDEO_CODEC_AVC
-        && tag.avc_packet_type == Some(AVC_PACKET_TYPE_SEQUENCE_HEADER);
+    // `header` is set for *both* legacy AVC sequence headers and
+    // Enhanced-RTMP `PacketTypeSequenceStart` tags — downstream
+    // consumers can stash the body as `CodecParameters.extradata`
+    // regardless of codec.
+    let is_header = tag.is_avc_sequence_header() || tag.is_ex_sequence_header();
+    // `PacketTypeMetadata` (Enhanced RTMP `colorInfo` etc.) is
+    // not real frame data — surface it as a header-flagged
+    // packet so a downstream consumer can route it to the
+    // codec-parameters / HDR-metadata path instead of the
+    // decoder. Per spec, FrameType bits are ignored when this
+    // is set, so suppress the keyframe flag too.
+    let is_metadata = tag.is_ex_metadata();
     let flags = oxideav_core::packet::PacketFlags {
-        keyframe: tag.is_keyframe(),
-        header: is_avc_seq_header,
+        keyframe: !is_metadata && tag.is_keyframe(),
+        header: is_header || is_metadata,
         ..Default::default()
     };
     Packet {
@@ -414,7 +430,9 @@ pub fn audio_codec_id(sound_format: u8) -> CodecId {
 }
 
 /// Map an FLV `codec_id` (low nibble of the first video-tag
-/// byte) to an oxideav [`CodecId`].
+/// byte) to an oxideav [`CodecId`]. Legacy single-byte codec IDs
+/// only — Enhanced RTMP FourCCs go through
+/// [`video_codec_id_for_tag`].
 pub fn video_codec_id(codec_id: u8) -> CodecId {
     let s = match codec_id {
         VIDEO_CODEC_H263 => "h263",
@@ -426,6 +444,31 @@ pub fn video_codec_id(codec_id: u8) -> CodecId {
         _ => "unknown",
     };
     CodecId::new(s)
+}
+
+/// Map an Enhanced RTMP v1 FourCC video tag (`b"av01"` /
+/// `b"vp09"` / `b"hvc1"`) to an oxideav [`CodecId`]. Unknown
+/// FourCCs (the spec leaves room for future codecs) collapse to
+/// `"unknown"`, matching the legacy `video_codec_id` policy.
+pub fn video_fourcc_codec_id(fourcc: [u8; 4]) -> CodecId {
+    let s = match &fourcc {
+        b"av01" => "av1",
+        b"vp09" => "vp9",
+        b"hvc1" => "hevc",
+        _ => "unknown",
+    };
+    CodecId::new(s)
+}
+
+/// Dispatch [`video_codec_id`] / [`video_fourcc_codec_id`] off a
+/// parsed [`VideoTag`]: Enhanced RTMP (FourCC) wins when set,
+/// otherwise the legacy single-byte `codec_id` is consulted.
+pub fn video_codec_id_for_tag(tag: &VideoTag) -> CodecId {
+    if let Some(fcc) = tag.fourcc {
+        video_fourcc_codec_id(fcc)
+    } else {
+        video_codec_id(tag.codec_id)
+    }
 }
 
 /// Build a [`CodecParameters`] for an audio stream from the
@@ -462,8 +505,16 @@ fn audio_codec_params(tag: &AudioTag) -> CodecParameters {
 /// downstream H.264 decoder can find the SPS/PPS without
 /// re-parsing the packet.
 fn video_codec_params(tag: &VideoTag) -> CodecParameters {
-    let mut p = CodecParameters::video(video_codec_id(tag.codec_id));
-    if tag.is_avc_sequence_header() {
+    let mut p = CodecParameters::video(video_codec_id_for_tag(tag));
+    // Legacy AVC: extradata is the `AVCDecoderConfigurationRecord`.
+    // Enhanced RTMP `PacketTypeSequenceStart`: extradata is the
+    // codec's configuration record per Table 4 — `HEVCDecoder
+    // ConfigurationRecord` for `hvc1`, `AV1CodecConfigurationRecord`
+    // for `av01`, `VPCodecConfigurationRecord` for `vp09`. In all
+    // three cases the body is exactly what a downstream
+    // ISO-BMFF-style decoder would expect to receive as
+    // extradata, so we copy it through unmodified.
+    if tag.is_avc_sequence_header() || tag.is_ex_sequence_header() {
         p.extradata = tag.body.clone();
     }
     p
@@ -623,7 +674,9 @@ fn _bytes_source_anchor(_: Box<dyn BytesSource>) {}
 mod tests {
     use super::*;
     use crate::flv::{
-        AAC_PACKET_TYPE_RAW, AVC_PACKET_TYPE_NALU, VIDEO_FRAME_INTER, VIDEO_FRAME_KEYFRAME,
+        AAC_PACKET_TYPE_RAW, AVC_PACKET_TYPE_NALU, AVC_PACKET_TYPE_SEQUENCE_HEADER,
+        EX_PACKET_TYPE_CODED_FRAMES, EX_PACKET_TYPE_METADATA, EX_PACKET_TYPE_SEQUENCE_START,
+        FOURCC_AV1, FOURCC_HEVC, FOURCC_VP9, VIDEO_FRAME_INTER, VIDEO_FRAME_KEYFRAME,
     };
 
     #[test]
@@ -705,6 +758,8 @@ mod tests {
             avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
             composition_time: 0,
             body: b"\x00\x00\x00\x05hello".to_vec(),
+            ex_packet_type: None,
+            fourcc: None,
         };
         let pkt = video_to_packet(33, &tag);
         assert_eq!(pkt.stream_index, VIDEO_STREAM_INDEX);
@@ -723,6 +778,8 @@ mod tests {
             avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
             composition_time: -10,
             body: vec![1, 2, 3],
+            ex_packet_type: None,
+            fourcc: None,
         };
         let pkt = video_to_packet(100, &tag);
         assert!(!pkt.flags.keyframe);
@@ -738,6 +795,8 @@ mod tests {
             avc_packet_type: Some(AVC_PACKET_TYPE_SEQUENCE_HEADER),
             composition_time: 0,
             body: b"\x01\x42\x80\x1e".to_vec(),
+            ex_packet_type: None,
+            fourcc: None,
         };
         let pkt = video_to_packet(0, &tag);
         assert!(pkt.flags.keyframe);
@@ -753,10 +812,136 @@ mod tests {
             avc_packet_type: None,
             composition_time: 0,
             body: vec![0xAA, 0xBB, 0xCC],
+            ex_packet_type: None,
+            fourcc: None,
         };
         let pkt = video_to_packet(50, &tag);
         assert_eq!(pkt.pts, pkt.dts);
         assert_eq!(pkt.data, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    // ------- Enhanced RTMP v1 dispatch into Packet -------
+
+    #[test]
+    fn video_codec_id_for_tag_dispatches_legacy_vs_fourcc() {
+        let avc = VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: VIDEO_CODEC_AVC,
+            avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
+            composition_time: 0,
+            body: vec![],
+            ex_packet_type: None,
+            fourcc: None,
+        };
+        assert_eq!(video_codec_id_for_tag(&avc).as_str(), "h264");
+        for (fcc, expected) in [
+            (FOURCC_HEVC, "hevc"),
+            (FOURCC_AV1, "av1"),
+            (FOURCC_VP9, "vp9"),
+        ] {
+            let t = VideoTag {
+                frame_type: VIDEO_FRAME_KEYFRAME,
+                codec_id: 0,
+                avc_packet_type: None,
+                composition_time: 0,
+                body: vec![],
+                ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+                fourcc: Some(fcc),
+            };
+            assert_eq!(video_codec_id_for_tag(&t).as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn ex_hevc_sequence_start_packet_sets_header_flag() {
+        // Enhanced RTMP `PacketTypeSequenceStart` body is the
+        // `HEVCDecoderConfigurationRecord`. We surface it just
+        // like AVC's `avcC` — `flags.header == true`, body in
+        // `pkt.data` for downstream extradata harvesting.
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: b"\x01hvcc-stub".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
+            fourcc: Some(FOURCC_HEVC),
+        };
+        let pkt = video_to_packet(0, &tag);
+        assert!(pkt.flags.header);
+        assert!(pkt.flags.keyframe);
+        assert_eq!(pkt.dts, Some(0));
+        assert_eq!(pkt.pts, Some(0));
+        assert_eq!(pkt.data, b"\x01hvcc-stub".to_vec());
+    }
+
+    #[test]
+    fn ex_hevc_coded_frames_with_cts_offsets_pts() {
+        // Only HEVC × CodedFrames carries CTS on the wire in
+        // Enhanced RTMP — exercise the CTS-propagation branch.
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_INTER,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 17,
+            body: b"\x00\x00\x00\x04NALU".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+            fourcc: Some(FOURCC_HEVC),
+        };
+        let pkt = video_to_packet(200, &tag);
+        assert!(!pkt.flags.keyframe);
+        assert!(!pkt.flags.header);
+        assert_eq!(pkt.dts, Some(200));
+        assert_eq!(pkt.pts, Some(217));
+    }
+
+    #[test]
+    fn ex_av1_coded_frames_no_cts_offset() {
+        // AV1 / VP9 leave CTS implied-zero — `pts == dts`.
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: vec![0x0a, 0x0b],
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+            fourcc: Some(FOURCC_AV1),
+        };
+        let pkt = video_to_packet(500, &tag);
+        assert!(pkt.flags.keyframe);
+        assert!(!pkt.flags.header);
+        assert_eq!(pkt.dts, pkt.pts);
+        assert_eq!(pkt.dts, Some(500));
+    }
+
+    #[test]
+    fn ex_metadata_packet_ignores_frame_type_flags() {
+        // Per spec the FrameType bits MUST be ignored for
+        // PacketTypeMetadata; we suppress `keyframe` and set
+        // `header` so the consumer routes it to its sideband
+        // (HDR `colorInfo` etc.) instead of the decoder.
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME, // would normally → keyframe = true
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: b"amf-payload".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_METADATA),
+            fourcc: Some(FOURCC_HEVC),
+        };
+        let pkt = video_to_packet(123, &tag);
+        assert!(!pkt.flags.keyframe);
+        assert!(pkt.flags.header);
+        assert_eq!(pkt.data, b"amf-payload".to_vec());
+    }
+
+    #[test]
+    fn legacy_avc_seq_header_constant_still_referenced() {
+        // Sanity test ensures the `AVC_PACKET_TYPE_SEQUENCE_HEADER`
+        // import isn't dropped by a future refactor — the symbol
+        // is part of the public re-export chain for downstream
+        // codec adapters that hand-craft VideoTag literals.
+        let _ = AVC_PACKET_TYPE_SEQUENCE_HEADER;
     }
 
     #[test]
