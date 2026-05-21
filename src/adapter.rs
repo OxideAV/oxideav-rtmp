@@ -392,10 +392,14 @@ pub fn audio_to_packet(timestamp_ms: u32, tag: &AudioTag) -> Packet {
 pub fn video_to_packet(timestamp_ms: u32, tag: &VideoTag) -> Packet {
     let dts = timestamp_ms as i64;
     // CTS lives in two places on the wire — AVC's 3-byte
-    // SI24 (legacy), and HEVC × Enhanced-RTMP `CodedFrames`'s
-    // SI24 (per Enhanced RTMP v1 Table 4, the only Enhanced
-    // shape that carries CTS). `parse_video` normalises both
-    // into `tag.composition_time`; AV1 and VP9 leave it zero.
+    // SI24 (legacy), and the three NALU-based Enhanced-RTMP
+    // FourCC variants paired with `CodedFrames`: HEVC (v1),
+    // AVC and VVC (added v2). `parse_video` normalises all of
+    // them into `tag.composition_time`; the non-NALU FourCCs
+    // (`av01`, `vp09`, `vp08`) and the SequenceStart /
+    // SequenceEnd / Metadata / CodedFramesX shapes leave it
+    // zero (per §"ExVideoTagBody" "compositionTimeOffset is
+    // implied to equal zero" — equivalent to "no offset").
     let has_cts =
         tag.codec_id == VIDEO_CODEC_AVC || (tag.fourcc.is_some() && tag.composition_time != 0);
     let pts = if has_cts {
@@ -503,15 +507,21 @@ pub fn video_codec_id(codec_id: u8) -> CodecId {
     CodecId::new(s)
 }
 
-/// Map an Enhanced RTMP v1 FourCC video tag (`b"av01"` /
-/// `b"vp09"` / `b"hvc1"`) to an oxideav [`CodecId`]. Unknown
-/// FourCCs (the spec leaves room for future codecs) collapse to
-/// `"unknown"`, matching the legacy `video_codec_id` policy.
+/// Map an Enhanced-RTMP FourCC video tag to an oxideav
+/// [`CodecId`]. Covers the v1 set (`b"av01"` / `b"vp09"` /
+/// `b"hvc1"`) and the v2 additions (`b"vp08"` / `b"avc1"` /
+/// `b"vvc1"`). Unknown FourCCs (the spec leaves room for future
+/// codecs) collapse to `"unknown"`, matching the legacy
+/// [`video_codec_id`] policy.
 pub fn video_fourcc_codec_id(fourcc: [u8; 4]) -> CodecId {
     let s = match &fourcc {
         b"av01" => "av1",
         b"vp09" => "vp9",
         b"hvc1" => "hevc",
+        // Enhanced RTMP v2 (Veovera 2026) §"Enhanced Video".
+        b"vp08" => "vp8",
+        b"avc1" => "h264",
+        b"vvc1" => "vvc",
         _ => "unknown",
     };
     CodecId::new(s)

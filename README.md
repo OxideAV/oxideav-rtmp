@@ -72,15 +72,20 @@ client.close()?;
   Adobe digest-verified handshake are not implemented; they're
   essentially unused in modern ingest workflows.
 - **H.264 + AAC** are the canonical legacy payloads, plus
-  **Enhanced RTMP v1** (Veovera 2023) FourCC video codecs:
-  `hvc1` (HEVC / H.265), `av01` (AV1), `vp09` (VP9). Sequence-start
-  (HEVCDecoderConfigurationRecord / `AV1CodecConfigurationRecord` /
-  `VPCodecConfigurationRecord`), `CodedFrames`, `CodedFramesX`
-  (CTS=0 omitted), `SequenceEnd`, and the HDR `PacketTypeMetadata`
-  (`colorInfo`) frames all round-trip via `flv::parse_video` /
-  `flv::build_video`. The crate passes through FLV tag bytes
-  verbatim, so additional codecs (MP3, H.263, Speex, …) keep
-  working too.
+  **Enhanced RTMP v1** (Veovera 2023) FourCC video codecs —
+  `hvc1` (HEVC / H.265), `av01` (AV1), `vp09` (VP9) — and the
+  **Enhanced RTMP v2** (Veovera 2026) additions: `vp08` (VP8),
+  `avc1` (FourCC-mode AVC / H.264), `vvc1` (VVC / H.266).
+  Sequence-start (HEVC / VVC / AVC `DecoderConfigurationRecord`,
+  `AV1CodecConfigurationRecord`, `VPCodecConfigurationRecord` for
+  VP8 + VP9), `CodedFrames`, `CodedFramesX` (CTS=0 omitted),
+  `SequenceEnd`, and the HDR `PacketTypeMetadata` (`colorInfo`)
+  frames all round-trip via `flv::parse_video` / `flv::build_video`.
+  SI24 `compositionTimeOffset` is emitted on the wire for the three
+  NALU-based FourCCs (`hvc1` / `avc1` / `vvc1`) with `CodedFrames`
+  and stripped for `CodedFramesX` per the v2 spec. The crate passes
+  through FLV tag bytes verbatim, so additional codecs (MP3, H.263,
+  Speex, …) keep working too.
 - **Enhanced RTMP v2** (Veovera 2026) FourCC audio codecs:
   `Opus`, `fLaC` (FLAC), `ac-3` (AC-3), `ec-3` (E-AC-3), `.mp3`,
   `mp4a` (AAC, added FourCC signalling). `SequenceStart`,
@@ -109,10 +114,12 @@ oxideav_rtmp::register(&mut reg);
 // `PacketSource` (audio = stream 0, video = stream 1, both with
 // time_base 1/1000). Codec ids are auto-detected from the
 // publisher's first audio + video tags (h264, hevc, av1, vp9 in
-// Enhanced-RTMP-v1 FourCC mode; h264, h263, vp6f / vp6a, flashsv /
+// Enhanced-RTMP-v1 FourCC mode; vp8, h264 (avc1), vvc added in
+// Enhanced-RTMP-v2 FourCC mode; h264, h263, vp6f / vp6a, flashsv /
 // flashsv2 for legacy single-byte codec ids; opus, flac, ac3,
-// eac3, mp3, aac in Enhanced-RTMP-v2 FourCC mode; aac, mp3, pcm_*,
-// speex, nellymoser for legacy single-byte audio sound-format).
+// eac3, mp3, aac in Enhanced-RTMP-v2 audio FourCC mode; aac, mp3,
+// pcm_*, speex, nellymoser for legacy single-byte audio
+// sound-format).
 let _src = reg.open("rtmp://0.0.0.0:1935/live/secret-key")?;
 ```
 

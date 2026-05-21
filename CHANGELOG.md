@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enhanced RTMP v2 video FourCC additions** (Veovera 2026).
+  `flv::parse_video` / `flv::build_video` now recognise the three
+  new `VideoFourCc` values from `enhanced-rtmp-v2.pdf`
+  §"Enhanced Video": `vp08` (VP8 — `VPCodecConfigurationRecord`
+  for SequenceStart, no SI24 on the wire), `avc1` (FourCC-mode
+  AVC/H.264 — `AVCDecoderConfigurationRecord` for SequenceStart,
+  SI24 `compositionTimeOffset` on the wire for `CodedFrames` and
+  implied-zero for `CodedFramesX`, mirroring the legacy AVC path),
+  and `vvc1` (VVC/H.266 — `VVCDecoderConfigurationRecord` for
+  SequenceStart, SI24 on the wire for `CodedFrames` and
+  implied-zero for `CodedFramesX`, parallel to HEVC's row). The
+  parse-side `needs_cts` rule and the build-side `cts_on_wire`
+  rule are widened symmetrically: the three NALU-based FourCCs
+  (`hvc1` / `avc1` / `vvc1`) all carry the SI24 with
+  `CodedFrames`; the non-NALU FourCCs (`av01` / `vp09` / `vp08`)
+  and the SequenceStart / SequenceEnd / Metadata / CodedFramesX
+  shapes never do.
+- **FourCC → `CodecId` mapping for the v2 video additions.**
+  `adapter::video_fourcc_codec_id` now resolves `vp08` →
+  `"vp8"`, `avc1` → `"h264"` (the same codec id legacy AVC
+  reports, so a downstream `oxideav-h264` decoder picks both up
+  unchanged), `vvc1` → `"vvc"`. The dispatcher
+  `video_codec_id_for_tag` already routes FourCC-mode tags
+  through this mapper, so the new codecs surface end-to-end on
+  the `PacketSource` adapter without any other change.
+- New `FOURCC_VP8` / `FOURCC_AVC` / `FOURCC_VVC` public
+  constants in `flv` so callers composing `VideoTag` literals
+  for the v2 set don't have to repeat the spec's ASCII bytes.
+- New tests (10 in `src/flv.rs`, 5 in `tests/enhanced_rtmp_video.rs`)
+  exercise VP8 SequenceStart + CodedFrames, AVC FourCC
+  SequenceStart + CodedFrames-with-SI24 + CodedFramesX, VVC
+  SequenceStart + negative-CTS CodedFrames + CodedFramesX,
+  truncated-SI24 controlled-failure, v2-FourCC disjointness from
+  the v1 set, and the full v1+v2 build → parse → build
+  idempotence sweep extended with eight new cases. The
+  AVC-FourCC keyframe test additionally confirms the resulting
+  `Packet` resolves to `CodecId("h264")` and applies the SI24
+  to `pts` correctly.
+
+### Notes
+
+- The `connect` command's `videoFourCcInfoMap` advertisement
+  (`enhanced-rtmp-v2.pdf` §"Enhancing NetConnection connect
+  Command") still does not list the new v2 codecs — a publisher
+  using `RtmpClient::connect` continues to negotiate as a legacy
+  AVC-only client. Manually-composed `VideoTag` literals with
+  `fourcc = Some(FOURCC_VP8 / FOURCC_AVC / FOURCC_VVC)` going
+  through `flv::build_video` produce correct wire bytes; the
+  high-level publish helper opts in once the configurable
+  codec-list follow-up lands.
+
 - **Enhanced RTMP v2 audio framing** (Veovera 2026). `flv::parse_audio`
   / `flv::build_audio` now recognise the `ExHeader = 9` value in the
   `SoundFormat` nibble of the audio-tag header byte and handle the

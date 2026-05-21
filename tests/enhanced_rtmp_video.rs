@@ -1,17 +1,20 @@
-//! Integration tests for Enhanced RTMP v1 (Veovera 2023) video framing.
+//! Integration tests for Enhanced RTMP video framing.
 //!
-//! These exercise the parse → `video_to_packet` → CodecId path so a
-//! downstream consumer that wires `RtmpSession` into the registry
-//! sees the right `CodecParameters` + `Packet` flags for HEVC / AV1
-//! / VP9 publishers (e.g. OBS 30+ in Enhanced-RTMP mode, YouTube /
-//! Twitch ingest endpoints that support the FourCC variant).
+//! Covers both the v1 (Veovera 2023) FourCC set — HEVC / AV1 / VP9 —
+//! and the v2 (Veovera 2026) additions — VP8 / FourCC-mode AVC /
+//! VVC. These exercise the parse → `video_to_packet` → CodecId path
+//! so a downstream consumer that wires `RtmpSession` into the
+//! registry sees the right `CodecParameters` + `Packet` flags for
+//! every publisher we know how to handle (OBS 30+ in Enhanced-RTMP
+//! mode, YouTube / Twitch / Facebook ingest endpoints that support
+//! the FourCC variant).
 
 use oxideav_rtmp::flv::{
-    build_video, parse_video, VideoTag, EX_PACKET_TYPE_CODED_FRAMES, EX_PACKET_TYPE_METADATA,
-    EX_PACKET_TYPE_SEQUENCE_START, FOURCC_AV1, FOURCC_HEVC, FOURCC_VP9, VIDEO_FRAME_INTER,
-    VIDEO_FRAME_KEYFRAME,
+    build_video, parse_video, VideoTag, EX_PACKET_TYPE_CODED_FRAMES, EX_PACKET_TYPE_CODED_FRAMES_X,
+    EX_PACKET_TYPE_METADATA, EX_PACKET_TYPE_SEQUENCE_START, FOURCC_AV1, FOURCC_AVC, FOURCC_HEVC,
+    FOURCC_VP8, FOURCC_VP9, FOURCC_VVC, VIDEO_FRAME_INTER, VIDEO_FRAME_KEYFRAME,
 };
-use oxideav_rtmp::{video_codec_id_for_tag, video_to_packet};
+use oxideav_rtmp::{video_codec_id_for_tag, video_fourcc_codec_id, video_to_packet};
 
 /// The exact byte sequence Enhanced RTMP §"Defining Additional
 /// Video Codecs" Table 4 specifies for a HEVC keyframe with a CTS
@@ -164,6 +167,71 @@ fn build_then_parse_then_build_is_idempotent_for_all_fourccs() {
             cts: 0,
             body: b"frame".to_vec(),
         },
+        // ----- Enhanced RTMP v2 (Veovera 2026) additions -----
+        Case {
+            label: "vp8-start",
+            fcc: FOURCC_VP8,
+            ft: VIDEO_FRAME_KEYFRAME,
+            pt: EX_PACKET_TYPE_SEQUENCE_START,
+            cts: 0,
+            body: b"vp8c".to_vec(),
+        },
+        Case {
+            label: "vp8-coded",
+            fcc: FOURCC_VP8,
+            ft: VIDEO_FRAME_KEYFRAME,
+            pt: EX_PACKET_TYPE_CODED_FRAMES,
+            cts: 0,
+            body: b"vp8frame".to_vec(),
+        },
+        Case {
+            label: "avc1-start",
+            fcc: FOURCC_AVC,
+            ft: VIDEO_FRAME_KEYFRAME,
+            pt: EX_PACKET_TYPE_SEQUENCE_START,
+            cts: 0,
+            body: b"avcc".to_vec(),
+        },
+        Case {
+            label: "avc1-coded-with-cts",
+            fcc: FOURCC_AVC,
+            ft: VIDEO_FRAME_INTER,
+            pt: EX_PACKET_TYPE_CODED_FRAMES,
+            cts: -42,
+            body: b"\x00\x00\x00\x05nalu1".to_vec(),
+        },
+        Case {
+            label: "avc1-coded-x",
+            fcc: FOURCC_AVC,
+            ft: VIDEO_FRAME_INTER,
+            pt: EX_PACKET_TYPE_CODED_FRAMES_X,
+            cts: 0,
+            body: b"\x00\x00\x00\x05nalu2".to_vec(),
+        },
+        Case {
+            label: "vvc1-start",
+            fcc: FOURCC_VVC,
+            ft: VIDEO_FRAME_KEYFRAME,
+            pt: EX_PACKET_TYPE_SEQUENCE_START,
+            cts: 0,
+            body: b"vvcc".to_vec(),
+        },
+        Case {
+            label: "vvc1-coded-with-cts",
+            fcc: FOURCC_VVC,
+            ft: VIDEO_FRAME_INTER,
+            pt: EX_PACKET_TYPE_CODED_FRAMES,
+            cts: 23,
+            body: b"\x00\x00\x00\x06h266ku".to_vec(),
+        },
+        Case {
+            label: "vvc1-coded-x",
+            fcc: FOURCC_VVC,
+            ft: VIDEO_FRAME_KEYFRAME,
+            pt: EX_PACKET_TYPE_CODED_FRAMES_X,
+            cts: 0,
+            body: b"\x00\x00\x00\x03vvc".to_vec(),
+        },
     ];
     for Case {
         label,
@@ -189,4 +257,119 @@ fn build_then_parse_then_build_is_idempotent_for_all_fourccs() {
         assert_eq!(bytes1, bytes2, "{label}: build is not idempotent");
         assert_eq!(tag1, tag2, "{label}: parse(build(t)) != t");
     }
+}
+
+// ------- Enhanced RTMP v2 (Veovera 2026) FourCC additions -------
+
+/// The exact byte sequence enhanced-rtmp-v2.pdf §"Enhanced Video"
+/// gives for a FourCC-mode AVC keyframe with a CTS offset:
+/// `IsExHeader(1) | FrameType(1) | PacketType(1)` = `0x91`, then
+/// `avc1`, then SI24(CTS), then length-prefixed NALUs. Parse must
+/// recover the same `composition_time` as the legacy AVC path
+/// since the pseudocode rows are identical (`compositionTimeOffset
+/// = SI24`). Resolves to `CodecId("h264")`.
+#[test]
+fn avc_fourcc_keyframe_wire_bytes_round_trip_to_packet() {
+    let payload: Vec<u8> = vec![
+        0x91, // IsExHeader=1 | FrameType=1 (key) | PacketType=1 (CodedFrames)
+        b'a', b'v', b'c', b'1', // FourCC
+        0x00, 0x00, 0x10, // SI24(16)
+        0x00, 0x00, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o', // NALU
+    ];
+    let tag = parse_video(&payload).expect("parse");
+    assert_eq!(tag.fourcc, Some(FOURCC_AVC));
+    assert_eq!(tag.ex_packet_type, Some(EX_PACKET_TYPE_CODED_FRAMES));
+    assert_eq!(tag.composition_time, 16);
+    assert_eq!(tag.body, b"\x00\x00\x00\x05hello".to_vec());
+
+    let pkt = video_to_packet(2000, &tag);
+    assert_eq!(pkt.dts, Some(2000));
+    assert_eq!(pkt.pts, Some(2016));
+    assert!(pkt.flags.keyframe);
+    assert!(!pkt.flags.header);
+    assert_eq!(video_codec_id_for_tag(&tag).as_str(), "h264");
+}
+
+/// VVC SequenceStart wire bytes: `IsExHeader=1 | FrameType=1 |
+/// PacketType=0` (`0x90`), then `vvc1`, then the
+/// `VVCDecoderConfigurationRecord`. The packet must be flagged
+/// `header` so a downstream H.266 decoder can pick the record up
+/// as extradata, and the codec id resolves to `"vvc"`.
+#[test]
+fn vvc_sequence_start_emits_header_flagged_packet_with_extradata() {
+    let mut payload: Vec<u8> = vec![0x90, b'v', b'v', b'c', b'1'];
+    payload.extend_from_slice(&[0xff, 0xfc, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]); // 10-byte stub VVCDecoderConfigurationRecord
+    let tag = parse_video(&payload).expect("parse");
+    assert!(tag.is_ex_sequence_header());
+    assert_eq!(tag.body.len(), 10);
+
+    let pkt = video_to_packet(0, &tag);
+    assert!(pkt.flags.header);
+    assert!(pkt.flags.keyframe);
+    assert_eq!(pkt.data.len(), 10);
+    assert_eq!(video_codec_id_for_tag(&tag).as_str(), "vvc");
+}
+
+/// VVC inter-frame with negative SI24 CTS reproduces the same
+/// sign-extension path the HEVC test exercises. enhanced-rtmp-v2.pdf
+/// §"ExVideoTagBody" mandates `compositionTimeOffset = SI24` for the
+/// VVC + CodedFrames row.
+#[test]
+fn vvc_negative_cts_wire_value_recovers_signed_offset() {
+    let payload: Vec<u8> = vec![
+        0xA1, // IsExHeader=1 | FrameType=2 (inter) | PacketType=1 (CodedFrames)
+        b'v', b'v', b'c', b'1', // FourCC
+        0xFF, 0xFF, 0xD0, // SI24(-48)
+        0xCA, 0xFE, 0xBA, 0xBE, // body
+    ];
+    let tag = parse_video(&payload).expect("parse");
+    assert_eq!(tag.composition_time, -48);
+    let pkt = video_to_packet(500, &tag);
+    assert_eq!(pkt.dts, Some(500));
+    assert_eq!(pkt.pts, Some(452));
+    assert!(!pkt.flags.keyframe);
+}
+
+/// VP8 CodedFrames have no SI24 on the wire — analogous to AV1 / VP9.
+/// Reading must not consume three phantom CTS bytes from the body.
+#[test]
+fn vp8_coded_frames_body_starts_immediately_after_fourcc() {
+    let payload: Vec<u8> = vec![
+        0x91, b'v', b'p', b'0', b'8', 0xDE, 0xAD, 0xBE, 0xEF, 0x10, 0x20,
+    ];
+    let tag = parse_video(&payload).expect("parse");
+    assert_eq!(tag.fourcc, Some(FOURCC_VP8));
+    assert_eq!(tag.composition_time, 0);
+    assert_eq!(tag.body, vec![0xDE, 0xAD, 0xBE, 0xEF, 0x10, 0x20]);
+    assert_eq!(video_codec_id_for_tag(&tag).as_str(), "vp8");
+}
+
+/// AVC-FourCC CodedFramesX optimisation: the SI24 is omitted (CTS
+/// implied zero) — three bytes saved vs the CodedFrames form.
+#[test]
+fn avc_fourcc_coded_frames_x_omits_cts_on_wire() {
+    let with_cts: Vec<u8> = vec![
+        0xA1, b'a', b'v', b'c', b'1', 0x00, 0x00, 0x00, b'A', b'B', b'C', b'D',
+    ];
+    let without_cts: Vec<u8> = vec![0xA3, b'a', b'v', b'c', b'1', b'A', b'B', b'C', b'D'];
+    let tag1 = parse_video(&with_cts).expect("parse codedframes");
+    let tag2 = parse_video(&without_cts).expect("parse codedframesx");
+    assert_eq!(tag1.composition_time, 0);
+    assert_eq!(tag2.composition_time, 0);
+    assert_eq!(tag1.body, tag2.body);
+    // CodedFramesX shaves exactly three bytes off the wire.
+    assert_eq!(with_cts.len() - without_cts.len(), 3);
+}
+
+/// FourCC → CodecId mapping covers every Enhanced-RTMP video FourCC
+/// (v1 set + v2 additions). Anything else falls back to `"unknown"`.
+#[test]
+fn video_fourcc_codec_id_maps_v1_and_v2_set_and_falls_back() {
+    assert_eq!(video_fourcc_codec_id(FOURCC_AV1).as_str(), "av1");
+    assert_eq!(video_fourcc_codec_id(FOURCC_VP9).as_str(), "vp9");
+    assert_eq!(video_fourcc_codec_id(FOURCC_HEVC).as_str(), "hevc");
+    assert_eq!(video_fourcc_codec_id(FOURCC_VP8).as_str(), "vp8");
+    assert_eq!(video_fourcc_codec_id(FOURCC_AVC).as_str(), "h264");
+    assert_eq!(video_fourcc_codec_id(FOURCC_VVC).as_str(), "vvc");
+    assert_eq!(video_fourcc_codec_id(*b"zzzz").as_str(), "unknown");
 }
