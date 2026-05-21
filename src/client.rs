@@ -238,6 +238,8 @@ impl RtmpClient {
             stereo: true,
             aac_packet_type: Some(flv::AAC_PACKET_TYPE_SEQUENCE_HEADER),
             body: asc.to_vec(),
+            ex_packet_type: None,
+            audio_fourcc: None,
         };
         self.send_audio_tag(0, &tag)
     }
@@ -251,6 +253,8 @@ impl RtmpClient {
             stereo: true,
             aac_packet_type: Some(flv::AAC_PACKET_TYPE_RAW),
             body: aac_frame.to_vec(),
+            ex_packet_type: None,
+            audio_fourcc: None,
         };
         self.send_audio_tag(timestamp_ms, &tag)
     }

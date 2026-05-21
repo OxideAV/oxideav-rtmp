@@ -81,6 +81,18 @@ client.close()?;
   `flv::build_video`. The crate passes through FLV tag bytes
   verbatim, so additional codecs (MP3, H.263, Speex, …) keep
   working too.
+- **Enhanced RTMP v2** (Veovera 2026) FourCC audio codecs:
+  `Opus`, `fLaC` (FLAC), `ac-3` (AC-3), `ec-3` (E-AC-3), `.mp3`,
+  `mp4a` (AAC, added FourCC signalling). `SequenceStart`,
+  `CodedFrames`, and `SequenceEnd` AudioPacketTypes round-trip via
+  `flv::parse_audio` / `flv::build_audio`; bodies are the per-codec
+  shapes called out in `enhanced-rtmp-v2.pdf` §"ExAudioTagBody"
+  (`OpusHead` ID-header per RFC 7845 §5.1 for Opus SequenceStart,
+  `fLaC + STREAMINFO` per Xiph FLAC §7 for FLAC SequenceStart, ATSC
+  sync frames for AC-3 / E-AC-3 CodedFrames, MPEG Layer III frames
+  for MP3, ISO/IEC 14496-3 `AudioSpecificConfig` for FourCC-AAC
+  SequenceStart). `Multitrack`, `MultichannelConfig`, and `ModEx`
+  AudioPacketTypes parse to opaque bodies pending follow-up rounds.
 
 ## Pipeline integration (`SourceRegistry`)
 
@@ -97,9 +109,10 @@ oxideav_rtmp::register(&mut reg);
 // `PacketSource` (audio = stream 0, video = stream 1, both with
 // time_base 1/1000). Codec ids are auto-detected from the
 // publisher's first audio + video tags (h264, hevc, av1, vp9 in
-// Enhanced-RTMP FourCC mode; h264, h263, vp6f / vp6a, flashsv /
-// flashsv2 for legacy single-byte codec ids; aac, mp3, pcm_*,
-// speex, nellymoser for audio).
+// Enhanced-RTMP-v1 FourCC mode; h264, h263, vp6f / vp6a, flashsv /
+// flashsv2 for legacy single-byte codec ids; opus, flac, ac3,
+// eac3, mp3, aac in Enhanced-RTMP-v2 FourCC mode; aac, mp3, pcm_*,
+// speex, nellymoser for legacy single-byte audio sound-format).
 let _src = reg.open("rtmp://0.0.0.0:1935/live/secret-key")?;
 ```
 

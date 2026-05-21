@@ -9,6 +9,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enhanced RTMP v2 audio framing** (Veovera 2026). `flv::parse_audio`
+  / `flv::build_audio` now recognise the `ExHeader = 9` value in the
+  `SoundFormat` nibble of the audio-tag header byte and handle the
+  `FourCC`-based extended header (`Opus` / `fLaC` / `ac-3` / `ec-3` /
+  `.mp3` / `mp4a`) per `enhanced-rtmp-v2.pdf` §"Enhanced Audio" /
+  "Extended AudioTagHeader" / "ExAudioTagBody". The three core
+  `AudioPacketType` values round-trip: `SequenceStart` (per-codec
+  sequence header — `OpusHead` / `fLaC + STREAMINFO` /
+  `AudioSpecificConfig` for FourCC-AAC), `CodedFrames` (codec
+  bitstream — AC-3 / E-AC-3 sync frames, Opus self-delimited packets
+  per RFC 6716 App. B, MP3 frames, raw AAC frames), and `SequenceEnd`
+  (empty body, "no less than the same meaning as a silence message"
+  per spec). New `AudioTag` fields `ex_packet_type: Option<u8>` and
+  `audio_fourcc: Option<[u8; 4]>` are the discriminators; legacy
+  publishers leave both `None` and the parser / builder follow the
+  pre-2023 SoundFormat / SoundRate / SoundSize / SoundType single-byte
+  path unchanged.
+- **FourCC → `CodecId` mapping for audio.** New
+  `adapter::audio_fourcc_codec_id([u8; 4]) -> CodecId` resolves
+  `Opus`/`fLaC`/`ac-3`/`ec-3`/`.mp3`/`mp4a` to
+  `"opus"`/`"flac"`/`"ac3"`/`"eac3"`/`"mp3"`/`"aac"`, and the new
+  dispatcher `adapter::audio_codec_id_for_tag(&AudioTag) -> CodecId`
+  selects legacy vs FourCC off `tag.audio_fourcc.is_some()`.
+  `audio_codec_params` now copies the body of any Enhanced-RTMP
+  `PacketTypeSequenceStart` audio tag into `CodecParameters.extradata`
+  (matching the existing AVC / HEVC behaviour), so downstream Opus /
+  FLAC / AAC decoders pick up their initialisation header without
+  re-parsing the packet stream.
+- **Packet flags propagated for Enhanced RTMP audio**.
+  `audio_to_packet` now sets `flags.header = true` for both legacy
+  AAC sequence-headers (unchanged) and Enhanced-RTMP
+  `PacketTypeSequenceStart`, and also flags `SequenceEnd` as a header
+  packet (empty body) so consumers can route it to an end-of-sequence
+  / flush boundary without trying to decode an empty payload. The
+  legacy AAC packet-type marker byte is **not** prepended in Enhanced
+  mode — the body is the raw codec data per `ExAudioTagBody`.
+- New `AUDIO_FORMAT_EX_HEADER` / `AUDIO_PACKET_TYPE_*` / `FOURCC_AC3`
+  / `FOURCC_EAC3` / `FOURCC_OPUS` / `FOURCC_MP3` / `FOURCC_FLAC` /
+  `FOURCC_AAC` public constants in `flv` so callers composing
+  `AudioTag` literals (e.g. an Enhanced-RTMP-aware push client) don't
+  have to repeat the spec's magic numbers.
+- New integration test (`tests/enhanced_rtmp_audio.rs`, 9 cases)
+  exercises wire-byte → `Packet` flow for Opus `SequenceStart`
+  (`OpusHead` ID-header round-trip), AC-3 / E-AC-3 / MP3
+  `CodedFrames`, FLAC `SequenceStart` (with the in-body `fLaC`
+  signature distinguished from the framing FourCC), `SequenceEnd`,
+  build-parse-build idempotence across the 5-FourCC × 3-PacketType
+  matrix, and legacy/Enhanced disjointness.
+
+### Notes
+
+- AudioPacketType `Multitrack`, `MultichannelConfig`, and `ModEx`
+  (with the only-defined `TimestampOffsetNano = 0` subtype) parse
+  paths are **not** implemented yet. Their nested layouts
+  (per-track FourCC + size-prefixed track chunks; AudioChannelOrder
+  + channel-count + channel-map / 32-bit AudioChannelFlags mask;
+  size-prefixed ModEx data + ModExType nibble chain) are spec'd in
+  `enhanced-rtmp-v2.pdf` §"ExAudioTagBody" but warrant a dedicated
+  follow-up round so we can wire them through `audio_to_packet` /
+  `CodecParameters` properly. A tag whose `AudioPacketType` decodes
+  to `Multitrack`, `MultichannelConfig`, or `ModEx` is currently
+  preserved verbatim (FourCC + raw body) — the parser does not
+  fail, but the caller is expected to skip the message rather than
+  interpret the body as a normal `CodedFrames` payload.
+- The `connect` command's `audioFourCcInfoMap` / `capsEx` /
+  `videoFourCcInfoMap` advertisements (`enhanced-rtmp-v2.pdf`
+  §"Enhancing NetConnection connect Command") are still not
+  populated by `RtmpClient`. A publisher using `RtmpClient::connect`
+  will negotiate as a legacy AVC + AAC client. Manually-composed
+  `AudioTag` literals with `audio_fourcc = Some(..)` going through
+  `flv::build_audio` still produce correct wire bytes; only the
+  high-level publish helper declines to opt in until a future round
+  adds a configurable codec list to `RtmpClient`.
+
 - **Enhanced RTMP v1 video framing** (Veovera 2023). `flv::parse_video`
   / `flv::build_video` now recognise the `IsExHeader` flag in the
   high bit of the video-tag header byte and handle the

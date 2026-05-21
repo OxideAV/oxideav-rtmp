@@ -329,21 +329,45 @@ impl PacketSource for RtmpPacketSource {
 ///
 /// The FLV tag header byte (sound-format / rate / size / stereo)
 /// is stripped — downstream decoders consume the codec body
-/// directly. For AAC the 1-byte AAC packet-type marker is
+/// directly. For legacy AAC the 1-byte AAC packet-type marker is
 /// retained ahead of the body so the decoder can distinguish
-/// `AudioSpecificConfig` from raw frames; non-AAC payloads emit
-/// just `tag.body`.
+/// `AudioSpecificConfig` from raw frames; non-AAC legacy payloads
+/// emit just `tag.body`.
+///
+/// For Enhanced RTMP v2 tags (`tag.audio_fourcc.is_some()`) the
+/// full ExHeader + FourCC framing is stripped and the body is
+/// passed through unmodified — the downstream codec consumes
+/// the raw codec bytes (`OpusCodedData` / `Ac3CodedData` /
+/// `Mp3CodedData` / `FlacCodedData` / `AacCodedData` / their
+/// per-codec sequence-header bodies). `PacketTypeSequenceStart`
+/// tags carry `flags.header = true`; `PacketTypeSequenceEnd`
+/// surfaces as an empty `data` with the `header` flag set so a
+/// consumer can route it to an end-of-stream signal.
 pub fn audio_to_packet(timestamp_ms: u32, tag: &AudioTag) -> Packet {
-    let mut data = Vec::with_capacity(tag.body.len() + 1);
-    if tag.sound_format == AUDIO_FORMAT_AAC {
-        data.push(tag.aac_packet_type.unwrap_or(flv::AAC_PACKET_TYPE_RAW));
-    }
-    data.extend_from_slice(&tag.body);
     let ts = timestamp_ms as i64;
-    let is_aac_seq_header = tag.sound_format == AUDIO_FORMAT_AAC
-        && tag.aac_packet_type == Some(AAC_PACKET_TYPE_SEQUENCE_HEADER);
+    let (data, is_header) = if tag.audio_fourcc.is_some() {
+        // Enhanced RTMP v2: body is the codec's data verbatim
+        // (per `ExAudioTagBody`). No AAC marker — that's a legacy
+        // discriminator. SequenceStart is the header signal; the
+        // SequenceEnd variant gets `header = true` too so the
+        // downstream can recognise a flush boundary.
+        let header = matches!(
+            tag.ex_packet_type,
+            Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_START) | Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_END)
+        );
+        (tag.body.clone(), header)
+    } else {
+        let mut data = Vec::with_capacity(tag.body.len() + 1);
+        if tag.sound_format == AUDIO_FORMAT_AAC {
+            data.push(tag.aac_packet_type.unwrap_or(flv::AAC_PACKET_TYPE_RAW));
+        }
+        data.extend_from_slice(&tag.body);
+        let header = tag.sound_format == AUDIO_FORMAT_AAC
+            && tag.aac_packet_type == Some(AAC_PACKET_TYPE_SEQUENCE_HEADER);
+        (data, header)
+    };
     let flags = oxideav_core::packet::PacketFlags {
-        header: is_aac_seq_header,
+        header: is_header,
         ..Default::default()
     };
     Packet {
@@ -411,6 +435,11 @@ pub fn video_to_packet(timestamp_ms: u32, tag: &VideoTag) -> Packet {
 /// `"unknown"` for codecs the workspace doesn't yet name —
 /// downstream the decoder factory will fail to find a match,
 /// which is the right outcome for "FLV says some legacy codec".
+/// Enhanced RTMP v2 FourCC tags go through
+/// [`audio_fourcc_codec_id`] / [`audio_codec_id_for_tag`]; this
+/// helper only handles the legacy single-byte SoundFormat
+/// nibble and returns `"unknown"` for the `ExHeader = 9`
+/// sentinel.
 pub fn audio_codec_id(sound_format: u8) -> CodecId {
     let s = match sound_format {
         AUDIO_FORMAT_PCM_LE => "pcm_s16le",
@@ -427,6 +456,34 @@ pub fn audio_codec_id(sound_format: u8) -> CodecId {
         _ => "unknown",
     };
     CodecId::new(s)
+}
+
+/// Map an Enhanced RTMP v2 FourCC audio tag (`b"Opus"` /
+/// `b"fLaC"` / `b"ac-3"` / `b"ec-3"` / `b".mp3"` / `b"mp4a"`)
+/// to an oxideav [`CodecId`]. Unknown FourCCs collapse to
+/// `"unknown"`, matching the legacy [`audio_codec_id`] policy.
+pub fn audio_fourcc_codec_id(fourcc: [u8; 4]) -> CodecId {
+    let s = match &fourcc {
+        b"Opus" => "opus",
+        b"fLaC" => "flac",
+        b"ac-3" => "ac3",
+        b"ec-3" => "eac3",
+        b".mp3" => "mp3",
+        b"mp4a" => "aac",
+        _ => "unknown",
+    };
+    CodecId::new(s)
+}
+
+/// Dispatch [`audio_codec_id`] / [`audio_fourcc_codec_id`] off a
+/// parsed [`AudioTag`]: Enhanced RTMP v2 (FourCC) wins when set,
+/// otherwise the legacy single-byte `sound_format` is consulted.
+pub fn audio_codec_id_for_tag(tag: &AudioTag) -> CodecId {
+    if let Some(fcc) = tag.audio_fourcc {
+        audio_fourcc_codec_id(fcc)
+    } else {
+        audio_codec_id(tag.sound_format)
+    }
 }
 
 /// Map an FLV `codec_id` (low nibble of the first video-tag
@@ -478,8 +535,24 @@ pub fn video_codec_id_for_tag(tag: &VideoTag) -> CodecId {
 /// payload's `AudioSpecificConfig` carries the truth — so we
 /// leave those fields `None` for AAC and let the decoder fill
 /// them in).
+///
+/// For Enhanced RTMP v2 tags (`tag.audio_fourcc.is_some()`) the
+/// codec id is resolved through the FourCC dispatcher and the
+/// legacy SoundRate/Stereo hints are skipped (the spec mandates
+/// they're not interpreted in ExHeader mode). For
+/// `PacketTypeSequenceStart` we copy the codec's sequence-header
+/// body into `extradata` — that's `OpusHead` for Opus,
+/// `fLaC + STREAMINFO` for FLAC, and the AAC `AudioSpecificConfig`
+/// for FourCC-AAC. AC-3 / E-AC-3 / MP3 have no SequenceStart
+/// shape in v2, so `extradata` stays empty for them.
 fn audio_codec_params(tag: &AudioTag) -> CodecParameters {
-    let mut p = CodecParameters::audio(audio_codec_id(tag.sound_format));
+    let mut p = CodecParameters::audio(audio_codec_id_for_tag(tag));
+    if tag.audio_fourcc.is_some() {
+        if tag.ex_packet_type == Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_START) {
+            p.extradata = tag.body.clone();
+        }
+        return p;
+    }
     if tag.sound_format != AUDIO_FORMAT_AAC {
         // FLV sound_rate: 0=5.5k 1=11k 2=22k 3=44.1k.
         let rate = match tag.sound_rate {
@@ -674,9 +747,10 @@ fn _bytes_source_anchor(_: Box<dyn BytesSource>) {}
 mod tests {
     use super::*;
     use crate::flv::{
-        AAC_PACKET_TYPE_RAW, AVC_PACKET_TYPE_NALU, AVC_PACKET_TYPE_SEQUENCE_HEADER,
-        EX_PACKET_TYPE_CODED_FRAMES, EX_PACKET_TYPE_METADATA, EX_PACKET_TYPE_SEQUENCE_START,
-        FOURCC_AV1, FOURCC_HEVC, FOURCC_VP9, VIDEO_FRAME_INTER, VIDEO_FRAME_KEYFRAME,
+        AAC_PACKET_TYPE_RAW, AUDIO_FORMAT_EX_HEADER, AVC_PACKET_TYPE_NALU,
+        AVC_PACKET_TYPE_SEQUENCE_HEADER, EX_PACKET_TYPE_CODED_FRAMES, EX_PACKET_TYPE_METADATA,
+        EX_PACKET_TYPE_SEQUENCE_START, FOURCC_AV1, FOURCC_HEVC, FOURCC_VP9, VIDEO_FRAME_INTER,
+        VIDEO_FRAME_KEYFRAME,
     };
 
     #[test]
@@ -706,6 +780,8 @@ mod tests {
             stereo: true,
             aac_packet_type: Some(AAC_PACKET_TYPE_SEQUENCE_HEADER),
             body: vec![0x12, 0x10],
+            ex_packet_type: None,
+            audio_fourcc: None,
         };
         let pkt = audio_to_packet(0, &tag);
         assert_eq!(pkt.stream_index, AUDIO_STREAM_INDEX);
@@ -726,6 +802,8 @@ mod tests {
             stereo: true,
             aac_packet_type: Some(AAC_PACKET_TYPE_RAW),
             body: vec![0xAB, 0xCD, 0xEF],
+            ex_packet_type: None,
+            audio_fourcc: None,
         };
         let pkt = audio_to_packet(123, &tag);
         assert_eq!(pkt.pts, Some(123));
@@ -743,11 +821,165 @@ mod tests {
             stereo: true,
             aac_packet_type: None,
             body: vec![0xFF, 0xFB, 0x90, 0x00],
+            ex_packet_type: None,
+            audio_fourcc: None,
         };
         let pkt = audio_to_packet(40, &tag);
         // No AAC marker prepended for non-AAC.
         assert_eq!(pkt.data, vec![0xFF, 0xFB, 0x90, 0x00]);
         assert_eq!(pkt.pts, Some(40));
+    }
+
+    // ------- Enhanced RTMP v2 audio dispatch into Packet -------
+
+    #[test]
+    fn audio_codec_id_for_tag_dispatches_legacy_vs_fourcc() {
+        let legacy_aac = AudioTag {
+            sound_format: AUDIO_FORMAT_AAC,
+            sound_rate: 3,
+            sound_size_16bit: true,
+            stereo: true,
+            aac_packet_type: Some(AAC_PACKET_TYPE_SEQUENCE_HEADER),
+            body: vec![],
+            ex_packet_type: None,
+            audio_fourcc: None,
+        };
+        assert_eq!(audio_codec_id_for_tag(&legacy_aac).as_str(), "aac");
+        for (fcc, expected) in [
+            (flv::FOURCC_OPUS, "opus"),
+            (flv::FOURCC_FLAC, "flac"),
+            (flv::FOURCC_AC3, "ac3"),
+            (flv::FOURCC_EAC3, "eac3"),
+            (flv::FOURCC_MP3, "mp3"),
+            (flv::FOURCC_AAC, "aac"),
+        ] {
+            let t = AudioTag {
+                sound_format: AUDIO_FORMAT_EX_HEADER,
+                sound_rate: 0,
+                sound_size_16bit: false,
+                stereo: false,
+                aac_packet_type: None,
+                ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_CODED_FRAMES),
+                audio_fourcc: Some(fcc),
+                body: vec![],
+            };
+            assert_eq!(audio_codec_id_for_tag(&t).as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn audio_fourcc_codec_id_unknown_collapses() {
+        // Forward-compatible fallback for codecs the workspace
+        // doesn't yet name.
+        assert_eq!(audio_fourcc_codec_id(*b"xxxx").as_str(), "unknown");
+    }
+
+    #[test]
+    fn ex_opus_sequence_start_packet_sets_header_flag_and_strips_fourcc() {
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_START),
+            audio_fourcc: Some(flv::FOURCC_OPUS),
+            body: b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec(),
+        };
+        let pkt = audio_to_packet(0, &tag);
+        assert_eq!(pkt.stream_index, AUDIO_STREAM_INDEX);
+        assert!(pkt.flags.header);
+        // The Opus ID-header bytes pass through unchanged — no
+        // legacy AAC packet-type marker is prepended in Enhanced
+        // mode.
+        assert_eq!(
+            pkt.data,
+            b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec()
+        );
+    }
+
+    #[test]
+    fn ex_ac3_coded_frames_packet_strips_fourcc_and_keeps_body() {
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_CODED_FRAMES),
+            audio_fourcc: Some(flv::FOURCC_AC3),
+            body: vec![0x0B, 0x77, 0xAB, 0xCD, 0xEF],
+        };
+        let pkt = audio_to_packet(200, &tag);
+        assert!(!pkt.flags.header);
+        assert_eq!(pkt.dts, Some(200));
+        assert_eq!(pkt.pts, Some(200));
+        // Raw AC-3 frame bytes — no marker, no header.
+        assert_eq!(pkt.data, vec![0x0B, 0x77, 0xAB, 0xCD, 0xEF]);
+    }
+
+    #[test]
+    fn ex_audio_sequence_end_packet_flagged_header_with_empty_body() {
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_END),
+            audio_fourcc: Some(flv::FOURCC_OPUS),
+            body: vec![],
+        };
+        let pkt = audio_to_packet(999, &tag);
+        // SequenceEnd is a flush boundary — header flag lets the
+        // consumer route it without trying to decode an empty
+        // frame.
+        assert!(pkt.flags.header);
+        assert!(pkt.data.is_empty());
+        assert_eq!(pkt.dts, Some(999));
+    }
+
+    #[test]
+    fn ex_audio_codec_params_copies_sequence_start_to_extradata() {
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_START),
+            audio_fourcc: Some(flv::FOURCC_FLAC),
+            body: b"fLaC\x80\x00\x00\x22streaminfo-body-bytes".to_vec(),
+        };
+        let p = audio_codec_params(&tag);
+        assert_eq!(p.codec_id.as_str(), "flac");
+        assert_eq!(p.extradata, tag.body);
+        // Legacy SoundRate/Stereo hints are skipped — the spec
+        // says the bit-field "are not interpreted" in ExHeader
+        // mode and codec-internal headers carry the truth.
+        assert_eq!(p.sample_rate, None);
+        assert_eq!(p.channels, None);
+    }
+
+    #[test]
+    fn ex_audio_codec_params_ac3_coded_frames_leaves_extradata_empty() {
+        // AC-3 has no SequenceStart shape defined in v2 — only
+        // CodedFrames carries data. Ensure `audio_codec_params`
+        // doesn't accidentally treat a CodedFrames body as
+        // extradata.
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_CODED_FRAMES),
+            audio_fourcc: Some(flv::FOURCC_AC3),
+            body: vec![0x0B, 0x77, 0xAB, 0xCD],
+        };
+        let p = audio_codec_params(&tag);
+        assert_eq!(p.codec_id.as_str(), "ac3");
+        assert!(p.extradata.is_empty());
     }
 
     #[test]
