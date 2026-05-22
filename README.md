@@ -24,7 +24,7 @@ while let Some(pkt) = session.next_packet()? {
     match pkt {
         StreamPacket::Video { timestamp, tag } => { /* AVC bytes in `tag.body` */ }
         StreamPacket::Audio { timestamp, tag } => { /* AAC bytes in `tag.body` */ }
-        StreamPacket::Metadata(meta)           => { /* onMetaData AMF0 object */ }
+        StreamPacket::Metadata(meta)           => { /* onMetaData object (AMF0 or AMF3, bridged to AMF0) */ }
     }
 }
 ```
@@ -70,13 +70,18 @@ client.close()?;
   (subscribe / pull) is a follow-up.
 - **AMF0 command flow** is what every commodity ingest endpoint
   (OBS / Wirecast / nginx-rtmp / libavformat) negotiates. The
-  [`amf3`] module also ships a complete AMF3 wire-format
-  encoder + decoder — all thirteen markers plus the three
-  reference tables — for the Adobe Media Server clients that
-  switch to AMF3 via the AMF0 `avmplus-object-marker` (0x11)
-  or that open AMF3 message-type channels (15 / 16 / 17). Shared
-  objects, RTMFP, and the Adobe digest-verified handshake remain
-  unimplemented.
+  [`amf3`] module ships a complete AMF3 wire-format encoder +
+  decoder — all thirteen markers plus the three reference tables —
+  and AMF3 data / command messages are now **routed end-to-end**:
+  the server decodes `onMetaData` carried as a type-15 AMF3 data
+  message (per AMF 3 spec §4.1 / AMF 0 spec §3.1, an AMF0 frame
+  switching to AMF3 via the `avmplus-object-marker` `0x11`),
+  bridges the AMF3 value graph onto `Amf0Value`, and surfaces it
+  through the same `StreamPacket::Metadata` path as AMF0; type-17
+  AMF3 commands feed the same stream-teardown detection.
+  `RtmpClient::send_metadata_amf3` emits the AMF3-encoded form for
+  peers on an AMF3 channel. Shared objects, RTMFP, and the Adobe
+  digest-verified handshake remain unimplemented.
 - **H.264 + AAC** are the canonical legacy payloads, plus
   **Enhanced RTMP v1** (Veovera 2023) FourCC video codecs —
   `hvc1` (HEVC / H.265), `av01` (AV1), `vp09` (VP9) — and the
@@ -141,7 +146,8 @@ The lower-level modules are public so callers can compose something
 non-standard:
 
 - `amf::{encode, decode, encode_command, Amf0Value}`
-- `amf3::{encode, decode, decode_all, encode_all, Amf3Value, Decoder}`
+- `amf3::{encode, decode, decode_all, decode_data_message, encode_all, Amf3Value, Decoder}`
+  plus `Amf3Value::to_amf0()` and `amf3::AVMPLUS_OBJECT_MARKER`
 - `chunk::{ChunkReader, ChunkWriter, Message}`
 - `handshake::{client_handshake, server_handshake}`
 - `flv::{parse_video, build_video, parse_audio, build_audio}`

@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AMF3 data / command message routing** (`src/amf3.rs`,
+  `src/server.rs`, `src/client.rs`). Wires the r93 AMF3 parser into the
+  RTMP message-dispatch path so AMF3-encoded `onMetaData` /
+  data-messages (message type id 15) and AMF3 commands (type 17) decode
+  end-to-end. Per AMF 3 spec §4.1 + AMF 0 spec §3.1, the outer
+  NetConnection message structure is AMF0 and a value switches to AMF3
+  via the `avmplus-object-marker` (`0x11`); new
+  `amf3::decode_data_message` parses a type-15/17 body that is either
+  `0x11`-prefixed (the spec-mandated switch) or already-AMF3
+  (no-prefix, for channels negotiated to AMF3 from the start), sharing
+  one reference-table context across the whole body. New
+  `Amf3Value::to_amf0()` bridges the decoded AMF3 value graph onto the
+  `Amf0Value` enum so `server::RtmpSession::next_packet` surfaces AMF3
+  metadata through the same `StreamPacket::Metadata(Amf0Value)` path as
+  AMF0 — `Integer`/`Date` collapse to `Number`/`Date`, sealed +
+  dynamic object members concatenate into one ordered `Object`, the
+  AMF3 `Array` dense slot becomes an ECMA-array under stringified
+  ordinal keys, and `ByteArray`/`Vector`/`Dictionary`/`Xml*` map to
+  their nearest AMF0 shape. The server's `MSG_DATA_AMF3` /
+  `MSG_COMMAND_AMF3` arms now route (the AMF3 command path detects the
+  same `closeStream` / `deleteStream` / `FCUnpublish` teardown as
+  AMF0). New `RtmpClient::send_metadata_amf3` emits an AMF3-encoded
+  `onMetaData` for peers on an AMF3 channel. `pub const
+  amf3::AVMPLUS_OBJECT_MARKER`; `Amf0Value` / `Amf3Value` re-exported
+  at the crate root. This resolves the r93 follow-up noted below.
+- 9 new tests: 4 unit tests in `src/amf3.rs` cover `decode_data_message`
+  framing (avmplus-wrapped sequence, unprefixed-AMF3, shared reference
+  context, dangling-marker error); 5 cover the `to_amf0` bridge
+  (scalars with Integer/Date collapse, sealed+dynamic merge ordering,
+  Array→ECMA ordinal keys, Vector/ByteArray→StrictArray, and a full
+  realistic `onMetaData` body bridged into an AMF0 object). A new
+  `tests/amf3_metadata.rs` integration test drives a full
+  client→server loopback publishing an AMF3 `onMetaData` and asserts
+  the server surfaces every field through `StreamPacket::Metadata`.
 - **AMF3 wire-format parser + builder** (`src/amf3.rs`). Implements the
   full Adobe "Action Message Format -- AMF 3" (January 2013)
   specification mirrored under `docs/streaming/rtmp/amf3-file-format-
@@ -50,12 +84,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- AMF3 round-tripping via the AMF0 `avmplus-object-marker` (0x11)
-  is not yet wired into [`amf::decode`] — the new module is exposed
-  publicly so callers handling AMF3 message-type channels (15 / 16 /
-  17) can use it directly. A follow-up round can add the AMF0 ↔ AMF3
-  switch by extending `amf::Amf0Value` with a `Wrapped(Amf3Value)`
-  variant or by upgrading the command dispatcher to a tagged enum.
+- AMF3 message routing via the AMF0 `avmplus-object-marker` (0x11) is
+  now wired into the server's message dispatch (see the r96 entry
+  above) through `amf3::decode_data_message` + `Amf3Value::to_amf0`,
+  rather than by extending `amf::Amf0Value` with a wrapping variant.
+  The standalone `amf::decode` path still consumes pure AMF0 only;
+  AMF3-channel callers use the `amf3` module (directly or via the
+  server / client routing) — the cleaner split given AMF3's
+  per-message reference-table context.
 
 - **Enhanced RTMP v2 video FourCC additions** (Veovera 2026).
   `flv::parse_video` / `flv::build_video` now recognise the three

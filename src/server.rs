@@ -27,6 +27,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::amf::{self, Amf0Value};
+use crate::amf3;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
 use crate::error::{Error, Result};
 use crate::flv::{parse_audio, parse_video, AudioTag, VideoTag};
@@ -320,12 +321,21 @@ impl RtmpSession {
                     // Common shape: ["@setDataFrame", "onMetaData",
                     // <meta>]. Some clients omit "@setDataFrame" and
                     // just send ["onMetaData", <meta>]. Accept both.
-                    let meta = values
+                    if let Some(m) = metadata_object(&values) {
+                        return Ok(Some(StreamPacket::Metadata(m)));
+                    }
+                }
+                MSG_DATA_AMF3 => {
+                    // AMF3-encoded data message (type 15). Per AMF3 §4.1
+                    // the body is an AMF0 frame switching to AMF3 via the
+                    // avmplus marker; decode it and bridge each value onto
+                    // the AMF0 shape so metadata flows through the same
+                    // path as MSG_DATA_AMF0.
+                    let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
                         .iter()
-                        .rev()
-                        .find(|v| matches!(v, Amf0Value::Object(_) | Amf0Value::EcmaArray(_)))
-                        .cloned();
-                    if let Some(m) = meta {
+                        .map(amf3::Amf3Value::to_amf0)
+                        .collect();
+                    if let Some(m) = metadata_object(&values) {
                         return Ok(Some(StreamPacket::Metadata(m)));
                     }
                 }
@@ -333,6 +343,20 @@ impl RtmpSession {
                     // Likely closeStream / deleteStream /
                     // FCUnpublish — peer is shutting down.
                     let values = amf::decode_all(&msg.payload)?;
+                    if let Some(name) = values.first().and_then(Amf0Value::as_str) {
+                        if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
+                            self.ended = true;
+                            return Ok(None);
+                        }
+                    }
+                }
+                MSG_COMMAND_AMF3 => {
+                    // AMF3-encoded command (type 17). Same teardown
+                    // detection as the AMF0 command path.
+                    let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
+                        .iter()
+                        .map(amf3::Amf3Value::to_amf0)
+                        .collect();
                     if let Some(name) = values.first().and_then(Amf0Value::as_str) {
                         if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
                             self.ended = true;
@@ -530,6 +554,20 @@ fn drive_until_publish(stream: TcpStream, peer_addr: SocketAddr) -> Result<Publi
             }
         }
     }
+}
+
+/// Pull the metadata object out of a decoded data-message value list.
+///
+/// `@setDataFrame("onMetaData", <meta>)` is the standard publish shape;
+/// some clients omit the leading `@setDataFrame` and send just
+/// `["onMetaData", <meta>]`. Either way the payload object is the last
+/// Object / ECMA-array value in the list, so search from the back.
+fn metadata_object(values: &[Amf0Value]) -> Option<Amf0Value> {
+    values
+        .iter()
+        .rev()
+        .find(|v| matches!(v, Amf0Value::Object(_) | Amf0Value::EcmaArray(_)))
+        .cloned()
 }
 
 fn read_u32_be(buf: &[u8]) -> Result<u32> {

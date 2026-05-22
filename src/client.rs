@@ -20,6 +20,7 @@ use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::amf::{self, Amf0Value};
+use crate::amf3;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
 use crate::error::{Error, Result};
 use crate::flv::{self, AudioTag, VideoTag};
@@ -280,6 +281,32 @@ impl RtmpClient {
     /// `videocodecid`, `audiodatarate`, `audiocodecid`, etc.
     pub fn send_metadata(&mut self, metadata: Amf0Value) -> Result<()> {
         let msg = build_set_data_frame(self.stream_id, metadata);
+        self.writer.write_message(CSID_DATA, &msg)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Send `onMetaData` as an AMF3-encoded data message (RTMP message
+    /// type 15) instead of the AMF0 default.
+    ///
+    /// The body is framed per AMF 3 spec §4.1 / AMF 0 spec §3.1: the
+    /// outer NetConnection message structure is AMF0, and each value
+    /// switches to AMF3 by prefixing it with the `avmplus-object-marker`
+    /// (`0x11`). Most ingest endpoints stay on AMF0, so prefer
+    /// [`send_metadata`](Self::send_metadata); this exists for peers that
+    /// negotiated an AMF3 channel.
+    pub fn send_metadata_amf3(&mut self, metadata: amf3::Amf3Value) -> Result<()> {
+        let mut payload = Vec::new();
+        payload.push(amf3::AVMPLUS_OBJECT_MARKER);
+        amf3::encode(&mut payload, &amf3::Amf3Value::String("onMetaData".into()));
+        payload.push(amf3::AVMPLUS_OBJECT_MARKER);
+        amf3::encode(&mut payload, &metadata);
+        let msg = Message {
+            msg_type_id: MSG_DATA_AMF3,
+            msg_stream_id: self.stream_id,
+            timestamp: 0,
+            payload,
+        };
         self.writer.write_message(CSID_DATA, &msg)?;
         self.writer.flush()?;
         Ok(())

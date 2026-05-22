@@ -182,6 +182,115 @@ impl Amf3Value {
             _ => None,
         }
     }
+
+    /// Project this AMF3 value onto the matching [`Amf0Value`](crate::amf::Amf0Value) shape.
+    ///
+    /// RTMP data / command messages can be carried either AMF0-encoded
+    /// (message type ids 18 / 20) or AMF3-encoded (15 / 17), and a
+    /// publisher chooses one or the other per channel. Consumers of
+    /// `server::StreamPacket::Metadata` shouldn't have to branch on which
+    /// encoding the publisher happened to pick — both carry the same
+    /// `onMetaData` object semantics. This bridge maps the AMF3 value
+    /// graph onto the AMF0 enum so a single metadata-handling path covers
+    /// both.
+    ///
+    /// The two formats are not isomorphic, so the mapping is lossy in the
+    /// directions AMF0 can't represent:
+    ///
+    /// * `Integer` / `Date` collapse to `Amf0Value::Number` /
+    ///   `Amf0Value::Date` (AMF0 has no integer type; its `Date` keeps
+    ///   a timezone slot AMF3 dropped, filled with 0).
+    /// * Both AMF3 `Object` member sections (sealed + dynamic) concatenate
+    ///   into one ordered `Amf0Value::Object`; the class name and the
+    ///   externalizable body are not representable in AMF0 and are
+    ///   dropped.
+    /// * The AMF3 `Array` dense slot becomes an ECMA-array under
+    ///   stringified ordinal keys merged with the associative slot — the
+    ///   shape `onMetaData` arrays use in practice.
+    /// * `ByteArray` / `Vector` / `Dictionary` / `Xml` have no AMF0
+    ///   counterpart; `ByteArray` and the vectors become a
+    ///   `Amf0Value::StrictArray` of numbers, `Xml*` become
+    ///   `Amf0Value::String`, and `Dictionary` becomes an
+    ///   `Amf0Value::EcmaArray` keyed by each entry's stringified key.
+    pub fn to_amf0(&self) -> crate::amf::Amf0Value {
+        use crate::amf::Amf0Value as A0;
+        match self {
+            Amf3Value::Undefined => A0::Undefined,
+            Amf3Value::Null => A0::Null,
+            Amf3Value::Boolean(b) => A0::Boolean(*b),
+            Amf3Value::Integer(n) => A0::Number(f64::from(*n)),
+            Amf3Value::Double(n) => A0::Number(*n),
+            Amf3Value::String(s) => A0::String(s.clone()),
+            Amf3Value::XmlDocument(s) | Amf3Value::Xml(s) => A0::String(s.clone()),
+            Amf3Value::Date(ms) => A0::Date {
+                millis: *ms,
+                timezone: 0,
+            },
+            Amf3Value::Array { dense, assoc } => {
+                // onMetaData "arrays" are normally pure-associative ECMA
+                // arrays; preserve both portions by emitting the dense
+                // entries under their stringified ordinal then the named
+                // members.
+                let mut pairs = Vec::with_capacity(dense.len() + assoc.len());
+                for (i, v) in dense.iter().enumerate() {
+                    pairs.push((i.to_string(), v.to_amf0()));
+                }
+                for (k, v) in assoc {
+                    pairs.push((k.clone(), v.to_amf0()));
+                }
+                A0::EcmaArray(pairs)
+            }
+            Amf3Value::Object {
+                sealed,
+                dynamic_members,
+                ..
+            } => {
+                let mut pairs = Vec::with_capacity(sealed.len() + dynamic_members.len());
+                for (k, v) in sealed.iter().chain(dynamic_members.iter()) {
+                    pairs.push((k.clone(), v.to_amf0()));
+                }
+                A0::Object(pairs)
+            }
+            Amf3Value::ByteArray(bytes) => {
+                A0::StrictArray(bytes.iter().map(|b| A0::Number(f64::from(*b))).collect())
+            }
+            Amf3Value::VectorInt { items, .. } => {
+                A0::StrictArray(items.iter().map(|n| A0::Number(f64::from(*n))).collect())
+            }
+            Amf3Value::VectorUInt { items, .. } => {
+                A0::StrictArray(items.iter().map(|n| A0::Number(f64::from(*n))).collect())
+            }
+            Amf3Value::VectorDouble { items, .. } => {
+                A0::StrictArray(items.iter().map(|n| A0::Number(*n)).collect())
+            }
+            Amf3Value::VectorObject { items, .. } => {
+                A0::StrictArray(items.iter().map(Amf3Value::to_amf0).collect())
+            }
+            Amf3Value::Dictionary { entries, .. } => {
+                let pairs = entries
+                    .iter()
+                    .map(|(k, v)| (amf3_key_to_string(k), v.to_amf0()))
+                    .collect();
+                A0::EcmaArray(pairs)
+            }
+        }
+    }
+}
+
+/// Best-effort stringification of an AMF3 value used as a Dictionary key.
+/// AS3 Dictionary keys may be any value; AMF0 ECMA-array keys must be
+/// strings. Scalar keys map to their natural text; complex keys fall back
+/// to a stable placeholder so the entry is still surfaced.
+fn amf3_key_to_string(k: &Amf3Value) -> String {
+    match k {
+        Amf3Value::String(s) | Amf3Value::Xml(s) | Amf3Value::XmlDocument(s) => s.clone(),
+        Amf3Value::Integer(n) => n.to_string(),
+        Amf3Value::Double(n) => n.to_string(),
+        Amf3Value::Boolean(b) => b.to_string(),
+        Amf3Value::Null => "null".to_string(),
+        Amf3Value::Undefined => "undefined".to_string(),
+        _ => "[object]".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +670,49 @@ pub fn decode_all(buf: &[u8]) -> Result<Vec<Amf3Value>> {
     let mut pos = 0;
     let mut out = Vec::new();
     while pos < buf.len() {
+        out.push(dec.decode(buf, &mut pos)?);
+    }
+    Ok(out)
+}
+
+/// AMF0 `avmplus-object-marker` — signals a switch from the AMF0 outer
+/// framing to an AMF3-encoded value (AMF0 spec §3.1).
+pub const AVMPLUS_OBJECT_MARKER: u8 = 0x11;
+
+/// Decode an RTMP AMF3 data / command message body (message type ids 15
+/// and 17) into a flat sequence of [`Amf3Value`]s.
+///
+/// Per AMF 3 spec §4.1 and AMF 0 spec §3.1, the outer NetConnection
+/// messaging structure is AMF0; an individual value switches to AMF3 by
+/// prefixing it with the `avmplus-object-marker` (`0x11`). RTMP type-15 /
+/// type-17 bodies therefore consist of one-or-more values, each
+/// optionally introduced by that marker. This decoder accepts both:
+///
+/// * a leading `0x11` marker before a value (the spec-mandated AMF3
+///   switch), and
+/// * a value with no marker at the top of the body — emitted by some
+///   senders that drop straight into AMF3 because the channel was
+///   already negotiated to AMF3 — by treating any non-`0x11` first byte
+///   as the start of an AMF3 marker directly.
+///
+/// All values in one body share a single reference-table context, reset
+/// once at entry per §4.1.
+pub fn decode_data_message(buf: &[u8]) -> Result<Vec<Amf3Value>> {
+    let mut dec = Decoder::new();
+    let mut pos = 0;
+    let mut out = Vec::new();
+    while pos < buf.len() {
+        // A `0x11` here is the AMF0 avmplus switch; consume it and decode
+        // the AMF3 value that follows. Any other byte is taken to be an
+        // AMF3 marker directly (already-AMF3 channel).
+        if buf[pos] == AVMPLUS_OBJECT_MARKER {
+            pos += 1;
+            if pos >= buf.len() {
+                return Err(Error::InvalidAmf0(
+                    "avmplus marker (0x11) at end of body with no AMF3 value".into(),
+                ));
+            }
+        }
         out.push(dec.decode(buf, &mut pos)?);
     }
     Ok(out)
@@ -1397,5 +1549,186 @@ mod tests {
             values,
             vec![Amf3Value::Date(1234.0), Amf3Value::Date(1234.0)]
         );
+    }
+
+    // ----- RTMP data/command message framing (§4.1) -----
+
+    /// Build the AMF3 wire bytes for a single value, then wrap it the way
+    /// an RTMP type-15 / type-17 body does: an AMF0 `avmplus` marker
+    /// (0x11) introducing the AMF3-encoded value.
+    fn avmplus_wrap(v: &Amf3Value) -> Vec<u8> {
+        let mut out = vec![AVMPLUS_OBJECT_MARKER];
+        encode(&mut out, v);
+        out
+    }
+
+    #[test]
+    fn data_message_decodes_avmplus_wrapped_sequence() {
+        // ["onMetaData", {duration: 12.5, width: 1920}] — each value
+        // introduced by the avmplus switch marker, the spec-mandated
+        // framing for a NetConnection AMF3 message body.
+        let meta = dynamic_object([
+            ("duration", Amf3Value::Double(12.5)),
+            ("width", Amf3Value::Integer(1920)),
+        ]);
+        let mut body = avmplus_wrap(&Amf3Value::String("onMetaData".into()));
+        body.extend(avmplus_wrap(&meta));
+
+        let values = decode_data_message(&body).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_str(), Some("onMetaData"));
+        assert_eq!(
+            values[1].get("duration").and_then(Amf3Value::as_f64),
+            Some(12.5)
+        );
+        assert_eq!(
+            values[1].get("width").and_then(Amf3Value::as_i32),
+            Some(1920)
+        );
+    }
+
+    #[test]
+    fn data_message_decodes_unprefixed_amf3() {
+        // Some senders drop straight into AMF3 with no leading 0x11
+        // (channel already negotiated to AMF3). decode_data_message must
+        // still parse those.
+        let mut body = Vec::new();
+        encode(&mut body, &Amf3Value::String("onMetaData".into()));
+        encode(
+            &mut body,
+            &dynamic_object([("fps", Amf3Value::Integer(30))]),
+        );
+
+        let values = decode_data_message(&body).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_str(), Some("onMetaData"));
+        assert_eq!(values[1].get("fps").and_then(Amf3Value::as_i32), Some(30));
+    }
+
+    #[test]
+    fn data_message_shares_one_reference_context() {
+        // A string emitted once then referenced should resolve back to
+        // the same text across the whole body.
+        let mut body = Vec::new();
+        encode(&mut body, &Amf3Value::String("repeat".into()));
+        // Second value: string-by-reference (ref flag 0, index 0).
+        body.push(M_STRING);
+        write_u29(&mut body, 0);
+
+        let values = decode_data_message(&body).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_str(), Some("repeat"));
+        assert_eq!(values[1].as_str(), Some("repeat"));
+    }
+
+    #[test]
+    fn data_message_dangling_avmplus_marker_errors() {
+        assert!(decode_data_message(&[AVMPLUS_OBJECT_MARKER]).is_err());
+    }
+
+    // ----- AMF3 -> AMF0 bridge -----
+
+    #[test]
+    fn bridge_scalars() {
+        use crate::amf::Amf0Value as A0;
+        assert_eq!(Amf3Value::Null.to_amf0(), A0::Null);
+        assert_eq!(Amf3Value::Undefined.to_amf0(), A0::Undefined);
+        assert_eq!(Amf3Value::Boolean(true).to_amf0(), A0::Boolean(true));
+        // Integer + Double both collapse to AMF0 Number.
+        assert_eq!(Amf3Value::Integer(7).to_amf0(), A0::Number(7.0));
+        assert_eq!(Amf3Value::Double(2.5).to_amf0(), A0::Number(2.5));
+        assert_eq!(
+            Amf3Value::String("x".into()).to_amf0(),
+            A0::String("x".into())
+        );
+        // Date drops the (absent) timezone into a 0 slot.
+        assert_eq!(
+            Amf3Value::Date(100.0).to_amf0(),
+            A0::Date {
+                millis: 100.0,
+                timezone: 0
+            }
+        );
+    }
+
+    #[test]
+    fn bridge_object_merges_sealed_and_dynamic_in_order() {
+        use crate::amf::Amf0Value as A0;
+        let obj = Amf3Value::Object {
+            class_name: "Some.Class".into(),
+            dynamic: true,
+            sealed: vec![("a".into(), Amf3Value::Integer(1))],
+            dynamic_members: vec![("b".into(), Amf3Value::String("two".into()))],
+            externalizable_body: None,
+        };
+        // Class name is dropped; sealed then dynamic members, in order.
+        assert_eq!(
+            obj.to_amf0(),
+            A0::Object(vec![
+                ("a".into(), A0::Number(1.0)),
+                ("b".into(), A0::String("two".into())),
+            ])
+        );
+    }
+
+    #[test]
+    fn bridge_array_to_ecma_with_ordinal_keys() {
+        use crate::amf::Amf0Value as A0;
+        let arr = Amf3Value::Array {
+            dense: vec![Amf3Value::Integer(10), Amf3Value::Integer(20)],
+            assoc: vec![("name".into(), Amf3Value::String("v".into()))],
+        };
+        assert_eq!(
+            arr.to_amf0(),
+            A0::EcmaArray(vec![
+                ("0".into(), A0::Number(10.0)),
+                ("1".into(), A0::Number(20.0)),
+                ("name".into(), A0::String("v".into())),
+            ])
+        );
+    }
+
+    #[test]
+    fn bridge_vectors_and_bytearray_to_strict_array() {
+        use crate::amf::Amf0Value as A0;
+        let vi = Amf3Value::VectorInt {
+            fixed: true,
+            items: vec![-1, 2],
+        };
+        assert_eq!(
+            vi.to_amf0(),
+            A0::StrictArray(vec![A0::Number(-1.0), A0::Number(2.0)])
+        );
+        let ba = Amf3Value::ByteArray(vec![0, 255]);
+        assert_eq!(
+            ba.to_amf0(),
+            A0::StrictArray(vec![A0::Number(0.0), A0::Number(255.0)])
+        );
+    }
+
+    #[test]
+    fn bridge_full_onmetadata_roundtrips_into_amf0_object() {
+        use crate::amf::Amf0Value as A0;
+        // Decode a realistic AMF3 onMetaData body and verify the bridged
+        // AMF0 object exposes the fields a metadata consumer reads.
+        let meta = dynamic_object([
+            ("width", Amf3Value::Integer(1280)),
+            ("height", Amf3Value::Integer(720)),
+            ("framerate", Amf3Value::Double(29.97)),
+            ("videocodecid", Amf3Value::String("avc1".into())),
+        ]);
+        let mut body = avmplus_wrap(&Amf3Value::String("onMetaData".into()));
+        body.extend(avmplus_wrap(&meta));
+
+        let bridged: Vec<A0> = decode_data_message(&body)
+            .unwrap()
+            .iter()
+            .map(Amf3Value::to_amf0)
+            .collect();
+        let obj = bridged.last().unwrap();
+        assert_eq!(obj.get("width").and_then(A0::as_f64), Some(1280.0));
+        assert_eq!(obj.get("height").and_then(A0::as_f64), Some(720.0));
+        assert_eq!(obj.get("framerate").and_then(A0::as_f64), Some(29.97));
+        assert_eq!(obj.get("videocodecid").and_then(A0::as_str), Some("avc1"));
     }
 }
