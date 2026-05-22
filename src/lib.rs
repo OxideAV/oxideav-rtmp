@@ -22,17 +22,29 @@
 //! callers who need an RTMP primitive the high-level API doesn't
 //! expose yet.
 //!
+//! AMF support:
+//!
+//! * [`amf`] — AMF0 wire format (the default for RTMP command +
+//!   metadata messages). Used by every commodity ingest endpoint.
+//! * [`amf3`] — AMF3 wire format, the Flash Player 9+ binary
+//!   serialization. RTMP can switch a channel to AMF3 via the AMF0
+//!   `avmplus-object-marker` (0x11) or by using message type IDs 15
+//!   (Data), 16 (Shared Object) and 17 (Command). The encoder + decoder
+//!   handle all thirteen markers plus the three reference tables
+//!   (strings / objects / traits).
+//!
 //! Out of scope for this release:
 //!
 //! * RTMPS (TLS). Consumers who need it can wrap our `Read + Write`
 //!   with rustls. We may add an `rtmps` feature later.
 //! * RTMP play (downstream subscriber / upstream pull). Only publish
 //!   direction is implemented.
-//! * AMF3, shared objects, RTMFP, RTMP Encrypted, and the Adobe
+//! * Shared objects, RTMFP, RTMP Encrypted, and the Adobe
 //!   digest-verified handshake variant.
 
 pub mod adapter;
 pub mod amf;
+pub mod amf3;
 pub mod chunk;
 pub mod client;
 pub mod error;

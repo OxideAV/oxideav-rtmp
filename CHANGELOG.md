@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AMF3 wire-format parser + builder** (`src/amf3.rs`). Implements the
+  full Adobe "Action Message Format -- AMF 3" (January 2013)
+  specification mirrored under `docs/streaming/rtmp/amf3-file-format-
+  spec-adobe.pdf`: all thirteen value markers (Undefined / Null /
+  False / True / Integer / Double / String / XMLDocument / Date /
+  Array / Object / XML / ByteArray / Vector{Int,UInt,Double,Object} /
+  Dictionary), U29 variable-length integers (§1.3.1) with explicit
+  sign-extension for the Integer marker (§3.6), and the three
+  reference tables (strings / objects / traits) maintained per
+  `decode_all` invocation per §2.2. Object support distinguishes
+  anonymous / typed / dynamic / externalizable shapes (§3.12);
+  externalizable bodies surface as `Some(Vec<u8>)` on the
+  `Amf3Value::Object::externalizable_body` field for round-tripping,
+  with generic decode refusing externalizable inputs (no class
+  handler registered) rather than silently corrupting `pos`.
+  `Decoder::reset_tables()` provides the §4.1 packet-boundary reset.
+  Encoder always emits literal (non-reference) values — the wire
+  bytes remain valid per spec, and any literal can re-enter the
+  decoder which will resolve references encountered later in the
+  same payload. New helpers `anon_object` / `dynamic_object` /
+  `anon_object_unordered` mirror the AMF0 builder ergonomics.
+- New 26 unit tests in `src/amf3.rs` exercise: U29 length-class
+  boundaries (1-byte, 2-byte, 3-byte, 4-byte) and a spec-Table-1
+  canonical-bytes check for 0x7F / 0x80 / 0x4000 / 0x200000; all
+  simple-marker (`Undefined` / `Null` / `Boolean`) round-trips;
+  Integer sign extension at the negative boundary plus the
+  out-of-range fallback to Double; literal-then-reference for both
+  string and object tables; empty-string-never-in-table per §1.3.2;
+  Date / ByteArray round-trips; dense + associative Array shapes;
+  anonymous, dynamic, and typed-with-sealed-and-dynamic Object
+  shapes; externalizable-without-handler refuses cleanly;
+  `Vector.<int>` / `<uint>` / `<Number>` / `<Object>` (mixed-type)
+  round-trips; `Dictionary` with both String and Integer keys;
+  `Xml` / `XmlDocument` round-trips; multi-value packet sharing the
+  string table across values; dangling-reference rejected; unknown
+  marker rejected; trait reference re-used between two consecutive
+  typed-object encodings; and object reference resolving to the
+  same Date value.
+
+### Notes
+
+- AMF3 round-tripping via the AMF0 `avmplus-object-marker` (0x11)
+  is not yet wired into [`amf::decode`] — the new module is exposed
+  publicly so callers handling AMF3 message-type channels (15 / 16 /
+  17) can use it directly. A follow-up round can add the AMF0 ↔ AMF3
+  switch by extending `amf::Amf0Value` with a `Wrapped(Amf3Value)`
+  variant or by upgrading the command dispatcher to a tagged enum.
+
 - **Enhanced RTMP v2 video FourCC additions** (Veovera 2026).
   `flv::parse_video` / `flv::build_video` now recognise the three
   new `VideoFourCc` values from `enhanced-rtmp-v2.pdf`
@@ -194,12 +242,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   produce correct wire bytes; only the high-level publish helper
   declines to opt in until a future round adds a configurable
   codec list to `RtmpClient`.
-- AMF3 message bodies are still not parsed (TagType 15 /
-  Command type 17 / Data type 15 / Shared-Object type 16). The
-  legacy RTMP 1.0 AMF0 flow is what every commodity ingest
-  endpoint negotiates, but a follow-up round can lift the
-  `amf` module to AMF3 once the `docs/streaming/rtmp/amf3-*.pdf`
-  spec is transcribed.
+- AMF3 message bodies (TagType 15 / Command type 17 / Data
+  type 15 / Shared-Object type 16) are now decodable via the
+  new `amf3` module — see the entry above for the wire-format
+  parser landing.
 
 ## [0.0.3](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.2...v0.0.3) - 2026-05-03
 

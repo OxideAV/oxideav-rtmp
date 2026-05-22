@@ -68,9 +68,15 @@ client.close()?;
 - **Publish direction only.** The server accepts incoming
   publishers; the client pushes to remote servers. RTMP play
   (subscribe / pull) is a follow-up.
-- **AMF0 command flow.** AMF3, shared objects, RTMFP, and the
-  Adobe digest-verified handshake are not implemented; they're
-  essentially unused in modern ingest workflows.
+- **AMF0 command flow** is what every commodity ingest endpoint
+  (OBS / Wirecast / nginx-rtmp / libavformat) negotiates. The
+  [`amf3`] module also ships a complete AMF3 wire-format
+  encoder + decoder — all thirteen markers plus the three
+  reference tables — for the Adobe Media Server clients that
+  switch to AMF3 via the AMF0 `avmplus-object-marker` (0x11)
+  or that open AMF3 message-type channels (15 / 16 / 17). Shared
+  objects, RTMFP, and the Adobe digest-verified handshake remain
+  unimplemented.
 - **H.264 + AAC** are the canonical legacy payloads, plus
   **Enhanced RTMP v1** (Veovera 2023) FourCC video codecs —
   `hvc1` (HEVC / H.265), `av01` (AV1), `vp09` (VP9) — and the
@@ -135,6 +141,7 @@ The lower-level modules are public so callers can compose something
 non-standard:
 
 - `amf::{encode, decode, encode_command, Amf0Value}`
+- `amf3::{encode, decode, decode_all, encode_all, Amf3Value, Decoder}`
 - `chunk::{ChunkReader, ChunkWriter, Message}`
 - `handshake::{client_handshake, server_handshake}`
 - `flv::{parse_video, build_video, parse_audio, build_audio}`
