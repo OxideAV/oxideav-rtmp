@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Client teardown no longer truncates in-flight A/V frames**
+  (`src/client.rs`). `RtmpClient::close` previously did
+  `TcpStream::shutdown(Shutdown::Both)` immediately after writing the
+  `closeStream` command. Closing the read half at the same instant lets
+  the kernel answer the peer's still-unacked data with a RST on some
+  platforms, which discards any audio/video messages the peer hasn't yet
+  drained from its receive buffer — so the last frames plus `closeStream`
+  could vanish mid-stream. `close` now shuts down only the write half
+  (`Shutdown::Write`, a graceful FIN); the peer drains every buffered
+  frame and our `closeStream` command before observing EOF. This
+  resolves the intermittent `loopback_publish` failure (server saw 2 of
+  4 video tags) that surfaced on fast Linux CI runners.
+
 ### Added
 
 - **Enhanced RTMP v2 ModEx prelude** (`src/flv.rs`). `flv::parse_video`

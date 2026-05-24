@@ -336,7 +336,17 @@ impl RtmpClient {
             },
         );
         let _ = self.writer.flush();
-        let _ = self.stream.shutdown(Shutdown::Both);
+        // Shut down the write half only (send a graceful FIN) rather
+        // than the whole socket. `Shutdown::Both` tears the read half
+        // down at the same instant, which on some platforms makes the
+        // kernel answer the peer's still-unacked data with a RST; that
+        // RST discards any A/V messages the peer hasn't yet drained
+        // from its receive buffer — closeStream and the last frames we
+        // just wrote can be thrown away mid-stream. A write-half FIN
+        // lets the peer read every buffered frame plus our closeStream
+        // command, then observe EOF cleanly. The read half closes when
+        // `self` (and its owned `TcpStream`) drops at end of scope.
+        let _ = self.stream.shutdown(Shutdown::Write);
         Ok(())
     }
 
