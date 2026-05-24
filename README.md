@@ -107,8 +107,22 @@ client.close()?;
   `fLaC + STREAMINFO` per Xiph FLAC §7 for FLAC SequenceStart, ATSC
   sync frames for AC-3 / E-AC-3 CodedFrames, MPEG Layer III frames
   for MP3, ISO/IEC 14496-3 `AudioSpecificConfig` for FourCC-AAC
-  SequenceStart). `Multitrack`, `MultichannelConfig`, and `ModEx`
+  SequenceStart). `Multitrack` and `MultichannelConfig`
   AudioPacketTypes parse to opaque bodies pending follow-up rounds.
+- **Enhanced RTMP v2 `ModEx` prelude** (Veovera 2026). The `ModEx`
+  packet-type signal (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" /
+  §"ExAudioTagHeader") is decoded for both audio and video: a chain
+  of size-prefixed `modExData` entries (`UI8 + 1` length, escaping to
+  `0xFF` + `UI16 + 1` for 256..=65536-byte payloads) preceding the
+  FourCC, each terminated by a `modExType | next-PacketType` nibble
+  byte. The chain round-trips through `flv::parse_*` / `flv::build_*`
+  via the new `VideoTag::mod_ex` / `AudioTag::mod_ex` (`Vec<flv::ModEx>`)
+  fields, and the real PacketType is recovered from the chain so the
+  packet adapters route a ModEx-prefixed tag transparently. The only
+  subtype defined today, `TimestampOffsetNano` (a `bytesToUI24`
+  sub-millisecond presentation offset, 0..=999_999 ns), is exposed via
+  `{Video,Audio}Tag::timestamp_offset_nano`; folding that nanosecond
+  offset into the millisecond `Packet` timeline is a follow-up.
 
 ## Pipeline integration (`SourceRegistry`)
 
@@ -150,6 +164,6 @@ non-standard:
   plus `Amf3Value::to_amf0()` and `amf3::AVMPLUS_OBJECT_MARKER`
 - `chunk::{ChunkReader, ChunkWriter, Message}`
 - `handshake::{client_handshake, server_handshake}`
-- `flv::{parse_video, build_video, parse_audio, build_audio}`
+- `flv::{parse_video, build_video, parse_audio, build_audio, ModEx}`
 - `message::build_*` — builders for every protocol-control /
   command message we emit

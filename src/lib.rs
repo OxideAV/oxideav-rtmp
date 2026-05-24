@@ -62,5 +62,5 @@ pub use amf::Amf0Value;
 pub use amf3::Amf3Value;
 pub use client::{RtmpClient, RtmpUrl};
 pub use error::{Error, Result};
-pub use flv::{AudioTag, VideoTag};
+pub use flv::{AudioTag, ModEx, VideoTag};
 pub use server::{PublishRequest, RtmpServer, RtmpSession, StreamPacket};

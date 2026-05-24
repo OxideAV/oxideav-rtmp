@@ -182,6 +182,7 @@ impl RtmpClient {
     /// [`send_video`](Self::send_video).
     pub fn send_video_sequence_header(&mut self, avc_c: &[u8]) -> Result<()> {
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: flv::VIDEO_FRAME_KEYFRAME,
             codec_id: flv::VIDEO_CODEC_AVC,
             avc_packet_type: Some(flv::AVC_PACKET_TYPE_SEQUENCE_HEADER),
@@ -198,6 +199,7 @@ impl RtmpClient {
     /// `is_keyframe` drives the FLV frame_type bits.
     pub fn send_video(&mut self, timestamp_ms: u32, is_keyframe: bool, body: &[u8]) -> Result<()> {
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: if is_keyframe {
                 flv::VIDEO_FRAME_KEYFRAME
             } else {
@@ -233,6 +235,7 @@ impl RtmpClient {
     /// raw-frame [`send_audio`](Self::send_audio).
     pub fn send_audio_sequence_header(&mut self, asc: &[u8]) -> Result<()> {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: flv::AUDIO_FORMAT_AAC,
             sound_rate: 3,
             sound_size_16bit: true,
@@ -248,6 +251,7 @@ impl RtmpClient {
     /// Send one raw AAC frame.
     pub fn send_audio(&mut self, timestamp_ms: u32, aac_frame: &[u8]) -> Result<()> {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: flv::AUDIO_FORMAT_AAC,
             sound_rate: 3,
             sound_size_16bit: true,

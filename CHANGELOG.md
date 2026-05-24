@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enhanced RTMP v2 ModEx prelude** (`src/flv.rs`). `flv::parse_video`
+  / `flv::build_video` and `flv::parse_audio` / `flv::build_audio` now
+  decode and re-emit the `ModEx` packet-type prelude chain per
+  `enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" / §"ExAudioTagHeader" (the
+  `while (packetType == ModEx)` loop). When the PacketType nibble of the
+  header byte is `ModEx (7 for video, 7 for audio)`, a chain of
+  size-prefixed entries precedes the FourCC: each entry is a
+  `modExDataSize` (`UI8 + 1`, escaping to a `0xFF` sentinel + `UI16 + 1`
+  for 256..=65536 bytes), the `modExData` bytes, and a single byte whose
+  high nibble is the `modExType` (`UB[4]`) and whose low nibble is the
+  *next* PacketType (`UB[4]`) — looping until a non-ModEx PacketType
+  terminates the chain. New `flv::ModEx { mod_ex_type, data }` captures
+  each entry; new `VideoTag::mod_ex` / `AudioTag::mod_ex` fields hold the
+  ordered chain and round-trip it verbatim ahead of the real packet
+  type. The only `mod_ex_type` defined today is
+  `TimestampOffsetNano = 0` (a `bytesToUI24` 0..=999_999 ns
+  sub-millisecond presentation offset); `ModEx::timestamp_offset_nano`,
+  `ModEx::timestamp_offset_nano_entry`, and
+  `VideoTag::timestamp_offset_nano` / `AudioTag::timestamp_offset_nano`
+  expose it. Crucially, after parsing, `ex_packet_type` holds the real
+  PacketType recovered from the chain (not `ModEx`), so the
+  `video_to_packet` / `audio_to_packet` adapters route a ModEx-prefixed
+  tag to the correct CodecId + packet flags transparently — previously
+  the header's `7` nibble would have been mis-read as an unknown
+  PacketType and the chain bytes mistaken for the FourCC. New public
+  constants `EX_PACKET_TYPE_MOD_EX`, `EX_PACKET_TYPE_MULTITRACK`,
+  `MOD_EX_TYPE_TIMESTAMP_OFFSET_NANO`; `flv::ModEx` re-exported at the
+  crate root.
+- 9 new tests (8 unit in `src/flv.rs`, 1 integration in
+  `tests/enhanced_rtmp_video.rs`) cover: video + audio
+  TimestampOffsetNano single-entry round-trips, a two-entry chain
+  (TimestampOffsetNano + an unknown subtype preserved verbatim), the
+  UI16 size escape (300-byte modExData), the accessor rejecting the
+  wrong subtype / short data, controlled-failure on truncated chains
+  (missing data / nibble / FourCC) for both audio and video, byte-exact
+  no-prelude output for an empty `mod_ex`, and a full
+  ModEx-wire-bytes → `parse_video` → `video_to_packet` → CodecId
+  resolution + `build_video` round-trip proving the prelude is
+  transparent to the adapter.
 - **AMF3 data / command message routing** (`src/amf3.rs`,
   `src/server.rs`, `src/client.rs`). Wires the r93 AMF3 parser into the
   RTMP message-dispatch path so AMF3-encoded `onMetaData` /

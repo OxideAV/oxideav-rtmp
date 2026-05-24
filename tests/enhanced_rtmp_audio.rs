@@ -109,6 +109,7 @@ fn flac_sequence_start_body_includes_native_signature() {
                  \x2d\x3e\x4f\x50\x61\x72\x83\x94"
         .to_vec();
     let tag = AudioTag {
+        mod_ex: Vec::new(),
         sound_format: AUDIO_FORMAT_EX_HEADER,
         sound_rate: 0,
         sound_size_16bit: false,
@@ -206,6 +207,7 @@ fn build_parse_idempotence_across_all_known_pairs() {
                 vec![0xAA, 0xBB, 0xCC, 0xDD]
             };
             let tag = AudioTag {
+                mod_ex: Vec::new(),
                 sound_format: AUDIO_FORMAT_EX_HEADER,
                 sound_rate: 0,
                 sound_size_16bit: false,

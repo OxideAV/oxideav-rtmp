@@ -243,6 +243,7 @@ fn build_then_parse_then_build_is_idempotent_for_all_fourccs() {
     } in cases
     {
         let tag1 = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: ft,
             codec_id: 0,
             avc_packet_type: None,
@@ -372,4 +373,42 @@ fn video_fourcc_codec_id_maps_v1_and_v2_set_and_falls_back() {
     assert_eq!(video_fourcc_codec_id(FOURCC_AVC).as_str(), "h264");
     assert_eq!(video_fourcc_codec_id(FOURCC_VVC).as_str(), "vvc");
     assert_eq!(video_fourcc_codec_id(*b"zzzz").as_str(), "unknown");
+}
+
+/// A ModEx-prefixed wire payload (Enhanced RTMP v2 §"ExVideoTagHeader")
+/// must decode the prelude chain, recover the real PacketType from the
+/// chain's terminating nibble, and resolve to the correct CodecId plus
+/// packet timing — i.e. the ModEx signal is transparent to the
+/// downstream consumer. Before ModEx support the header's low nibble of
+/// 7 would have been mis-read as an unknown PacketType and the four
+/// chain bytes mistaken for the FourCC.
+#[test]
+fn mod_ex_prefixed_hevc_coded_frames_resolves_through_adapter() {
+    // byte0 = IsExHeader|FrameType=2(inter)|PacketType=7(ModEx) = 0xA7
+    // ModEx entry: size UI8=2 (3-byte data), bytesToUI24(750_000)=0x0B71B0,
+    //   nibble = ModExType(0)|CodedFrames(1) = 0x01
+    // then FourCC hvc1, SI24 CTS=0, NALU body.
+    let payload: Vec<u8> = vec![
+        0xA7, 0x02, 0x0B, 0x71, 0xB0, 0x01, b'h', b'v', b'c', b'1', 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x05, b'h', b'e', b'l', b'l', b'o',
+    ];
+    let tag = parse_video(&payload).expect("parse mod_ex");
+    assert_eq!(tag.fourcc, Some(FOURCC_HEVC));
+    assert_eq!(tag.ex_packet_type, Some(EX_PACKET_TYPE_CODED_FRAMES));
+    assert_eq!(tag.composition_time, 0);
+    assert_eq!(tag.body, b"\x00\x00\x00\x05hello".to_vec());
+    assert_eq!(tag.mod_ex.len(), 1);
+    assert_eq!(tag.timestamp_offset_nano(), 750_000);
+
+    // The adapter routes by the recovered real PacketType, so the
+    // ModEx signal is transparent: same CodecId + flags as a plain
+    // HEVC CodedFrames tag.
+    let pkt = video_to_packet(2000, &tag);
+    assert_eq!(pkt.dts, Some(2000));
+    assert_eq!(pkt.pts, Some(2000));
+    assert!(!pkt.flags.keyframe);
+    assert_eq!(video_codec_id_for_tag(&tag).as_str(), "hevc");
+
+    // Build round-trips the prelude verbatim.
+    assert_eq!(build_video(&tag), payload);
 }

@@ -80,6 +80,170 @@ pub const EX_PACKET_TYPE_METADATA: u8 = 4;
 /// `AV1VideoDescriptor`, mutually exclusive with
 /// `PacketTypeSequenceStart` per the 2023-06-07 revision note).
 pub const EX_PACKET_TYPE_MPEG2TS_SEQUENCE_START: u8 = 5;
+/// `Multitrack` — turns on video multitrack mode. Body shape
+/// (AvMultitrackType + per-track FourCc + track id + size) is
+/// deferred to a follow-up round.
+pub const EX_PACKET_TYPE_MULTITRACK: u8 = 6;
+/// `ModEx` — modifier/extension marker that introduces a chain of
+/// size-prefixed ModEx packets before the *real* VideoPacketType is
+/// read (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" — the
+/// `while (videoPacketType == VideoPacketType.ModEx)` loop). One of
+/// these chains can carry high-precision timestamps
+/// (`TimestampOffsetNano`) or other future per-message modifiers.
+pub const EX_PACKET_TYPE_MOD_EX: u8 = 7;
+
+/// `enum VideoPacketModExType` / `enum AudioPacketModExType`
+/// (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" / §"ExAudioTagHeader").
+/// `TimestampOffsetNano = 0` is the only subtype defined today: the
+/// ModEx data carries a `bytesToUI24` nanosecond offset (0..=999_999
+/// ns) added to the current media message's presentation time
+/// without altering the core RTMP millisecond timestamp.
+pub const MOD_EX_TYPE_TIMESTAMP_OFFSET_NANO: u8 = 0;
+
+/// One entry in the Enhanced RTMP v2 ModEx prelude chain
+/// (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" / §"ExAudioTagHeader").
+///
+/// On the wire each entry is `modExDataSize` (1-byte `UI8 + 1`, or a
+/// 16-bit `UI16 + 1` escape when the 8-bit form would be 256),
+/// followed by `modExDataSize` bytes of `modExData`, then a single
+/// byte whose high nibble is the [`mod_ex_type`][ModEx::mod_ex_type]
+/// (`UB[4]`) and whose low nibble is the *next* PacketType (`UB[4]`).
+/// The decoded struct keeps only the per-entry payload; the trailing
+/// nibble byte is reconstructed from the chain order + the tag's real
+/// packet type when re-encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModEx {
+    /// `AudioPacketModExType` / `VideoPacketModExType` — the high
+    /// nibble of the byte that follows the data. One of
+    /// `MOD_EX_TYPE_*` (only `TimestampOffsetNano = 0` defined today).
+    pub mod_ex_type: u8,
+    /// Raw `modExData` bytes (1..=65536 bytes). For
+    /// `TimestampOffsetNano` this is at least 3 bytes whose first
+    /// three big-endian bytes are the UI24 nanosecond offset.
+    pub data: Vec<u8>,
+}
+
+impl ModEx {
+    /// Decode the `TimestampOffsetNano` value (`bytesToUI24` of the
+    /// first three `data` bytes) when this entry is that subtype.
+    /// Returns `None` for any other `mod_ex_type` or if `data` is
+    /// shorter than the spec-mandated three bytes.
+    pub fn timestamp_offset_nano(&self) -> Option<u32> {
+        if self.mod_ex_type != MOD_EX_TYPE_TIMESTAMP_OFFSET_NANO || self.data.len() < 3 {
+            return None;
+        }
+        Some(((self.data[0] as u32) << 16) | ((self.data[1] as u32) << 8) | (self.data[2] as u32))
+    }
+
+    /// Build a `TimestampOffsetNano` ModEx entry from a nanosecond
+    /// offset (0..=999_999 ns per spec) encoded as a `bytesToUI24`
+    /// 3-byte big-endian payload.
+    pub fn timestamp_offset_nano_entry(nano: u32) -> ModEx {
+        ModEx {
+            mod_ex_type: MOD_EX_TYPE_TIMESTAMP_OFFSET_NANO,
+            data: vec![(nano >> 16) as u8, (nano >> 8) as u8, nano as u8],
+        }
+    }
+}
+
+/// Parse a ModEx prelude chain starting at `payload[start]` (the
+/// `payload[start - 1]` low nibble was already decoded as
+/// `PacketType.ModEx`). Returns the decoded entries, the *real*
+/// PacketType nibble that terminates the chain, and the offset of
+/// the first byte after the chain.
+///
+/// Per `enhanced-rtmp-v2.pdf` the loop is identical for audio and
+/// video: read `modExDataSize` (`UI8 + 1`, escaping to `UI16 + 1`
+/// when the 8-bit form would be 256), read that many data bytes,
+/// then read one nibble byte (`modExType:UB[4] | packetType:UB[4]`)
+/// — repeating while the new packetType is again `ModEx`.
+fn parse_mod_ex_chain(
+    payload: &[u8],
+    start: usize,
+    mod_ex_value: u8,
+    what: &str,
+) -> Result<(Vec<ModEx>, u8, usize)> {
+    let mut pos = start;
+    let mut chain = Vec::new();
+    loop {
+        // modExDataSize = UI8 + 1
+        if pos >= payload.len() {
+            return Err(Error::Other(format!(
+                "Enhanced RTMP {what} ModEx: truncated reading modExDataSize"
+            )));
+        }
+        let mut size = payload[pos] as usize + 1;
+        pos += 1;
+        // If the 8-bit form maxes out (== 256), a UI16 + 1 follows.
+        if size == 256 {
+            if pos + 2 > payload.len() {
+                return Err(Error::Other(format!(
+                    "Enhanced RTMP {what} ModEx: truncated reading 16-bit modExDataSize"
+                )));
+            }
+            size = (((payload[pos] as usize) << 8) | (payload[pos + 1] as usize)) + 1;
+            pos += 2;
+        }
+        // modExData = UI8[modExDataSize]
+        if pos + size > payload.len() {
+            return Err(Error::Other(format!(
+                "Enhanced RTMP {what} ModEx: truncated reading {size}-byte modExData"
+            )));
+        }
+        let data = payload[pos..pos + size].to_vec();
+        pos += size;
+        // nibble byte: modExType (UB[4], high) | packetType (UB[4], low)
+        if pos >= payload.len() {
+            return Err(Error::Other(format!(
+                "Enhanced RTMP {what} ModEx: truncated reading modExType/packetType nibble"
+            )));
+        }
+        let nibble = payload[pos];
+        pos += 1;
+        let mod_ex_type = (nibble >> 4) & 0x0F;
+        let next_packet_type = nibble & 0x0F;
+        chain.push(ModEx { mod_ex_type, data });
+        if next_packet_type != mod_ex_value {
+            return Ok((chain, next_packet_type, pos));
+        }
+        // Another ModEx entry follows.
+    }
+}
+
+/// Append a ModEx prelude chain to `out`. Each entry writes the
+/// `modExDataSize` (`UI8 + 1`, or the `0xFF` + `UI16 + 1` escape
+/// when the data is 257..=65536 bytes), the data bytes, and a nibble
+/// byte whose high nibble is the entry's `mod_ex_type` and whose low
+/// nibble is the PacketType to read *next* — `ModEx` for every entry
+/// except the last, whose low nibble is the real `packet_type`.
+fn build_mod_ex_chain(out: &mut Vec<u8>, chain: &[ModEx], mod_ex_value: u8, real_packet_type: u8) {
+    for (i, entry) in chain.iter().enumerate() {
+        let len = entry.data.len();
+        // UI8 form covers 1..=255 bytes (stored as len - 1, 0..=254).
+        // A stored UI8 of 255 means modExDataSize == 256, which the
+        // parser reads as the "switch to UI16" escape — so 256..=65536
+        // bytes always take the escape form (UI16 = len - 1).
+        if (1..=255).contains(&len) {
+            out.push((len - 1) as u8);
+        } else {
+            // UI16 escape: emit 0xFF (the 8-bit 256 sentinel), then
+            // (len - 1) as UI16. len is clamped to the 16-bit range.
+            out.push(0xFF);
+            let v16 = (len.saturating_sub(1)).min(0xFFFF) as u16;
+            out.push((v16 >> 8) as u8);
+            out.push(v16 as u8);
+        }
+        out.extend_from_slice(&entry.data);
+        // The terminating nibble byte points at the *next* packet
+        // type: ModEx while more entries follow, the real type last.
+        let next = if i + 1 < chain.len() {
+            mod_ex_value
+        } else {
+            real_packet_type
+        };
+        out.push(((entry.mod_ex_type & 0x0F) << 4) | (next & 0x0F));
+    }
+}
 
 // Enhanced RTMP §"Defining Additional Video Codecs", Table 4
 // "Video FourCC" row. FourCCs are read as four ASCII bytes in
@@ -232,6 +396,16 @@ pub struct VideoTag {
     /// (HEVC, v1), `b"vp08"` (VP8, v2), `b"avc1"` (AVC/H.264 in
     /// FourCC mode, v2), `b"vvc1"` (VVC/H.266, v2).
     pub fourcc: Option<[u8; 4]>,
+    /// Enhanced RTMP v2 ModEx prelude chain
+    /// (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader"). Empty for
+    /// legacy tags and for Enhanced tags that carry no modifier.
+    /// Each entry was a `PacketType.ModEx` step before the real
+    /// [`ex_packet_type`][VideoTag::ex_packet_type] was decoded;
+    /// the chain is re-emitted verbatim ahead of the real packet
+    /// type on build. The only subtype defined today is
+    /// `TimestampOffsetNano` (high-precision sub-millisecond
+    /// presentation offset).
+    pub mod_ex: Vec<ModEx>,
 }
 
 impl VideoTag {
@@ -260,6 +434,18 @@ impl VideoTag {
     /// short-circuit on this predicate first.
     pub fn is_ex_metadata(&self) -> bool {
         self.fourcc.is_some() && self.ex_packet_type == Some(EX_PACKET_TYPE_METADATA)
+    }
+
+    /// Sum of the `TimestampOffsetNano` ModEx entries on this tag, in
+    /// nanoseconds. Per `enhanced-rtmp-v2.pdf` the offset is added to
+    /// the current media message's presentation time without altering
+    /// the core RTMP millisecond timestamp. Returns `0` when no such
+    /// entry is present.
+    pub fn timestamp_offset_nano(&self) -> u32 {
+        self.mod_ex
+            .iter()
+            .filter_map(ModEx::timestamp_offset_nano)
+            .fold(0u32, |acc, n| acc.saturating_add(n))
     }
 }
 
@@ -295,25 +481,44 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
     }
     let b0 = payload[0];
     if (b0 & VIDEO_IS_EX_HEADER) != 0 {
-        // --- Enhanced RTMP v1 framing ---
+        // --- Enhanced RTMP v1/v2 framing ---
         //
         //   byte 0      = IsExHeader(1) | FrameType(3) | PacketType(4)
-        //   byte 1..=4  = FourCC (4 ASCII bytes)
-        //   byte 5..    = body, with shape depending on FourCC × PacketType
+        //   [ModEx prelude chain — present only when PacketType == ModEx]
+        //   byte ..=+3  = FourCC (4 ASCII bytes)
+        //   byte ..     = body, with shape depending on FourCC × PacketType
         //
         // Per spec, when PacketType == Metadata the FrameType
         // flags above the nibble are required to be ignored;
         // we still preserve the raw bits in `frame_type` so
         // callers that diff fixtures can see them.
         let frame_type = (b0 >> 4) & 0b0111;
-        let packet_type = b0 & 0x0F;
-        if payload.len() < 5 {
+        let mut packet_type = b0 & 0x0F;
+        let mut pos = 1;
+
+        // ModEx prelude (enhanced-rtmp-v2.pdf §"ExVideoTagHeader"):
+        // while the freshly-read PacketType nibble is ModEx, consume
+        // a size-prefixed modExData entry + the trailing
+        // modExType/packetType nibble byte, looping until a non-ModEx
+        // PacketType terminates the chain. The chain sits between the
+        // header byte and the FourCC.
+        let mut mod_ex = Vec::new();
+        if packet_type == EX_PACKET_TYPE_MOD_EX {
+            let (chain, real_pt, next) =
+                parse_mod_ex_chain(payload, pos, EX_PACKET_TYPE_MOD_EX, "video")?;
+            mod_ex = chain;
+            packet_type = real_pt;
+            pos = next;
+        }
+
+        if pos + 4 > payload.len() {
             return Err(Error::Other(
-                "Enhanced RTMP video tag: need 5+ bytes (IsExHeader + FourCC)".into(),
+                "Enhanced RTMP video tag: need 4 bytes for FourCC after header/ModEx".into(),
             ));
         }
         let mut fcc = [0u8; 4];
-        fcc.copy_from_slice(&payload[1..5]);
+        fcc.copy_from_slice(&payload[pos..pos + 4]);
+        pos += 4;
 
         // SI24 CompositionTime is on the wire only for the
         // three NALU-based FourCCs paired with
@@ -329,16 +534,17 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
         let needs_cts = packet_type == EX_PACKET_TYPE_CODED_FRAMES
             && (fcc == FOURCC_HEVC || fcc == FOURCC_AVC || fcc == FOURCC_VVC);
         let (cts, body_start) = if needs_cts {
-            if payload.len() < 8 {
+            if pos + 3 > payload.len() {
                 return Err(Error::Other(
-                    "Enhanced RTMP / HEVC CodedFrames: need 8+ bytes for SI24 CTS".into(),
+                    "Enhanced RTMP / HEVC CodedFrames: need 3 bytes for SI24 CTS".into(),
                 ));
             }
-            let raw =
-                ((payload[5] as i32) << 16) | ((payload[6] as i32) << 8) | (payload[7] as i32);
-            (sign_extend_si24(raw), 8)
+            let raw = ((payload[pos] as i32) << 16)
+                | ((payload[pos + 1] as i32) << 8)
+                | (payload[pos + 2] as i32);
+            (sign_extend_si24(raw), pos + 3)
         } else {
-            (0, 5)
+            (0, pos)
         };
 
         Ok(VideoTag {
@@ -349,6 +555,7 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
             body: payload[body_start..].to_vec(),
             ex_packet_type: Some(packet_type),
             fourcc: Some(fcc),
+            mod_ex,
         })
     } else {
         // --- Legacy pre-2023 framing ---
@@ -369,6 +576,7 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
                 body: payload[5..].to_vec(),
                 ex_packet_type: None,
                 fourcc: None,
+                mod_ex: Vec::new(),
             })
         } else {
             Ok(VideoTag {
@@ -379,6 +587,7 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
                 body: payload[1..].to_vec(),
                 ex_packet_type: None,
                 fourcc: None,
+                mod_ex: Vec::new(),
             })
         }
     }
@@ -399,12 +608,23 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
 pub fn build_video(tag: &VideoTag) -> Vec<u8> {
     if let Some(fcc) = tag.fourcc {
         let packet_type = tag.ex_packet_type.unwrap_or(EX_PACKET_TYPE_CODED_FRAMES);
+        // When a ModEx prelude is present the header byte's
+        // PacketType nibble is `ModEx`; the *real* packet type is
+        // carried by the terminating nibble of the chain
+        // (enhanced-rtmp-v2.pdf §"ExVideoTagHeader"). Otherwise the
+        // header nibble is the real packet type directly.
+        let header_pt = if tag.mod_ex.is_empty() {
+            packet_type
+        } else {
+            EX_PACKET_TYPE_MOD_EX
+        };
         // Per Enhanced RTMP §"Defining Additional Video Codecs"
         // FrameType is UB[3] (i.e. lives in bits 4..=6 — bit 7
         // is IsExHeader). Mask to 3 bits before packing.
-        let head = VIDEO_IS_EX_HEADER | ((tag.frame_type & 0x07) << 4) | (packet_type & 0x0F);
+        let head = VIDEO_IS_EX_HEADER | ((tag.frame_type & 0x07) << 4) | (header_pt & 0x0F);
         let mut out = Vec::with_capacity(tag.body.len() + 8);
         out.push(head);
+        build_mod_ex_chain(&mut out, &tag.mod_ex, EX_PACKET_TYPE_MOD_EX, packet_type);
         out.extend_from_slice(&fcc);
         // Mirrors the parse-side `needs_cts` rule: HEVC / AVC /
         // VVC + CodedFrames emit the SI24 composition-time;
@@ -486,6 +706,15 @@ pub struct AudioTag {
     /// `OpusCodedData`, `Mp3CodedData`, `AacCodedData`,
     /// `FlacCodedData`); empty for `SequenceEnd`.
     pub body: Vec<u8>,
+    /// Enhanced RTMP v2 ModEx prelude chain
+    /// (`enhanced-rtmp-v2.pdf` §"ExAudioTagHeader"). Empty for
+    /// legacy tags and for Enhanced tags that carry no modifier.
+    /// Each entry was an `AudioPacketType.ModEx` step before the
+    /// real [`ex_packet_type`][AudioTag::ex_packet_type] was
+    /// decoded; the chain is re-emitted verbatim ahead of the real
+    /// packet type on build. The only subtype defined today is
+    /// `TimestampOffsetNano`.
+    pub mod_ex: Vec<ModEx>,
 }
 
 impl AudioTag {
@@ -513,6 +742,16 @@ impl AudioTag {
     pub fn is_ex_sequence_header(&self) -> bool {
         self.audio_fourcc.is_some() && self.ex_packet_type == Some(AUDIO_PACKET_TYPE_SEQUENCE_START)
     }
+
+    /// Sum of the `TimestampOffsetNano` ModEx entries on this tag, in
+    /// nanoseconds (added to the message presentation time without
+    /// altering the RTMP millisecond timestamp). `0` when absent.
+    pub fn timestamp_offset_nano(&self) -> u32 {
+        self.mod_ex
+            .iter()
+            .filter_map(ModEx::timestamp_offset_nano)
+            .fold(0u32, |acc, n| acc.saturating_add(n))
+    }
 }
 
 /// Decode the FLV audio-tag header from an RTMP audio message
@@ -534,11 +773,13 @@ impl AudioTag {
 /// `ex_packet_type` / FourCC by returning the raw bytes in the
 /// struct (callers decide whether to ignore the tag or fail).
 ///
-/// NOTE: the `Multitrack` and `ModEx` AudioPacketTypes have
-/// nested layouts (per-track FourCC + size-prefixed track chunks,
-/// or a chain of `modExDataSize + modExData + modExType`
-/// preludes). They are deferred to a follow-up round; if the
-/// nibble decodes to either value, the body is preserved verbatim
+/// The `ModEx` AudioPacketType prelude (a chain of
+/// `modExDataSize + modExData + modExType/packetType` entries before
+/// the real packet type) is now decoded into [`AudioTag::mod_ex`].
+/// The `Multitrack` and `MultichannelConfig` AudioPacketTypes still
+/// have nested layouts (per-track FourCC + size-prefixed track chunks;
+/// AudioChannelOrder + channel map) deferred to a follow-up round; if
+/// the nibble decodes to either value, the body is preserved verbatim
 /// and the caller is expected to skip the message rather than
 /// interpret it as a normal coded-frame tag.
 pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
@@ -551,8 +792,9 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
         // --- Enhanced RTMP v2 framing ---
         //
         //   byte 0     = SoundFormat=9(4) | AudioPacketType(4)
-        //   byte 1..=4 = AudioFourCc (4 ASCII bytes)
-        //   byte 5..   = body, per (FourCc, PacketType) per
+        //   [ModEx prelude chain — present only when packetType == ModEx]
+        //   byte ..=+3 = AudioFourCc (4 ASCII bytes)
+        //   byte ..    = body, per (FourCc, PacketType) per
         //                §"ExAudioTagBody"
         //
         // Per spec the legacy bit-field SoundRate/SoundSize/
@@ -561,14 +803,31 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
         // (incorrectly) keys off them gets a clearly-zero answer
         // instead of an arbitrary alias of the AudioPacketType
         // nibble.
-        let packet_type = b0 & 0x0F;
-        if payload.len() < 5 {
+        let mut packet_type = b0 & 0x0F;
+        let mut pos = 1;
+
+        // ModEx prelude (enhanced-rtmp-v2.pdf §"ExAudioTagHeader"):
+        // identical loop to the video path — consume size-prefixed
+        // modExData + the trailing modExType/packetType nibble while
+        // the PacketType nibble is ModEx. The chain sits between the
+        // header byte and the FourCC.
+        let mut mod_ex = Vec::new();
+        if packet_type == AUDIO_PACKET_TYPE_MOD_EX {
+            let (chain, real_pt, next) =
+                parse_mod_ex_chain(payload, pos, AUDIO_PACKET_TYPE_MOD_EX, "audio")?;
+            mod_ex = chain;
+            packet_type = real_pt;
+            pos = next;
+        }
+
+        if pos + 4 > payload.len() {
             return Err(Error::Other(
-                "Enhanced RTMP audio tag: need 5+ bytes (ExHeader + FourCC)".into(),
+                "Enhanced RTMP audio tag: need 4 bytes for FourCC after header/ModEx".into(),
             ));
         }
         let mut fcc = [0u8; 4];
-        fcc.copy_from_slice(&payload[1..5]);
+        fcc.copy_from_slice(&payload[pos..pos + 4]);
+        pos += 4;
         Ok(AudioTag {
             sound_format,
             sound_rate: 0,
@@ -577,7 +836,8 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
             aac_packet_type: None,
             ex_packet_type: Some(packet_type),
             audio_fourcc: Some(fcc),
-            body: payload[5..].to_vec(),
+            body: payload[pos..].to_vec(),
+            mod_ex,
         })
     } else {
         // --- Legacy pre-2023 framing ---
@@ -597,6 +857,7 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
                 ex_packet_type: None,
                 audio_fourcc: None,
                 body: payload[2..].to_vec(),
+                mod_ex: Vec::new(),
             })
         } else {
             Ok(AudioTag {
@@ -608,6 +869,7 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
                 ex_packet_type: None,
                 audio_fourcc: None,
                 body: payload[1..].to_vec(),
+                mod_ex: Vec::new(),
             })
         }
     }
@@ -628,9 +890,19 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
 pub fn build_audio(tag: &AudioTag) -> Vec<u8> {
     if let Some(fcc) = tag.audio_fourcc {
         let packet_type = tag.ex_packet_type.unwrap_or(AUDIO_PACKET_TYPE_CODED_FRAMES);
-        let head = (AUDIO_FORMAT_EX_HEADER << 4) | (packet_type & 0x0F);
+        // When a ModEx prelude is present the header byte's
+        // AudioPacketType nibble is `ModEx`; the real packet type is
+        // carried by the terminating nibble of the chain
+        // (enhanced-rtmp-v2.pdf §"ExAudioTagHeader").
+        let header_pt = if tag.mod_ex.is_empty() {
+            packet_type
+        } else {
+            AUDIO_PACKET_TYPE_MOD_EX
+        };
+        let head = (AUDIO_FORMAT_EX_HEADER << 4) | (header_pt & 0x0F);
         let mut out = Vec::with_capacity(tag.body.len() + 5);
         out.push(head);
+        build_mod_ex_chain(&mut out, &tag.mod_ex, AUDIO_PACKET_TYPE_MOD_EX, packet_type);
         out.extend_from_slice(&fcc);
         out.extend_from_slice(&tag.body);
         out
@@ -656,6 +928,7 @@ mod tests {
     #[test]
     fn video_tag_avc_nalu_roundtrip() {
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: VIDEO_CODEC_AVC,
             avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
@@ -673,6 +946,7 @@ mod tests {
     #[test]
     fn video_tag_negative_cts_sign_extends() {
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: VIDEO_CODEC_AVC,
             avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
@@ -693,6 +967,7 @@ mod tests {
         // SequenceStart: HEVCDecoderConfigurationRecord in body,
         // no SI24 CTS on the wire.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -721,6 +996,7 @@ mod tests {
         // keeps the SI24 CTS on the wire (per Table 4's HEVC
         // pseudocode).
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: 0,
             avc_packet_type: None,
@@ -748,6 +1024,7 @@ mod tests {
         // CodedFramesX is the SI24=0 optimisation — three
         // bytes off the wire vs CodedFrames.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: 0,
             avc_packet_type: None,
@@ -776,6 +1053,7 @@ mod tests {
         // AV1 SequenceStart body is the
         // AV1CodecConfigurationRecord (per spec). No CTS.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -801,6 +1079,7 @@ mod tests {
         // §"If FourCC == AV1"). Still no CTS — only HEVC keeps
         // composition-time on the wire.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -825,6 +1104,7 @@ mod tests {
         // VP9 CodedFrames body "MUST contain full frames"
         // (Enhanced RTMP v1 §"If FourCC == VP9").
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -846,6 +1126,7 @@ mod tests {
     fn ex_video_tag_sequence_end_empty_body() {
         // SequenceEnd carries no codec data — body is empty.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -873,6 +1154,7 @@ mod tests {
         // be ignored." We still preserve the bits — caller
         // policy decides.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INFO, // would be "ignored" per spec
             codec_id: 0,
             avc_packet_type: None,
@@ -904,6 +1186,7 @@ mod tests {
             VIDEO_FRAME_INFO,
         ] {
             let tag = VideoTag {
+                mod_ex: Vec::new(),
                 frame_type: ft,
                 codec_id: VIDEO_CODEC_AVC,
                 avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
@@ -927,6 +1210,7 @@ mod tests {
         // [VPCodecConfigurationRecord]`). No CTS — VP8 has no
         // B-frames.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -953,6 +1237,7 @@ mod tests {
         // VP8 CodedFrames body is one or more full frames; no CTS
         // on the wire (no B-frame ordering).
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: 0,
             avc_packet_type: None,
@@ -979,6 +1264,7 @@ mod tests {
         // §"Enhanced Video"). No CTS on SequenceStart for any
         // FourCC, AVC included.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -1005,6 +1291,7 @@ mod tests {
         // negative offset (-100) to also exercise the sign-extend
         // path through both build and parse.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: 0,
             avc_packet_type: None,
@@ -1030,6 +1317,7 @@ mod tests {
         // CodedFramesX optimisation — same as HEVC: no SI24 on the
         // wire, three bytes saved.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: 0,
             avc_packet_type: None,
@@ -1055,6 +1343,7 @@ mod tests {
         // (per ISO/IEC 14496-15:2024 §11.2.4.2). No CTS on
         // SequenceStart.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -1078,6 +1367,7 @@ mod tests {
         // the §"ExVideoTagBody" pseudocode `if (videoFourCc ==
         // VideoFourCc.Vvc) { compositionTimeOffset = SI24 }`.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -1101,6 +1391,7 @@ mod tests {
     #[test]
     fn ex_video_tag_vvc_coded_frames_x_omits_cts() {
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: 0,
             avc_packet_type: None,
@@ -1140,6 +1431,7 @@ mod tests {
         // can't accidentally alias one to another.
         for &fcc in &[FOURCC_VP8, FOURCC_AVC, FOURCC_VVC] {
             let tag = VideoTag {
+                mod_ex: Vec::new(),
                 frame_type: VIDEO_FRAME_KEYFRAME,
                 codec_id: 0,
                 avc_packet_type: None,
@@ -1162,6 +1454,7 @@ mod tests {
     #[test]
     fn audio_tag_aac_sequence_header_roundtrip() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_AAC,
             sound_rate: 3,
             sound_size_16bit: true,
@@ -1189,6 +1482,7 @@ mod tests {
         // RFC 7845 §5.1; we use a tiny stub here since the
         // framing layer doesn't validate codec-payload internals).
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -1224,6 +1518,7 @@ mod tests {
         // undelimited framing from Section 3 of [RFC6716]." The
         // framing layer treats the body as opaque bytes.
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -1251,6 +1546,7 @@ mod tests {
         // section 7 of the FLAC specification." The framing layer
         // treats this as opaque.
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -1277,6 +1573,7 @@ mod tests {
         // Compression (AC-3, E-AC-3)." No SequenceStart shape is
         // defined for AC-3 in v2 — only CodedFrames carries data.
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -1298,6 +1595,7 @@ mod tests {
     #[test]
     fn ex_audio_tag_eac3_coded_frames_roundtrip() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -1321,6 +1619,7 @@ mod tests {
         // frames. Each frame is a data block with its own header
         // and audio information."
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -1346,6 +1645,7 @@ mod tests {
         // but reached via FourCC instead of the legacy
         // SoundFormat=10 / AACPacketType=0 path.
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -1372,6 +1672,7 @@ mod tests {
     #[test]
     fn ex_audio_tag_sequence_end_empty_body() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -1423,5 +1724,210 @@ mod tests {
         ] {
             assert_ne!(sf, AUDIO_FORMAT_EX_HEADER, "sf={sf}");
         }
+    }
+
+    // ------- Enhanced RTMP v2 ModEx prelude (Veovera 2026) -------
+
+    #[test]
+    fn ex_video_mod_ex_timestamp_offset_nano_roundtrip() {
+        // A single TimestampOffsetNano ModEx entry preceding a VVC
+        // CodedFrames packet. Header byte low nibble = ModEx(7);
+        // chain carries the real CodedFrames(1) packet type in its
+        // terminating nibble; SI24 CTS then follows the FourCC.
+        let nano = 999_999u32; // spec max sub-millisecond offset.
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_INTER,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 7,
+            body: b"\x00\x00\x00\x05nalu!".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+            fourcc: Some(FOURCC_VVC),
+            mod_ex: vec![ModEx::timestamp_offset_nano_entry(nano)],
+        };
+        let payload = build_video(&tag);
+        // byte 0 = IsExHeader|FrameType(2)|ModEx(7) = 0b1010_0111 = 0xA7.
+        assert_eq!(payload[0], 0xA7);
+        // modExDataSize = UI8 + 1 → data is 3 bytes, so UI8 = 2.
+        assert_eq!(payload[1], 2);
+        // modExData = bytesToUI24(999_999) = 0x0F_423F.
+        assert_eq!(&payload[2..5], &[0x0F, 0x42, 0x3F]);
+        // nibble byte: modExType(0, high) | packetType CodedFrames(1, low).
+        assert_eq!(payload[5], 0x01);
+        // FourCC then SI24 CTS then body.
+        assert_eq!(&payload[6..10], b"vvc1");
+        assert_eq!(&payload[10..13], &[0x00, 0x00, 0x07]);
+        assert_eq!(&payload[13..], b"\x00\x00\x00\x05nalu!");
+
+        let back = parse_video(&payload).unwrap();
+        assert_eq!(back, tag);
+        assert_eq!(back.timestamp_offset_nano(), nano);
+        assert_eq!(back.mod_ex[0].timestamp_offset_nano(), Some(nano));
+    }
+
+    #[test]
+    fn ex_video_mod_ex_chain_multiple_entries_roundtrip() {
+        // Two chained ModEx entries before an AV1 SequenceStart.
+        // The first entry's terminating nibble is ModEx again; the
+        // second's is the real SequenceStart(0).
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: b"av1cfg".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
+            fourcc: Some(FOURCC_AV1),
+            mod_ex: vec![
+                ModEx::timestamp_offset_nano_entry(500_000),
+                ModEx {
+                    mod_ex_type: 3, // a future/unknown subtype: preserved verbatim
+                    data: vec![0xAA, 0xBB],
+                },
+            ],
+        };
+        let payload = build_video(&tag);
+        // First entry: size byte (2 → 3-byte data), data, nibble
+        // (ModExType 0 | ModEx 7) = 0x07.
+        assert_eq!(payload[1], 2);
+        assert_eq!(&payload[2..5], &[0x07, 0xA1, 0x20]); // bytesToUI24(500_000)
+        assert_eq!(payload[5], 0x07);
+        // Second entry: size byte (1 → 2-byte data), data, nibble
+        // (ModExType 3 | SequenceStart 0) = 0x30.
+        assert_eq!(payload[6], 1);
+        assert_eq!(&payload[7..9], &[0xAA, 0xBB]);
+        assert_eq!(payload[9], 0x30);
+        assert_eq!(&payload[10..14], b"av01");
+        assert_eq!(&payload[14..], b"av1cfg");
+
+        let back = parse_video(&payload).unwrap();
+        assert_eq!(back, tag);
+        // Only the TimestampOffsetNano entry contributes to the sum.
+        assert_eq!(back.timestamp_offset_nano(), 500_000);
+    }
+
+    #[test]
+    fn ex_video_mod_ex_ui16_size_escape_roundtrip() {
+        // modExData longer than 255 bytes uses the UI16 escape:
+        // the 8-bit size byte is 0xFF (== 256 sentinel) followed by
+        // a UI16 of (len - 1).
+        let big = vec![0x5A; 300];
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_INTER,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: b"hevc-frame".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES_X),
+            fourcc: Some(FOURCC_HEVC),
+            mod_ex: vec![ModEx {
+                mod_ex_type: MOD_EX_TYPE_TIMESTAMP_OFFSET_NANO,
+                data: big.clone(),
+            }],
+        };
+        let payload = build_video(&tag);
+        // size: 0xFF sentinel + UI16(len-1 = 299 = 0x012B).
+        assert_eq!(payload[1], 0xFF);
+        assert_eq!(&payload[2..4], &[0x01, 0x2B]);
+        assert_eq!(&payload[4..4 + 300], &big[..]);
+        // nibble after data: ModExType 0 | CodedFramesX(3).
+        assert_eq!(payload[4 + 300], 0x03);
+
+        let back = parse_video(&payload).unwrap();
+        assert_eq!(back, tag);
+        assert_eq!(back.mod_ex[0].data.len(), 300);
+    }
+
+    #[test]
+    fn ex_audio_mod_ex_timestamp_offset_nano_roundtrip() {
+        // ModEx prelude on an Opus CodedFrames audio tag.
+        let nano = 250_000u32;
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(AUDIO_PACKET_TYPE_CODED_FRAMES),
+            audio_fourcc: Some(FOURCC_OPUS),
+            body: b"opus-pkt".to_vec(),
+            mod_ex: vec![ModEx::timestamp_offset_nano_entry(nano)],
+        };
+        let payload = build_audio(&tag);
+        // byte 0 = ExHeader(9) << 4 | ModEx(7) = 0x97.
+        assert_eq!(payload[0], 0x97);
+        assert_eq!(payload[1], 2); // 3-byte data → UI8 = 2.
+        assert_eq!(&payload[2..5], &[0x03, 0xD0, 0x90]); // bytesToUI24(250_000)
+                                                         // nibble: ModExType 0 | CodedFrames(1).
+        assert_eq!(payload[5], 0x01);
+        assert_eq!(&payload[6..10], b"Opus");
+        assert_eq!(&payload[10..], b"opus-pkt");
+
+        let back = parse_audio(&payload).unwrap();
+        assert_eq!(back, tag);
+        assert_eq!(back.timestamp_offset_nano(), nano);
+    }
+
+    #[test]
+    fn mod_ex_accessor_rejects_wrong_type_and_short_data() {
+        // timestamp_offset_nano() only resolves for the
+        // TimestampOffsetNano subtype with >= 3 data bytes.
+        let wrong_type = ModEx {
+            mod_ex_type: 1,
+            data: vec![0, 0, 0],
+        };
+        assert_eq!(wrong_type.timestamp_offset_nano(), None);
+        let too_short = ModEx {
+            mod_ex_type: MOD_EX_TYPE_TIMESTAMP_OFFSET_NANO,
+            data: vec![0x00, 0x01],
+        };
+        assert_eq!(too_short.timestamp_offset_nano(), None);
+    }
+
+    #[test]
+    fn ex_video_mod_ex_truncated_chain_fails_controlled() {
+        // Header announces ModEx but the chain is cut short — the
+        // parser must surface a controlled error, not panic / index
+        // out of bounds.
+        // byte0 = IsExHeader|FrameType1|ModEx7 = 0x97 then a size
+        // byte claiming 3 data bytes but no data following.
+        let truncated = [0x97u8, 0x02];
+        assert!(parse_video(&truncated).is_err());
+        // Size + data present but missing the modExType/packetType nibble.
+        let no_nibble = [0x97u8, 0x02, 0x00, 0x00, 0x00];
+        assert!(parse_video(&no_nibble).is_err());
+        // Chain terminates with a real packet type but no FourCC.
+        let no_fourcc = [0x97u8, 0x02, 0x00, 0x00, 0x00, 0x01];
+        assert!(parse_video(&no_fourcc).is_err());
+    }
+
+    #[test]
+    fn ex_audio_mod_ex_truncated_chain_fails_controlled() {
+        let truncated = [0x97u8, 0x02];
+        assert!(parse_audio(&truncated).is_err());
+        let no_fourcc = [0x97u8, 0x02, 0x00, 0x00, 0x00, 0x01];
+        assert!(parse_audio(&no_fourcc).is_err());
+    }
+
+    #[test]
+    fn ex_video_without_mod_ex_emits_no_prelude() {
+        // Empty mod_ex must produce byte-identical output to the
+        // pre-ModEx encoding (no spurious prelude bytes).
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: b"\x01cfg".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
+            fourcc: Some(FOURCC_HEVC),
+            mod_ex: Vec::new(),
+        };
+        let payload = build_video(&tag);
+        // Header low nibble is the real packet type, not ModEx.
+        assert_eq!(payload[0] & 0x0F, EX_PACKET_TYPE_SEQUENCE_START);
+        assert_eq!(&payload[1..5], b"hvc1");
+        assert_eq!(&payload[5..], b"\x01cfg");
+        assert_eq!(parse_video(&payload).unwrap(), tag);
     }
 }

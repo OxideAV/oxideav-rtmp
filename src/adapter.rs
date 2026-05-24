@@ -784,6 +784,7 @@ mod tests {
     #[test]
     fn audio_aac_seq_header_packet_carries_marker_and_header_flag() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_AAC,
             sound_rate: 3,
             sound_size_16bit: true,
@@ -806,6 +807,7 @@ mod tests {
     #[test]
     fn audio_aac_raw_packet_keeps_packet_type_byte() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_AAC,
             sound_rate: 3,
             sound_size_16bit: true,
@@ -825,6 +827,7 @@ mod tests {
     #[test]
     fn audio_mp3_packet_strips_flv_header_only() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_MP3,
             sound_rate: 3,
             sound_size_16bit: true,
@@ -845,6 +848,7 @@ mod tests {
     #[test]
     fn audio_codec_id_for_tag_dispatches_legacy_vs_fourcc() {
         let legacy_aac = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_AAC,
             sound_rate: 3,
             sound_size_16bit: true,
@@ -864,6 +868,7 @@ mod tests {
             (flv::FOURCC_AAC, "aac"),
         ] {
             let t = AudioTag {
+                mod_ex: Vec::new(),
                 sound_format: AUDIO_FORMAT_EX_HEADER,
                 sound_rate: 0,
                 sound_size_16bit: false,
@@ -887,6 +892,7 @@ mod tests {
     #[test]
     fn ex_opus_sequence_start_packet_sets_header_flag_and_strips_fourcc() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -911,6 +917,7 @@ mod tests {
     #[test]
     fn ex_ac3_coded_frames_packet_strips_fourcc_and_keeps_body() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -931,6 +938,7 @@ mod tests {
     #[test]
     fn ex_audio_sequence_end_packet_flagged_header_with_empty_body() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -952,6 +960,7 @@ mod tests {
     #[test]
     fn ex_audio_codec_params_copies_sequence_start_to_extradata() {
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -978,6 +987,7 @@ mod tests {
         // doesn't accidentally treat a CodedFrames body as
         // extradata.
         let tag = AudioTag {
+            mod_ex: Vec::new(),
             sound_format: AUDIO_FORMAT_EX_HEADER,
             sound_rate: 0,
             sound_size_16bit: false,
@@ -995,6 +1005,7 @@ mod tests {
     #[test]
     fn video_avc_keyframe_packet_keyframe_flag_and_no_pts_offset() {
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: VIDEO_CODEC_AVC,
             avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
@@ -1015,6 +1026,7 @@ mod tests {
     #[test]
     fn video_avc_inter_packet_with_negative_cts_offsets_pts() {
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: VIDEO_CODEC_AVC,
             avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
@@ -1032,6 +1044,7 @@ mod tests {
     #[test]
     fn video_avc_seq_header_marks_header_flag() {
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: VIDEO_CODEC_AVC,
             avc_packet_type: Some(AVC_PACKET_TYPE_SEQUENCE_HEADER),
@@ -1049,6 +1062,7 @@ mod tests {
     #[test]
     fn video_h263_packet_keeps_body_and_pts_eq_dts() {
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: VIDEO_CODEC_H263,
             avc_packet_type: None,
@@ -1067,6 +1081,7 @@ mod tests {
     #[test]
     fn video_codec_id_for_tag_dispatches_legacy_vs_fourcc() {
         let avc = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: VIDEO_CODEC_AVC,
             avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
@@ -1082,6 +1097,7 @@ mod tests {
             (FOURCC_VP9, "vp9"),
         ] {
             let t = VideoTag {
+                mod_ex: Vec::new(),
                 frame_type: VIDEO_FRAME_KEYFRAME,
                 codec_id: 0,
                 avc_packet_type: None,
@@ -1101,6 +1117,7 @@ mod tests {
         // like AVC's `avcC` — `flags.header == true`, body in
         // `pkt.data` for downstream extradata harvesting.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -1122,6 +1139,7 @@ mod tests {
         // Only HEVC × CodedFrames carries CTS on the wire in
         // Enhanced RTMP — exercise the CTS-propagation branch.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_INTER,
             codec_id: 0,
             avc_packet_type: None,
@@ -1141,6 +1159,7 @@ mod tests {
     fn ex_av1_coded_frames_no_cts_offset() {
         // AV1 / VP9 leave CTS implied-zero — `pts == dts`.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME,
             codec_id: 0,
             avc_packet_type: None,
@@ -1163,6 +1182,7 @@ mod tests {
         // `header` so the consumer routes it to its sideband
         // (HDR `colorInfo` etc.) instead of the decoder.
         let tag = VideoTag {
+            mod_ex: Vec::new(),
             frame_type: VIDEO_FRAME_KEYFRAME, // would normally → keyframe = true
             codec_id: 0,
             avc_packet_type: None,
