@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.3...v0.0.4) - 2026-05-24
+
+### Other
+
+- graceful FIN on close to stop teardown truncating A/V frames
+- Enhanced RTMP v2 ModEx packet-type prelude (audio + video)
+- route AMF3 data/command messages into message dispatch
+- AMF3 wire-format parser + builder (full §3.1 + §1.3.1 + §2.2)
+- Enhanced RTMP v2 video FourCC additions (vp08 / avc1 / vvc1)
+- Enhanced RTMP v2 audio framing (FourCC Opus / FLAC / AC-3 / E-AC-3 / MP3 / AAC)
+- Enhanced RTMP v1 video framing (FourCC HEVC / AV1 / VP9)
+
 ### Fixed
 
 - **Client teardown no longer truncates in-flight A/V frames**
