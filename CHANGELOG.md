@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Server session close emits `UserControl StreamEOF` before
+  `onStatus(NetStream.Unpublish.Success)`** (`src/server.rs`,
+  `src/message.rs`). The publish-side end-of-stream signal is now an
+  explicit RTMP wire event rather than a bare TCP FIN. `RtmpSession::close`
+  emits, in order: a `UserControl StreamEOF(stream_id)` event (RTMP 1.0
+  §7.1.7 — the `the stream is dry` event the spec assigns to the
+  server-to-client direction, re-used symmetrically here for an
+  end-of-publish notification), the existing
+  `onStatus("NetStream.Unpublish.Success")` command, a chunk-writer
+  `flush()` so every buffered chunk reaches the kernel, then a write-half
+  `Shutdown::Write` — mirroring the client-side r152 fix so the peer drains
+  every buffered frame and command before observing EOF. New
+  `message::build_user_control_stream_eof(u32)` builder exposes the event
+  for callers that want to emit it on a non-publish stream. New
+  `tests/session_close.rs` integration test drains raw bytes off the
+  client socket and asserts the StreamEOF six-byte body precedes the
+  literal AMF0 `NetStream.Unpublish.Success` string.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.3...v0.0.4) - 2026-05-24
 
 ### Other

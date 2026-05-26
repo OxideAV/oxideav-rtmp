@@ -109,6 +109,12 @@ client.close()?;
   for MP3, ISO/IEC 14496-3 `AudioSpecificConfig` for FourCC-AAC
   SequenceStart). `Multitrack` and `MultichannelConfig`
   AudioPacketTypes parse to opaque bodies pending follow-up rounds.
+- **Graceful session close**. `RtmpSession::close` emits a
+  `UserControl StreamEOF(stream_id)` (RTMP 1.0 §7.1.7) before
+  `onStatus("NetStream.Unpublish.Success")`, flushes the chunk writer,
+  and half-closes the write side. The peer drains every buffered
+  frame plus the EOF + status reply before observing FIN, matching the
+  client-side teardown behaviour.
 - **Enhanced RTMP v2 `ModEx` prelude** (Veovera 2026). The `ModEx`
   packet-type signal (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" /
   §"ExAudioTagHeader") is decoded for both audio and video: a chain

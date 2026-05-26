@@ -89,6 +89,25 @@ pub fn build_user_control_stream_begin(stream_id: u32) -> Message {
     }
 }
 
+/// User-control `StreamEOF` event (`UCM` type 1).
+///
+/// Per RTMP 1.0 §7.1.7, the server uses this to tell the peer that
+/// "playback of data is over as requested ... that the stream is dry."
+/// In the publish direction we re-use it as the symmetric end-of-stream
+/// signal so the peer learns the publisher is done before observing the
+/// TCP FIN. The 4-byte event body is the stream id of the dry stream.
+pub fn build_user_control_stream_eof(stream_id: u32) -> Message {
+    let mut p = Vec::with_capacity(6);
+    p.extend_from_slice(&USR_STREAM_EOF.to_be_bytes());
+    p.extend_from_slice(&stream_id.to_be_bytes());
+    Message {
+        msg_type_id: MSG_USER_CONTROL,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload: p,
+    }
+}
+
 pub fn build_ack(bytes_received: u32) -> Message {
     Message {
         msg_type_id: MSG_ACK,
@@ -275,5 +294,34 @@ pub fn build_set_data_frame(stream_id: u32, metadata: Amf0Value) -> Message {
         msg_stream_id: stream_id,
         timestamp: 0,
         payload,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exact wire bytes for a `UserControl StreamBegin` per RTMP 1.0
+    /// §7.1.7: 2-byte event type (0x0000) + 4-byte stream id BE.
+    #[test]
+    fn user_control_stream_begin_wire_bytes() {
+        let m = build_user_control_stream_begin(1);
+        assert_eq!(m.msg_type_id, MSG_USER_CONTROL);
+        assert_eq!(m.msg_stream_id, 0);
+        assert_eq!(m.payload, vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    }
+
+    /// Symmetric wire bytes for `UserControl StreamEOF` (type 1): a
+    /// publisher-side close emits this to signal end-of-publish before
+    /// the TCP FIN, so the peer doesn't have to guess whether the
+    /// connection dropped or terminated cleanly.
+    #[test]
+    fn user_control_stream_eof_wire_bytes() {
+        let m = build_user_control_stream_eof(7);
+        assert_eq!(m.msg_type_id, MSG_USER_CONTROL);
+        assert_eq!(m.msg_stream_id, 0);
+        assert_eq!(m.timestamp, 0);
+        // Event type 1 (StreamEOF) | stream id 7.
+        assert_eq!(m.payload, vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x07]);
     }
 }

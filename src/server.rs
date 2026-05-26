@@ -266,9 +266,32 @@ impl RtmpSession {
         Ok(())
     }
 
-    /// Close the session politely: send `NetStream.Unpublish.Success`
-    /// and shut the socket down.
+    /// Close the session politely.
+    ///
+    /// On the wire we emit, in order:
+    ///
+    /// 1. A `UserControl StreamEOF(stream_id)` event so the peer's
+    ///    chunk-stream state machine learns the publish is done before
+    ///    it observes the TCP FIN (RTMP 1.0 §7.1.7).
+    /// 2. `onStatus(NetStream.Unpublish.Success)` on the publish stream.
+    /// 3. A chunk-writer `flush()` so every buffered chunk reaches the
+    ///    kernel before the half-close.
+    ///
+    /// Then we send a write-half FIN (`Shutdown::Write`) rather than
+    /// tearing both halves down at once. `Shutdown::Both` instantly
+    /// closes the read half too, which on some platforms makes the
+    /// kernel answer the peer's still-unacked data with a RST and
+    /// discard any A/V messages the peer hasn't yet drained from its
+    /// receive buffer — closeStream / the StreamEOF event / the last
+    /// frames just written can be thrown away mid-stream. A write-half
+    /// FIN lets the peer read everything we just wrote, then observe
+    /// EOF cleanly. The read half closes when `self` (and its owned
+    /// `TcpStream`) drops at end of scope.
     pub fn close(mut self) -> Result<()> {
+        let _ = self.writer.write_message(
+            CSID_PROTOCOL_CONTROL,
+            &build_user_control_stream_eof(self.stream_id),
+        );
         let _ = self.writer.write_message(
             CSID_COMMAND,
             &build_on_status(
@@ -279,7 +302,7 @@ impl RtmpSession {
             ),
         );
         let _ = self.writer.flush();
-        let _ = self.stream.shutdown(Shutdown::Both);
+        let _ = self.stream.shutdown(Shutdown::Write);
         Ok(())
     }
 
