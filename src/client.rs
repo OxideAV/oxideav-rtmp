@@ -26,20 +26,82 @@ use crate::error::{Error, Result};
 use crate::flv::{self, AudioTag, VideoTag};
 use crate::message::*;
 
+/// Server-originated event observed by an [`RtmpClient`] in publish
+/// mode.
+///
+/// During an active publish the client mostly writes audio / video /
+/// data and the server stays mostly silent — but a few server→client
+/// notifications matter end-to-end. The most important is
+/// [`StreamEof`](Self::StreamEof): the server signalling, per RTMP 1.0
+/// §7.1.7, that "the stream is dry, no more data will be sent without
+/// additional commands." A symmetric publish-side server uses the same
+/// `UserControl StreamEOF` event to mark end-of-publish before closing
+/// the TCP write half — and the client should treat that as a clean
+/// stream end rather than as an unexpected FIN.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientEvent {
+    /// The server emitted `UserControl StreamBegin(stream_id)`
+    /// (UCM event type 0). Informational — most servers send this once
+    /// right after `createStream` succeeds.
+    StreamBegin { stream_id: u32 },
+    /// The server emitted `UserControl StreamEOF(stream_id)`
+    /// (UCM event type 1). End-of-stream from the server side. After
+    /// observing this, the caller should stop writing and shut the
+    /// client down via [`RtmpClient::close`].
+    StreamEof { stream_id: u32 },
+    /// The server emitted `onStatus(...)` carrying NetStream state.
+    /// `level` is typically `"status"` / `"warning"` / `"error"`;
+    /// `code` is e.g. `"NetStream.Publish.Start"` /
+    /// `"NetStream.Unpublish.Success"` / `"NetStream.Publish.BadName"`.
+    OnStatus {
+        level: String,
+        code: String,
+        description: String,
+    },
+    /// The server emitted `_result(transaction_id, ...)` for a command
+    /// the client issued. The publish-time `connect` / `createStream`
+    /// transactions are consumed internally by [`RtmpClient::connect`];
+    /// any subsequent `_result` (e.g. a custom RPC sent after publish
+    /// started) surfaces here so the caller can match it against its
+    /// own transaction id.
+    Result {
+        transaction_id: f64,
+        values: Vec<Amf0Value>,
+    },
+    /// The server emitted `_error(transaction_id, ...)`. Symmetric to
+    /// [`Result`](Self::Result) but for the failure path.
+    ErrorReply {
+        transaction_id: f64,
+        values: Vec<Amf0Value>,
+    },
+    /// Any other server-originated message (ping, ack, set-chunk-size,
+    /// bandwidth — most of which the client handles transparently
+    /// inside [`RtmpClient::poll_event`] before this variant ever fires).
+    /// The variant exists so the caller's `match` arm can keep going.
+    Other,
+}
+
 const CLIENT_CHUNK_SIZE: u32 = 4096;
 const FLASH_VER: &str = "FMLE/3.0 (compatible; oxideav-rtmp)";
 
 pub struct RtmpClient {
     stream: TcpStream,
-    /// Kept around so `recv` helpers (ack, onStatus replies) have
-    /// somewhere to drain the server's side. Not read on the normal
-    /// publish-only path.
-    #[allow(dead_code)]
+    /// Kept around so `recv` helpers (ack, onStatus replies, the
+    /// server-side `UserControl StreamEOF` mirror of our own
+    /// publish-side teardown) have somewhere to drain the server's
+    /// side. Surfaced through [`poll_event`](Self::poll_event).
     reader: ChunkReader<TcpStream>,
     writer: ChunkWriter<TcpStream>,
     stream_id: u32,
     /// Monotonic counter used for AMF command transaction ids.
     next_tx: f64,
+    /// Set once we've observed the read half drain (EOF / connection
+    /// reset) so subsequent `poll_event` calls return `Ok(None)` rather
+    /// than re-entering [`ChunkReader::read_message`] on a dead socket.
+    /// Distinct from a `StreamEOF` user-control event — the server
+    /// normally sends `StreamEOF` *first* then a trailing onStatus, so
+    /// `poll_event` keeps reading until the kernel reports EOF.
+    read_eof: bool,
 }
 
 /// Parsed RTMP URL: `rtmp://host[:port]/app/stream_name`.
@@ -174,6 +236,7 @@ impl RtmpClient {
             writer,
             stream_id,
             next_tx: 10.0,
+            read_eof: false,
         })
     }
 
@@ -316,6 +379,131 @@ impl RtmpClient {
         Ok(())
     }
 
+    /// Poll for one server-originated event.
+    ///
+    /// Reads up to one inbound RTMP message from the server, applies
+    /// protocol-level housekeeping internally (set-chunk-size,
+    /// window-ack-size, set-peer-bandwidth, ping-request/response,
+    /// acks), and surfaces externally-visible notifications as a
+    /// [`ClientEvent`]:
+    ///
+    /// * `UserControl StreamBegin(sid)` → [`ClientEvent::StreamBegin`]
+    /// * `UserControl StreamEOF(sid)`   → [`ClientEvent::StreamEof`]
+    ///   (mirror of [`RtmpSession::close`](crate::RtmpSession::close)'s
+    ///   server-side teardown; RTMP 1.0 §7.1.7)
+    /// * `onStatus(...)`                → [`ClientEvent::OnStatus`]
+    /// * `_result(tx_id, ...)`          → [`ClientEvent::Result`]
+    /// * `_error(tx_id, ...)`           → [`ClientEvent::ErrorReply`]
+    /// * everything else                → [`ClientEvent::Other`]
+    ///
+    /// Returns `Ok(None)` once the server has signalled a clean stream
+    /// end (`StreamEOF`) or once the TCP read half observes EOF /
+    /// connection-reset. After `Ok(None)` is returned the caller
+    /// should stop writing and finish the session with
+    /// [`close`](Self::close).
+    ///
+    /// This is a blocking call. Set a finite read timeout on
+    /// [`inner_mut`](Self::inner_mut) ahead of time if you want
+    /// `poll_event` to return periodically with an `Err(Error::Io)`
+    /// kind `WouldBlock` / `TimedOut` so an outer event loop can do
+    /// other work between polls — the underlying TCP read deadline is
+    /// the timeout granularity, not a poll interval.
+    pub fn poll_event(&mut self) -> Result<Option<ClientEvent>> {
+        if self.read_eof {
+            return Ok(None);
+        }
+        let msg = match self.reader.read_message() {
+            Ok(m) => m,
+            Err(Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                self.read_eof = true;
+                return Ok(None);
+            }
+            Err(Error::UnexpectedEof) => {
+                self.read_eof = true;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        match msg.msg_type_id {
+            MSG_SET_CHUNK_SIZE => {
+                let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
+                self.reader.set_chunk_size(size as usize);
+                Ok(Some(ClientEvent::Other))
+            }
+            MSG_ACK | MSG_WINDOW_ACK_SIZE | MSG_SET_PEER_BANDWIDTH => {
+                // Informational. Spec mandates an ack reply once we
+                // exceed the negotiated window, but for a publish-only
+                // client of typical bitrate we leave that as a future
+                // refinement — the server's own ack window resets per
+                // session.
+                Ok(Some(ClientEvent::Other))
+            }
+            MSG_USER_CONTROL => {
+                let (event_type, event_data) = parse_user_control(&msg.payload)?;
+                match event_type {
+                    USR_STREAM_BEGIN => {
+                        let sid = ucm_stream_id(event_data)?;
+                        Ok(Some(ClientEvent::StreamBegin { stream_id: sid }))
+                    }
+                    USR_STREAM_EOF => {
+                        let sid = ucm_stream_id(event_data)?;
+                        // Don't latch here: the server typically sends
+                        // a trailing onStatus / Unpublish.Success after
+                        // StreamEOF, then half-closes; we let the
+                        // subsequent read drain those and report EOF
+                        // naturally.
+                        Ok(Some(ClientEvent::StreamEof { stream_id: sid }))
+                    }
+                    USR_PING_REQUEST => {
+                        // Server pings — reply with PingResponse echoing
+                        // the same 4-byte timestamp body so the server's
+                        // liveness probe succeeds.
+                        let ts_bytes = event_data;
+                        if ts_bytes.len() >= 4 {
+                            let mut p = Vec::with_capacity(6);
+                            p.extend_from_slice(&USR_PING_RESPONSE.to_be_bytes());
+                            p.extend_from_slice(&ts_bytes[..4]);
+                            let _ = self.writer.write_message(
+                                CSID_PROTOCOL_CONTROL,
+                                &Message {
+                                    msg_type_id: MSG_USER_CONTROL,
+                                    msg_stream_id: 0,
+                                    timestamp: 0,
+                                    payload: p,
+                                },
+                            );
+                            let _ = self.writer.flush();
+                        }
+                        Ok(Some(ClientEvent::Other))
+                    }
+                    _ => {
+                        // StreamDry / SetBufferLength / StreamIsRecorded /
+                        // PingResponse — surface as Other; the publisher
+                        // doesn't act on them.
+                        Ok(Some(ClientEvent::Other))
+                    }
+                }
+            }
+            MSG_COMMAND_AMF0 => {
+                let values = amf::decode_all(&msg.payload)?;
+                Ok(Some(classify_command(values)))
+            }
+            MSG_COMMAND_AMF3 => {
+                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
+                    .iter()
+                    .map(amf3::Amf3Value::to_amf0)
+                    .collect();
+                Ok(Some(classify_command(values)))
+            }
+            _ => Ok(Some(ClientEvent::Other)),
+        }
+    }
+
     /// Send `closeStream` / `deleteStream` and shut the TCP socket.
     pub fn close(mut self) -> Result<()> {
         let tx = self.next_tx;
@@ -453,4 +641,177 @@ fn read_u32_be(buf: &[u8]) -> Result<u32> {
         return Err(Error::ProtocolViolation("need 4 bytes for u32be".into()));
     }
     Ok(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]))
+}
+
+/// Decode the `User Control` payload framing per RTMP 1.0 §6.2 /
+/// §7.1.7: a 16-bit BE event type followed by variable-length event
+/// data. Returns `(event_type, event_data)` borrowed from the input.
+fn parse_user_control(buf: &[u8]) -> Result<(u16, &[u8])> {
+    if buf.len() < 2 {
+        return Err(Error::ProtocolViolation(
+            "UserControl: payload < 2 bytes".into(),
+        ));
+    }
+    let event_type = u16::from_be_bytes([buf[0], buf[1]]);
+    Ok((event_type, &buf[2..]))
+}
+
+/// Stream-id-carrying UCM events (Stream Begin / Stream EOF / Stream
+/// Dry / StreamIsRecorded) all use a 4-byte BE stream id as their
+/// event data.
+fn ucm_stream_id(event_data: &[u8]) -> Result<u32> {
+    if event_data.len() < 4 {
+        return Err(Error::ProtocolViolation(
+            "UserControl: event data < 4 bytes (need stream id)".into(),
+        ));
+    }
+    Ok(u32::from_be_bytes([
+        event_data[0],
+        event_data[1],
+        event_data[2],
+        event_data[3],
+    ]))
+}
+
+/// Classify a decoded AMF0 command message into a [`ClientEvent`].
+/// Matches `onStatus` / `_result` / `_error` by name and pulls the
+/// transaction id / info object out of the expected slots.
+fn classify_command(values: Vec<Amf0Value>) -> ClientEvent {
+    let name = values.first().and_then(Amf0Value::as_str).unwrap_or("");
+    match name {
+        "onStatus" => {
+            // ["onStatus", 0.0, null, <info-object>]
+            if let Some(info) = values.get(3) {
+                let level = info
+                    .get("level")
+                    .and_then(Amf0Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let code = info
+                    .get("code")
+                    .and_then(Amf0Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let description = info
+                    .get("description")
+                    .and_then(Amf0Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                return ClientEvent::OnStatus {
+                    level,
+                    code,
+                    description,
+                };
+            }
+            ClientEvent::Other
+        }
+        "_result" => {
+            let tx = values.get(1).and_then(Amf0Value::as_f64).unwrap_or(0.0);
+            ClientEvent::Result {
+                transaction_id: tx,
+                values,
+            }
+        }
+        "_error" => {
+            let tx = values.get(1).and_then(Amf0Value::as_f64).unwrap_or(0.0);
+            ClientEvent::ErrorReply {
+                transaction_id: tx,
+                values,
+            }
+        }
+        _ => ClientEvent::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_user_control_stream_eof_recovers_stream_id() {
+        // Wire layout per RTMP 1.0 §7.1.7: [event_type=0x0001 BE]
+        // [stream_id BE]. Our build_user_control_stream_eof emits this
+        // exact 6-byte body — same six bytes the auditor's
+        // session_close test asserts on.
+        let payload: [u8; 6] = [0x00, 0x01, 0x00, 0x00, 0x00, 0x07];
+        let (event_type, event_data) = parse_user_control(&payload).expect("parse UCM");
+        assert_eq!(event_type, USR_STREAM_EOF);
+        assert_eq!(ucm_stream_id(event_data).expect("sid"), 7);
+    }
+
+    #[test]
+    fn parse_user_control_rejects_truncated_payload() {
+        // < 2 bytes — can't even read the event type.
+        assert!(parse_user_control(&[0x00]).is_err());
+        assert!(parse_user_control(&[]).is_err());
+        // 2 bytes (event type only) but the event type is a
+        // stream-id-carrying variant: event-data is empty so the SID
+        // extractor refuses.
+        let (event_type, event_data) = parse_user_control(&[0x00, 0x01]).expect("parse UCM");
+        assert_eq!(event_type, USR_STREAM_EOF);
+        assert!(ucm_stream_id(event_data).is_err());
+    }
+
+    #[test]
+    fn classify_command_recognises_on_status() {
+        let info = Amf0Value::Object(vec![
+            ("level".into(), Amf0Value::String("status".into())),
+            (
+                "code".into(),
+                Amf0Value::String("NetStream.Publish.Start".into()),
+            ),
+            ("description".into(), Amf0Value::String("ready".into())),
+        ]);
+        let values = vec![
+            Amf0Value::String("onStatus".into()),
+            Amf0Value::Number(0.0),
+            Amf0Value::Null,
+            info,
+        ];
+        match classify_command(values) {
+            ClientEvent::OnStatus {
+                level,
+                code,
+                description,
+            } => {
+                assert_eq!(level, "status");
+                assert_eq!(code, "NetStream.Publish.Start");
+                assert_eq!(description, "ready");
+            }
+            other => panic!("expected OnStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_command_recognises_result_and_error() {
+        let result = classify_command(vec![
+            Amf0Value::String("_result".into()),
+            Amf0Value::Number(42.0),
+            Amf0Value::Null,
+            Amf0Value::Number(7.0),
+        ]);
+        match result {
+            ClientEvent::Result {
+                transaction_id,
+                values,
+            } => {
+                assert_eq!(transaction_id, 42.0);
+                assert_eq!(values.len(), 4);
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+
+        let err = classify_command(vec![
+            Amf0Value::String("_error".into()),
+            Amf0Value::Number(99.0),
+            Amf0Value::Null,
+            Amf0Value::Null,
+        ]);
+        match err {
+            ClientEvent::ErrorReply { transaction_id, .. } => {
+                assert_eq!(transaction_id, 99.0);
+            }
+            other => panic!("expected ErrorReply, got {other:?}"),
+        }
+    }
 }

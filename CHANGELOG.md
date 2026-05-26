@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`RtmpClient::poll_event` surfaces server-originated events; symmetric
+  `UserControl StreamEOF` recognition on the client side** (`src/client.rs`,
+  `src/lib.rs`). Round 154 added the server-side teardown that emits a
+  `UserControl StreamEOF(stream_id)` (RTMP 1.0 §7.1.7) before
+  `onStatus(NetStream.Unpublish.Success)` and the write-half FIN. The
+  pre-r158 `RtmpClient` swallowed those server-originated bytes — the
+  `reader` field was `#[allow(dead_code)]`-flagged and the only
+  post-publish reads happened opportunistically when the underlying
+  `TcpStream` dropped, so a publisher couldn't tell "server cleanly
+  closed our publish" from "TCP connection died." This round wires up a
+  `poll_event(&mut self) -> Result<Option<ClientEvent>>` surface: each
+  call reads one inbound RTMP message, handles protocol-control
+  housekeeping internally (Set Chunk Size, Window Ack Size, Set Peer
+  Bandwidth, Ping Request → Ping Response auto-reply), and returns the
+  externally-visible notifications as a new `ClientEvent` enum:
+  `StreamBegin { stream_id }`, `StreamEof { stream_id }`,
+  `OnStatus { level, code, description }`,
+  `Result { transaction_id, values }`,
+  `ErrorReply { transaction_id, values }`, and `Other`. `StreamEof` is
+  not itself terminal — the server's close path emits onStatus *after*
+  StreamEOF, so `poll_event` keeps reading until the TCP read half
+  observes EOF / connection-reset, at which point a `read_eof` latch
+  makes subsequent calls return `Ok(None)` immediately without
+  re-entering the chunk reader on a dead socket. New
+  `tests/client_stream_eof.rs` covers end-to-end against our own
+  `RtmpServer::close`: the client observes
+  `ClientEvent::StreamEof { stream_id: 1 }` followed by
+  `ClientEvent::OnStatus { code: "NetStream.Unpublish.Success", .. }`,
+  and a separate test verifies the post-EOF latch returns `Ok(None)` in
+  under 50 ms. Four new unit tests in `src/client.rs` cover the UCM
+  payload parser (`parse_user_control` + `ucm_stream_id`) and the AMF0
+  command classifier (`classify_command` for `onStatus` / `_result` /
+  `_error`).
+
 - **Server session close emits `UserControl StreamEOF` before
   `onStatus(NetStream.Unpublish.Success)`** (`src/server.rs`,
   `src/message.rs`). The publish-side end-of-stream signal is now an

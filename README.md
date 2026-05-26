@@ -114,7 +114,14 @@ client.close()?;
   `onStatus("NetStream.Unpublish.Success")`, flushes the chunk writer,
   and half-closes the write side. The peer drains every buffered
   frame plus the EOF + status reply before observing FIN, matching the
-  client-side teardown behaviour.
+  client-side teardown behaviour. Symmetrically, `RtmpClient::poll_event`
+  surfaces server-originated `UserControl StreamEOF`,
+  `UserControl StreamBegin`, `onStatus(...)`, and `_result` / `_error`
+  replies as a `ClientEvent` enum so a publisher can distinguish a
+  clean server-initiated end-of-stream from an unexpected TCP FIN.
+  Protocol-control plumbing (Set Chunk Size, Window Ack Size, Set Peer
+  Bandwidth, Ping Request → Ping Response) is handled transparently
+  inside `poll_event`.
 - **Enhanced RTMP v2 `ModEx` prelude** (Veovera 2026). The `ModEx`
   packet-type signal (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" /
   §"ExAudioTagHeader") is decoded for both audio and video: a chain
