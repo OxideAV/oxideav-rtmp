@@ -93,10 +93,28 @@ impl Amf0Value {
 // Decode
 // ---------------------------------------------------------------------------
 
+/// Hard cap on nested-container decode depth. Real RTMP `onMetaData`
+/// objects nest at most 2-3 levels (an outer ECMA-array of scalars,
+/// occasionally an inner object for `videodatarate` style sub-records).
+/// A forged AMF0 frame can otherwise nest Object-inside-Object until
+/// the call stack runs out — guard against that DoS vector before we
+/// even reach the byte cursor.
+pub const MAX_DECODE_DEPTH: usize = 64;
+
 /// Decode one AMF0 value from `buf` starting at `*pos`. Advances `pos`
-/// past the value on success. Returns `InvalidAmf0` for unknown markers
-/// or truncated input.
+/// past the value on success. Returns `InvalidAmf0` for unknown markers,
+/// truncated input, or container nesting deeper than
+/// [`MAX_DECODE_DEPTH`].
 pub fn decode(buf: &[u8], pos: &mut usize) -> Result<Amf0Value> {
+    decode_at_depth(buf, pos, 0)
+}
+
+fn decode_at_depth(buf: &[u8], pos: &mut usize, depth: usize) -> Result<Amf0Value> {
+    if depth >= MAX_DECODE_DEPTH {
+        return Err(Error::InvalidAmf0(format!(
+            "nested container depth exceeded {MAX_DECODE_DEPTH}"
+        )));
+    }
     let marker = read_u8(buf, pos)?;
     match marker {
         M_NUMBER => {
@@ -108,20 +126,28 @@ pub fn decode(buf: &[u8], pos: &mut usize) -> Result<Amf0Value> {
         M_LONG_STRING => Ok(Amf0Value::String(read_utf8_long(buf, pos)?)),
         M_NULL => Ok(Amf0Value::Null),
         M_UNDEFINED => Ok(Amf0Value::Undefined),
-        M_OBJECT => Ok(Amf0Value::Object(read_object_body(buf, pos)?)),
+        M_OBJECT => Ok(Amf0Value::Object(read_object_body_at_depth(
+            buf,
+            pos,
+            depth + 1,
+        )?)),
         M_ECMA_ARRAY => {
             // Spec says this is preceded by a u32 associative count, then
             // the body is the same key/value/OBJECT_END terminator
             // sequence as a plain Object. The count is advisory — walk
             // until OBJECT_END.
             let _count = read_u32_be(buf, pos)?;
-            Ok(Amf0Value::EcmaArray(read_object_body(buf, pos)?))
+            Ok(Amf0Value::EcmaArray(read_object_body_at_depth(
+                buf,
+                pos,
+                depth + 1,
+            )?))
         }
         M_STRICT_ARRAY => {
             let count = read_u32_be(buf, pos)? as usize;
             let mut out = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
-                out.push(decode(buf, pos)?);
+                out.push(decode_at_depth(buf, pos, depth + 1)?);
             }
             Ok(Amf0Value::StrictArray(out))
         }
@@ -154,7 +180,11 @@ pub fn decode_all(buf: &[u8]) -> Result<Vec<Amf0Value>> {
     Ok(out)
 }
 
-fn read_object_body(buf: &[u8], pos: &mut usize) -> Result<Vec<(String, Amf0Value)>> {
+fn read_object_body_at_depth(
+    buf: &[u8],
+    pos: &mut usize,
+    depth: usize,
+) -> Result<Vec<(String, Amf0Value)>> {
     let mut out = Vec::new();
     loop {
         // Object keys are the short-string form WITHOUT a leading
@@ -171,7 +201,7 @@ fn read_object_body(buf: &[u8], pos: &mut usize) -> Result<Vec<(String, Amf0Valu
                 )));
             }
         }
-        let value = decode(buf, pos)?;
+        let value = decode_at_depth(buf, pos, depth)?;
         out.push((key, value));
     }
 }

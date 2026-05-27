@@ -122,6 +122,21 @@ client.close()?;
   Protocol-control plumbing (Set Chunk Size, Window Ack Size, Set Peer
   Bandwidth, Ping Request → Ping Response) is handled transparently
   inside `poll_event`.
+- **Injection-robust parser surface**. Every public decode entry
+  point — AMF0 (`decode` / `decode_all`), AMF3 (`decode` / `decode_all`
+  / `decode_data_message`), FLV (`parse_video` / `parse_audio`), the
+  chunk-stream reader (`ChunkReader::read_message`), both handshake
+  directions — is fuzzed against deterministic random byte streams
+  (`tests/injection_robustness.rs`) and against structurally-corrupted
+  RTMP frames (oversize lengths, forged fmt-1 chunks without prior
+  fmt-0 state, truncated handshakes, wrong RTMP version bytes,
+  `u32::MAX` strict-array counts). Every call returns `Result`,
+  never panics, never spins, and never over-allocates. Stack-overflow
+  protection: `amf::MAX_DECODE_DEPTH` and `amf3::MAX_DECODE_DEPTH`
+  (both 64) cap nested-container recursion in both AMF dialects before
+  the call stack runs out, so a forged onMetaData with 2_000 nested
+  Objects surfaces a clean error rather than crashing.
+
 - **Enhanced RTMP v2 `ModEx` prelude** (Veovera 2026). The `ModEx`
   packet-type signal (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" /
   §"ExAudioTagHeader") is decoded for both audio and video: a chain

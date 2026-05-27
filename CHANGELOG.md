@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Injection-robustness property tests + AMF0/AMF3 nested-container
+  depth guards** (`src/amf.rs`, `src/amf3.rs`,
+  `tests/injection_robustness.rs`). Every public parser surface — AMF0
+  (`decode` / `decode_all`), AMF3 (`decode` / `decode_all` /
+  `decode_data_message`), FLV (`parse_video` / `parse_audio`), the
+  chunk-stream reader (`ChunkReader::read_message`), and both
+  handshake directions (`client_handshake` / `server_handshake`) — is
+  now fuzzed with a deterministic xorshift PRNG (no `rand` dep): 1024
+  random-byte iterations for each AMF surface, 2048 for each FLV
+  surface, 512 for `ChunkReader`, plus a 1024-iteration "valid frame
+  with 1..=4 random byte flips" mutation pass on a built
+  `onMetaData` payload. Adversarial structural inputs are also covered:
+  truncated handshakes from both directions and at every truncation
+  boundary, wrong RTMP version bytes (`0x00` / `0x01` / `0x06` /
+  `0xFF`), AMF0 `M_STRICT_ARRAY` with a `u32::MAX` length, AMF0
+  `M_STRING` claiming 65535 bytes from a 3-byte buffer, a fmt-0 chunk
+  with an oversize 24-bit `msg_length` and a forged fmt-1 chunk
+  arriving with no prior fmt-0 state. The runtime guarantee: every
+  call either returns `Ok` or `Err`, never panics, never spins, and
+  never over-allocates (`amf0_strict_array_with_huge_count_errors_fast`
+  asserts the error path is under 100 ms even with `u32::MAX`).
+  Stack-overflow protection: `amf::MAX_DECODE_DEPTH = 64` and
+  `amf3::MAX_DECODE_DEPTH = 64` cap nested-container recursion before
+  the call stack runs out; AMF0 routes through a new
+  `decode_at_depth(buf, pos, depth)` and AMF3 tracks `depth` as a
+  field on `Decoder` (incremented on entry to `decode`, decremented on
+  return). Tests build 2_000-level-deep forged Object frames in both
+  formats and assert the guard surfaces a clean `Error::InvalidAmf0`
+  before the default 8 MiB stack overflows. Integration-test count:
+  28 → 49 (+21).
+
 - **`RtmpClient::poll_event` surfaces server-originated events; symmetric
   `UserControl StreamEOF` recognition on the client side** (`src/client.rs`,
   `src/lib.rs`). Round 154 added the server-side teardown that emits a

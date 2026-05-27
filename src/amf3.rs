@@ -297,6 +297,13 @@ fn amf3_key_to_string(k: &Amf3Value) -> String {
 // Decoder
 // ---------------------------------------------------------------------------
 
+/// Hard cap on AMF3 nested-container decode depth. Same DoS-mitigation
+/// purpose as [`crate::amf::MAX_DECODE_DEPTH`] — a forged frame can
+/// nest containers indefinitely (Object inside Array inside Dictionary
+/// inside Object…) until our call stack runs out. 64 is generous for
+/// any real `onMetaData` / shared-object payload.
+pub const MAX_DECODE_DEPTH: usize = 64;
+
 /// Decoder state — owns the three reference tables that survive across
 /// values inside one packet (§4.1).
 #[derive(Default)]
@@ -304,6 +311,10 @@ pub struct Decoder {
     strings: Vec<String>,
     objects: Vec<Amf3Value>,
     traits: Vec<TraitDef>,
+    /// Live recursion depth — incremented on entry to [`Decoder::decode`],
+    /// decremented on return. Exceeding [`MAX_DECODE_DEPTH`] returns a
+    /// controlled error instead of overflowing the stack.
+    depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -322,16 +333,32 @@ impl Decoder {
     /// Reset all three reference tables. Per §4.1.2 / §4.2, encoders
     /// must reset tables at packet / context-header boundaries; callers
     /// who reuse a `Decoder` across packets must call this at each
-    /// boundary.
+    /// boundary. Also resets the live recursion-depth counter (safe
+    /// only between decode calls — never invoke mid-decode).
     pub fn reset_tables(&mut self) {
         self.strings.clear();
         self.objects.clear();
         self.traits.clear();
+        self.depth = 0;
     }
 
     /// Decode one AMF3 value from `buf` starting at `*pos`. Advances
-    /// `pos` past the value on success.
+    /// `pos` past the value on success. Returns
+    /// `Error::InvalidAmf0(...)` if container nesting exceeds
+    /// [`MAX_DECODE_DEPTH`] before walking any markers.
     pub fn decode(&mut self, buf: &[u8], pos: &mut usize) -> Result<Amf3Value> {
+        if self.depth >= MAX_DECODE_DEPTH {
+            return Err(Error::InvalidAmf0(format!(
+                "amf3: nested container depth exceeded {MAX_DECODE_DEPTH}"
+            )));
+        }
+        self.depth += 1;
+        let result = self.decode_inner(buf, pos);
+        self.depth -= 1;
+        result
+    }
+
+    fn decode_inner(&mut self, buf: &[u8], pos: &mut usize) -> Result<Amf3Value> {
         let marker = read_u8(buf, pos)?;
         match marker {
             M_UNDEFINED => Ok(Amf3Value::Undefined),
