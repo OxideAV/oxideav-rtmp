@@ -118,6 +118,8 @@ fn flac_sequence_start_body_includes_native_signature() {
         ex_packet_type: Some(AUDIO_PACKET_TYPE_SEQUENCE_START),
         audio_fourcc: Some(FOURCC_FLAC),
         body: body.clone(),
+
+        multitrack: None,
     };
     let payload = build_audio(&tag);
     assert_eq!(payload[0], 0x90);
@@ -216,6 +218,8 @@ fn build_parse_idempotence_across_all_known_pairs() {
                 ex_packet_type: Some(pt),
                 audio_fourcc: Some(fcc),
                 body,
+
+                multitrack: None,
             };
             let bytes = build_audio(&tag);
             let parsed = parse_audio(&bytes).expect("parse");

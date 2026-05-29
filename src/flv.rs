@@ -80,9 +80,14 @@ pub const EX_PACKET_TYPE_METADATA: u8 = 4;
 /// `AV1VideoDescriptor`, mutually exclusive with
 /// `PacketTypeSequenceStart` per the 2023-06-07 revision note).
 pub const EX_PACKET_TYPE_MPEG2TS_SEQUENCE_START: u8 = 5;
-/// `Multitrack` — turns on video multitrack mode. Body shape
-/// (AvMultitrackType + per-track FourCc + track id + size) is
-/// deferred to a follow-up round.
+/// `Multitrack` — turns on video multitrack mode. After this
+/// PacketType nibble the next byte packs `multitrackType (UB[4]) |
+/// realPacketType (UB[4])`, optionally followed by a shared FourCC
+/// (when `multitrackType != ManyTracksManyCodecs`), then a sequence
+/// of tracks each carrying `(FourCC if ManyTracksManyCodecs) |
+/// trackId(UI8) | (sizeOfVideoTrack(UI24) if not OneTrack) | body`.
+/// Decoded by [`Multitrack`] / [`MultitrackTrack`] via
+/// [`VideoTag::multitrack`].
 pub const EX_PACKET_TYPE_MULTITRACK: u8 = 6;
 /// `ModEx` — modifier/extension marker that introduces a chain of
 /// size-prefixed ModEx packets before the *real* VideoPacketType is
@@ -324,9 +329,14 @@ pub const AUDIO_PACKET_TYPE_SEQUENCE_END: u8 = 2;
 /// [`MultichannelConfig`]; see [`AudioTag::multichannel_config`] for
 /// the lift / round-trip helpers.
 pub const AUDIO_PACKET_TYPE_MULTICHANNEL_CONFIG: u8 = 4;
-/// `Multitrack` — turns on audio multitrack mode. Body shape
-/// (AvMultitrackType + per-track FourCc + track id +
-/// sizeOfAudioTrack) is deferred to a follow-up round.
+/// `Multitrack` — turns on audio multitrack mode. After this
+/// PacketType nibble the next byte packs `multitrackType (UB[4]) |
+/// realPacketType (UB[4])`, optionally followed by a shared FourCC
+/// (when `multitrackType != ManyTracksManyCodecs`), then a sequence
+/// of tracks each carrying `(FourCC if ManyTracksManyCodecs) |
+/// trackId(UI8) | (sizeOfAudioTrack(UI24) if not OneTrack) | body`.
+/// Decoded by [`Multitrack`] / [`MultitrackTrack`] via
+/// [`AudioTag::multitrack`].
 pub const AUDIO_PACKET_TYPE_MULTITRACK: u8 = 5;
 /// `ModEx` — modifier/extension marker that introduces a chain
 /// of size-prefixed ModEx packets before the real AudioPacketType
@@ -603,6 +613,209 @@ impl MultichannelConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multitrack — Enhanced RTMP v2 §"ExVideoTagBody" / §"ExAudioTagBody"
+// ---------------------------------------------------------------------------
+//
+// When VideoPacketType == Multitrack (= 6) or AudioPacketType == Multitrack
+// (= 5), the body holds one or more tracks rather than a single track's
+// payload. The per-packet body has the layout (audio mirrors video):
+//
+//   multitrackType   = UB[4] as AvMultitrackType    // high nibble of next byte
+//   realPacketType   = UB[4] as VideoPacketType     // low nibble (the *real*
+//                                                   // PacketType the tracks
+//                                                   // carry; MUST NOT be
+//                                                   // Multitrack)
+//   if (multitrackType != ManyTracksManyCodecs) {
+//     sharedFourCc = FOURCC                         // codec shared by all tracks
+//   }
+//   while (more) {
+//     if (multitrackType == ManyTracksManyCodecs) {
+//       trackFourCc = FOURCC                        // per-track codec
+//     }
+//     trackId      = UI8
+//     if (multitrackType != OneTrack) {
+//       sizeOfTrack = UI24                          // bytes of the body that follows
+//     }
+//     body         = UI8[sizeOfTrack | rest-of-message]
+//   }
+//
+// OneTrack mode carries exactly one track and no size field; the body runs
+// to the end of the message. ManyTracks shares a single FourCC across all
+// tracks. ManyTracksManyCodecs carries a per-track FourCC.
+
+/// AvMultitrackType discriminator (UI8 in the spec's `enum AvMultitrackType`,
+/// stored on the wire as the high nibble of the byte immediately after the
+/// Multitrack PacketType nibble). See enhanced-rtmp-v2.pdf §"ExVideoTagBody" /
+/// §"ExAudioTagBody".
+pub const AV_MULTITRACK_TYPE_ONE_TRACK: u8 = 0;
+/// All tracks share the same codec (`sharedFourCc` read once before the
+/// track loop, `sizeOfTrack` UI24 present on every track).
+pub const AV_MULTITRACK_TYPE_MANY_TRACKS: u8 = 1;
+/// Each track carries its own codec (`trackFourCc` read inside the loop for
+/// every track, no shared FourCC in the header).
+pub const AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS: u8 = 2;
+
+/// Decoded `Multitrack` body of an Enhanced RTMP v2 video or audio message
+/// (enhanced-rtmp-v2.pdf §"ExVideoTagBody" / §"ExAudioTagBody"). The decoded
+/// view sits in [`VideoTag::multitrack`] / [`AudioTag::multitrack`]; when
+/// present, the tag's [`VideoTag::ex_packet_type`] /
+/// [`AudioTag::ex_packet_type`] holds the *real* (inner) PacketType the
+/// tracks carry (e.g. `CodedFrames`, `SequenceStart`), and the tag's
+/// [`VideoTag::fourcc`] / [`AudioTag::audio_fourcc`] holds the shared FourCC
+/// when [`multitrack_type`][Multitrack::multitrack_type] is `OneTrack` or
+/// `ManyTracks`. For `ManyTracksManyCodecs` the outer FourCC is `None`
+/// (each track carries its own).
+///
+/// The [`VideoTag::body`] / [`AudioTag::body`] field is unused for
+/// multitrack tags — track payloads live inside
+/// [`MultitrackTrack::body`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Multitrack {
+    /// `AvMultitrackType` discriminator (one of `AV_MULTITRACK_TYPE_*`).
+    /// Reserved values (3..=15) round-trip verbatim — the parser does not
+    /// reject them, so a forwarding ingest preserves unknown future modes.
+    pub multitrack_type: u8,
+    /// Decoded per-track entries in stream order. Always at least 1 entry
+    /// after a successful parse.
+    pub tracks: Vec<MultitrackTrack>,
+}
+
+/// One track inside a [`Multitrack`] body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultitrackTrack {
+    /// Per-track codec FourCC. `Some(..)` only when the surrounding
+    /// [`Multitrack::multitrack_type`] is `ManyTracksManyCodecs` — the
+    /// `OneTrack` / `ManyTracks` modes carry a shared FourCC on the outer
+    /// tag (see [`VideoTag::fourcc`] / [`AudioTag::audio_fourcc`]) and this
+    /// field is `None`. Set to `Some(..)` on build to opt into the
+    /// many-codecs layout for this track.
+    pub fourcc: Option<[u8; 4]>,
+    /// `trackId = UI8`. Per spec, trackId 0 is the default track described
+    /// by the top-level onMetaData; additional tracks use positive ids
+    /// (1, 2, 3, …). Values are identifiers only and do not imply ordering.
+    pub track_id: u8,
+    /// Codec payload for this track (the shape the real PacketType + FourCC
+    /// would produce as a single-track Enhanced-RTMP body). Empty for
+    /// SequenceEnd tracks per spec.
+    pub body: Vec<u8>,
+}
+
+impl Multitrack {
+    /// Parse the multitrack track-list bytes (everything in
+    /// [`VideoTag::body`] / [`AudioTag::body`] after [`parse_video`] /
+    /// [`parse_audio`] stripped the per-tag header) given the outer
+    /// `multitrack_type`. Returns `Err(Error::Other)` on truncation or on
+    /// a track whose `sizeOfTrack` UI24 overruns the buffer.
+    ///
+    /// `OneTrack` mode produces exactly one track whose body runs to the
+    /// end of the buffer. `ManyTracks` and `ManyTracksManyCodecs` modes
+    /// loop while bytes remain, consuming a UI24 `sizeOfTrack` per track.
+    pub fn parse(body: &[u8], multitrack_type: u8) -> Result<Multitrack> {
+        let many_codecs = multitrack_type == AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS;
+        let one_track = multitrack_type == AV_MULTITRACK_TYPE_ONE_TRACK;
+        let mut pos = 0usize;
+        let mut tracks = Vec::new();
+        loop {
+            if pos >= body.len() {
+                if tracks.is_empty() {
+                    return Err(Error::Other(
+                        "Multitrack: empty track list (need at least one track)".into(),
+                    ));
+                }
+                break;
+            }
+            let track_fourcc = if many_codecs {
+                if pos + 4 > body.len() {
+                    return Err(Error::Other(
+                        "Multitrack: truncated reading per-track FourCC".into(),
+                    ));
+                }
+                let mut fcc = [0u8; 4];
+                fcc.copy_from_slice(&body[pos..pos + 4]);
+                pos += 4;
+                Some(fcc)
+            } else {
+                None
+            };
+            if pos >= body.len() {
+                return Err(Error::Other("Multitrack: truncated reading trackId".into()));
+            }
+            let track_id = body[pos];
+            pos += 1;
+            let track_body = if one_track {
+                // OneTrack: no size field, body runs to end of buffer.
+                let rest = body[pos..].to_vec();
+                pos = body.len();
+                rest
+            } else {
+                if pos + 3 > body.len() {
+                    return Err(Error::Other(
+                        "Multitrack: truncated reading sizeOfTrack UI24".into(),
+                    ));
+                }
+                let size = ((body[pos] as usize) << 16)
+                    | ((body[pos + 1] as usize) << 8)
+                    | (body[pos + 2] as usize);
+                pos += 3;
+                if pos + size > body.len() {
+                    return Err(Error::Other(format!(
+                        "Multitrack: sizeOfTrack={size} overruns remaining {} bytes",
+                        body.len() - pos
+                    )));
+                }
+                let slice = body[pos..pos + size].to_vec();
+                pos += size;
+                slice
+            };
+            tracks.push(MultitrackTrack {
+                fourcc: track_fourcc,
+                track_id,
+                body: track_body,
+            });
+            if one_track {
+                break;
+            }
+        }
+        Ok(Multitrack {
+            multitrack_type,
+            tracks,
+        })
+    }
+
+    /// Serialise to the byte layout `parse` consumes. Output goes into the
+    /// tag's [`VideoTag::body`] / [`AudioTag::body`] slot when building an
+    /// outgoing multitrack message.
+    ///
+    /// For `OneTrack` mode only the first track's `track_id` + `body` are
+    /// emitted (the second-and-beyond tracks are silently ignored — the
+    /// caller is responsible for using `ManyTracks` if it has more than
+    /// one). For `ManyTracksManyCodecs` each track's `fourcc` MUST be
+    /// `Some(..)`; a `None` is encoded as four zero bytes to keep the
+    /// output decodable but the caller should treat that as a bug.
+    pub fn encode(&self) -> Vec<u8> {
+        let many_codecs = self.multitrack_type == AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS;
+        let one_track = self.multitrack_type == AV_MULTITRACK_TYPE_ONE_TRACK;
+        let mut out = Vec::new();
+        for (i, track) in self.tracks.iter().enumerate() {
+            if one_track && i > 0 {
+                break;
+            }
+            if many_codecs {
+                let fcc = track.fourcc.unwrap_or([0; 4]);
+                out.extend_from_slice(&fcc);
+            }
+            out.push(track.track_id);
+            if !one_track {
+                let size = track.body.len() & 0x00FF_FFFF;
+                out.extend_from_slice(&[(size >> 16) as u8, (size >> 8) as u8, size as u8]);
+            }
+            out.extend_from_slice(&track.body);
+        }
+        out
+    }
+}
+
 /// Decoded FLV video-tag header + payload. For H.264 the
 /// `composition_time` is the signed CTS offset (ms) between the
 /// decoder timestamp the RTMP chunk carries and the presentation
@@ -663,6 +876,16 @@ pub struct VideoTag {
     /// `TimestampOffsetNano` (high-precision sub-millisecond
     /// presentation offset).
     pub mod_ex: Vec<ModEx>,
+    /// Enhanced RTMP v2 `Multitrack` body (per-track FourCC + trackId +
+    /// sizeOfVideoTrack chain — see [`Multitrack`]). `Some(..)` only when
+    /// the wire PacketType nibble was `Multitrack = 6`; in that case
+    /// [`ex_packet_type`][VideoTag::ex_packet_type] holds the *real* inner
+    /// PacketType (e.g. `CodedFrames`, `SequenceStart`),
+    /// [`fourcc`][VideoTag::fourcc] holds the shared codec FourCC when the
+    /// multitrack mode is `OneTrack` / `ManyTracks` (and `None` for
+    /// `ManyTracksManyCodecs`), and the tag's [`body`][VideoTag::body] is
+    /// empty (track payloads sit in each [`MultitrackTrack::body`]).
+    pub multitrack: Option<Multitrack>,
 }
 
 impl VideoTag {
@@ -703,6 +926,38 @@ impl VideoTag {
             .iter()
             .filter_map(ModEx::timestamp_offset_nano)
             .fold(0u32, |acc, n| acc.saturating_add(n))
+    }
+
+    /// True when this tag is an Enhanced-RTMP v2 video `Multitrack`
+    /// message (the wire PacketType nibble was `Multitrack = 6` and
+    /// [`Self::multitrack`] decoded the per-track body).
+    pub fn is_multitrack(&self) -> bool {
+        self.multitrack.is_some()
+    }
+
+    /// Build an Enhanced-RTMP v2 video `Multitrack` tag with the given
+    /// FrameType, real inner PacketType, shared FourCC (when the multitrack
+    /// mode is `OneTrack` / `ManyTracks`; pass `None` for
+    /// `ManyTracksManyCodecs`), and per-track body. The returned tag has
+    /// `ex_packet_type = real_packet_type`, `fourcc = shared_fourcc`,
+    /// `multitrack = Some(mt)`, and `body` empty. ModEx prelude is empty.
+    pub fn multitrack_tag(
+        frame_type: u8,
+        real_packet_type: u8,
+        shared_fourcc: Option<[u8; 4]>,
+        mt: Multitrack,
+    ) -> VideoTag {
+        VideoTag {
+            frame_type,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: Vec::new(),
+            ex_packet_type: Some(real_packet_type),
+            fourcc: shared_fourcc,
+            mod_ex: Vec::new(),
+            multitrack: Some(mt),
+        }
     }
 }
 
@@ -768,14 +1023,76 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
             pos = next;
         }
 
-        if pos + 4 > payload.len() {
-            return Err(Error::Other(
-                "Enhanced RTMP video tag: need 4 bytes for FourCC after header/ModEx".into(),
-            ));
+        // Multitrack prelude (enhanced-rtmp-v2.pdf §"ExVideoTagHeader"):
+        // a Multitrack PacketType pulls in a `multitrackType (UB[4]) |
+        // realPacketType (UB[4])` byte and, when the multitrack mode is
+        // not ManyTracksManyCodecs, a shared FourCC. The body (the
+        // per-track list) is decoded later via `Multitrack::parse`.
+        let mut multitrack_type: Option<u8> = None;
+        if packet_type == EX_PACKET_TYPE_MULTITRACK {
+            if pos >= payload.len() {
+                return Err(Error::Other(
+                    "Enhanced RTMP video Multitrack: truncated reading multitrackType nibble"
+                        .into(),
+                ));
+            }
+            let nibble = payload[pos];
+            pos += 1;
+            let mt_type = (nibble >> 4) & 0x0F;
+            let inner_pt = nibble & 0x0F;
+            // Spec: "This fetch MUST not result in a VideoPacketType.Multitrack"
+            if inner_pt == EX_PACKET_TYPE_MULTITRACK {
+                return Err(Error::Other(
+                    "Enhanced RTMP video Multitrack: inner PacketType MUST NOT be Multitrack"
+                        .into(),
+                ));
+            }
+            multitrack_type = Some(mt_type);
+            packet_type = inner_pt;
         }
-        let mut fcc = [0u8; 4];
-        fcc.copy_from_slice(&payload[pos..pos + 4]);
-        pos += 4;
+
+        // For Multitrack ManyTracksManyCodecs there is no shared FourCC
+        // before the per-track loop; for OneTrack / ManyTracks the shared
+        // FourCC sits here (per spec). For non-Multitrack tags the FourCC
+        // always sits here.
+        let need_shared_fourcc = match multitrack_type {
+            Some(t) => t != AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS,
+            None => true,
+        };
+        let fcc_opt = if need_shared_fourcc {
+            if pos + 4 > payload.len() {
+                return Err(Error::Other(
+                    "Enhanced RTMP video tag: need 4 bytes for FourCC after header/ModEx".into(),
+                ));
+            }
+            let mut fcc = [0u8; 4];
+            fcc.copy_from_slice(&payload[pos..pos + 4]);
+            pos += 4;
+            Some(fcc)
+        } else {
+            None
+        };
+        // Keep a non-Option fcc for the non-Multitrack branches below
+        // (preserves the pre-change shape of the rest of the function).
+        let fcc = fcc_opt.unwrap_or([0; 4]);
+
+        // Multitrack tags: SI24 CompositionTime lives inside each
+        // per-track body (a track is itself an Enhanced-RTMP video
+        // body), so the outer parser only consumes the track list.
+        if let Some(mt_type) = multitrack_type {
+            let mt = Multitrack::parse(&payload[pos..], mt_type)?;
+            return Ok(VideoTag {
+                frame_type,
+                codec_id: 0,
+                avc_packet_type: None,
+                composition_time: 0,
+                body: Vec::new(),
+                ex_packet_type: Some(packet_type),
+                fourcc: fcc_opt,
+                mod_ex,
+                multitrack: Some(mt),
+            });
+        }
 
         // SI24 CompositionTime is on the wire only for the
         // three NALU-based FourCCs paired with
@@ -813,6 +1130,7 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
             ex_packet_type: Some(packet_type),
             fourcc: Some(fcc),
             mod_ex,
+            multitrack: None,
         })
     } else {
         // --- Legacy pre-2023 framing ---
@@ -834,6 +1152,7 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
                 ex_packet_type: None,
                 fourcc: None,
                 mod_ex: Vec::new(),
+                multitrack: None,
             })
         } else {
             Ok(VideoTag {
@@ -845,6 +1164,7 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
                 ex_packet_type: None,
                 fourcc: None,
                 mod_ex: Vec::new(),
+                multitrack: None,
             })
         }
     }
@@ -852,26 +1172,37 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
 
 /// Build an RTMP video-tag payload.
 ///
-/// Legacy mode (`tag.fourcc.is_none()`): writes the 1-byte
-/// frame/codec header + optional AVC packet type + 3-byte
-/// composition time, then `body`.
+/// Legacy mode (`tag.fourcc.is_none()` and `tag.multitrack.is_none()`):
+/// writes the 1-byte frame/codec header + optional AVC packet type +
+/// 3-byte composition time, then `body`.
 ///
-/// Enhanced RTMP mode (`tag.fourcc = Some([..])`): writes the
-/// `IsExHeader | frame_type | packet_type` byte, the 4-byte
-/// FourCC, the SI24 CTS *only* when FourCC == HEVC and
-/// PacketType == CodedFrames (matching Enhanced RTMP v1's
-/// "CompositionTime Offset is implied to equal zero" exception
-/// for `CodedFramesX` and the non-HEVC FourCCs), then `body`.
+/// Enhanced RTMP mode (`tag.fourcc = Some([..])` *or*
+/// `tag.multitrack = Some(..)` for ManyTracksManyCodecs): writes the
+/// `IsExHeader | frame_type | packet_type` byte, optionally a
+/// `multitrackType | realPacketType` byte for Multitrack tags, the
+/// 4-byte FourCC (omitted for Multitrack ManyTracksManyCodecs), the
+/// SI24 CTS *only* when FourCC ∈ {HEVC, AVC, VVC} and
+/// PacketType == CodedFrames on a non-Multitrack tag, then `body`
+/// (or the encoded track list for Multitrack tags).
 pub fn build_video(tag: &VideoTag) -> Vec<u8> {
-    if let Some(fcc) = tag.fourcc {
-        let packet_type = tag.ex_packet_type.unwrap_or(EX_PACKET_TYPE_CODED_FRAMES);
-        // When a ModEx prelude is present the header byte's
-        // PacketType nibble is `ModEx`; the *real* packet type is
-        // carried by the terminating nibble of the chain
+    if tag.fourcc.is_some() || tag.multitrack.is_some() {
+        let real_packet_type = tag.ex_packet_type.unwrap_or(EX_PACKET_TYPE_CODED_FRAMES);
+        let multitrack_outer_pt = if tag.multitrack.is_some() {
+            Some(EX_PACKET_TYPE_MULTITRACK)
+        } else {
+            None
+        };
+        // The packet type that sits in the byte *after* the ModEx chain
+        // (or the header byte itself when no ModEx is present): Multitrack
+        // for a multitrack tag, the real packet type otherwise.
+        let post_mod_ex_pt = multitrack_outer_pt.unwrap_or(real_packet_type);
+        // When a ModEx prelude is present the header byte's PacketType
+        // nibble is `ModEx`; the next packet type is carried by the
+        // terminating nibble of the chain
         // (enhanced-rtmp-v2.pdf §"ExVideoTagHeader"). Otherwise the
-        // header nibble is the real packet type directly.
+        // header nibble is `post_mod_ex_pt` directly.
         let header_pt = if tag.mod_ex.is_empty() {
-            packet_type
+            post_mod_ex_pt
         } else {
             EX_PACKET_TYPE_MOD_EX
         };
@@ -881,14 +1212,31 @@ pub fn build_video(tag: &VideoTag) -> Vec<u8> {
         let head = VIDEO_IS_EX_HEADER | ((tag.frame_type & 0x07) << 4) | (header_pt & 0x0F);
         let mut out = Vec::with_capacity(tag.body.len() + 8);
         out.push(head);
-        build_mod_ex_chain(&mut out, &tag.mod_ex, EX_PACKET_TYPE_MOD_EX, packet_type);
+        build_mod_ex_chain(&mut out, &tag.mod_ex, EX_PACKET_TYPE_MOD_EX, post_mod_ex_pt);
+        if let Some(mt) = &tag.multitrack {
+            // Multitrack nibble byte: `multitrackType (UB[4]) |
+            // realPacketType (UB[4])`.
+            out.push(((mt.multitrack_type & 0x0F) << 4) | (real_packet_type & 0x0F));
+            // Shared FourCC sits here unless the mode is ManyTracksManyCodecs.
+            if mt.multitrack_type != AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS {
+                let fcc = tag.fourcc.unwrap_or([0; 4]);
+                out.extend_from_slice(&fcc);
+            }
+            out.extend_from_slice(&mt.encode());
+            return out;
+        }
+        // Non-multitrack: FourCC always sits here. `tag.fourcc` is Some
+        // by the outer `if` (the multitrack branch above already returned).
+        let fcc = tag
+            .fourcc
+            .expect("Enhanced-RTMP non-Multitrack tag requires fourcc");
         out.extend_from_slice(&fcc);
         // Mirrors the parse-side `needs_cts` rule: HEVC / AVC /
         // VVC + CodedFrames emit the SI24 composition-time;
         // everything else (CodedFramesX, SequenceStart,
         // SequenceEnd, Metadata, and the non-NALU FourCCs)
         // omits it per Enhanced RTMP v1/v2 §"ExVideoTagBody".
-        let cts_on_wire = packet_type == EX_PACKET_TYPE_CODED_FRAMES
+        let cts_on_wire = real_packet_type == EX_PACKET_TYPE_CODED_FRAMES
             && (fcc == FOURCC_HEVC || fcc == FOURCC_AVC || fcc == FOURCC_VVC);
         if cts_on_wire {
             let cts = tag.composition_time & 0x00FF_FFFF;
@@ -972,6 +1320,17 @@ pub struct AudioTag {
     /// packet type on build. The only subtype defined today is
     /// `TimestampOffsetNano`.
     pub mod_ex: Vec<ModEx>,
+    /// Enhanced RTMP v2 `Multitrack` body (per-track FourCC + trackId +
+    /// sizeOfAudioTrack chain — see [`Multitrack`]). `Some(..)` only when
+    /// the wire AudioPacketType nibble was `Multitrack = 5`; in that case
+    /// [`ex_packet_type`][AudioTag::ex_packet_type] holds the *real* inner
+    /// AudioPacketType (e.g. `CodedFrames`, `SequenceStart`),
+    /// [`audio_fourcc`][AudioTag::audio_fourcc] holds the shared codec
+    /// FourCC when the multitrack mode is `OneTrack` / `ManyTracks` (and
+    /// `None` for `ManyTracksManyCodecs`), and the tag's
+    /// [`body`][AudioTag::body] is empty (track payloads sit in each
+    /// [`MultitrackTrack::body`]).
+    pub multitrack: Option<Multitrack>,
 }
 
 impl AudioTag {
@@ -1047,6 +1406,38 @@ impl AudioTag {
             audio_fourcc: Some(fourcc),
             body: cfg.encode(),
             mod_ex: Vec::new(),
+            multitrack: None,
+        }
+    }
+
+    /// True when this tag is an Enhanced-RTMP v2 audio `Multitrack`
+    /// message (the wire AudioPacketType nibble was `Multitrack = 5`
+    /// and [`Self::multitrack`] decoded the per-track body).
+    pub fn is_multitrack(&self) -> bool {
+        self.multitrack.is_some()
+    }
+
+    /// Build an Enhanced-RTMP v2 audio `Multitrack` tag with the given
+    /// real inner AudioPacketType, shared FourCC (`None` for
+    /// `ManyTracksManyCodecs`), and per-track body. The returned tag has
+    /// `ex_packet_type = real_packet_type`, `audio_fourcc = shared_fourcc`,
+    /// `multitrack = Some(mt)`, and `body` empty. ModEx prelude is empty.
+    pub fn multitrack_tag(
+        real_packet_type: u8,
+        shared_fourcc: Option<[u8; 4]>,
+        mt: Multitrack,
+    ) -> AudioTag {
+        AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(real_packet_type),
+            audio_fourcc: shared_fourcc,
+            body: Vec::new(),
+            mod_ex: Vec::new(),
+            multitrack: Some(mt),
         }
     }
 }
@@ -1078,11 +1469,11 @@ impl AudioTag {
 /// sit in [`AudioTag::body`] verbatim and lift to the strongly-typed
 /// [`MultichannelConfig`] view through
 /// [`AudioTag::multichannel_config`]. The `Multitrack` AudioPacketType
-/// still has a nested layout (per-track FourCC + size-prefixed track
-/// chunks) deferred to a follow-up round; if the nibble decodes to
-/// `Multitrack`, the body is preserved verbatim and the caller is
-/// expected to skip the message rather than interpret it as a normal
-/// coded-frame tag.
+/// is also recognised — the `multitrackType (UB[4]) | realPacketType
+/// (UB[4])` byte plus the optional shared FourCC are consumed inline
+/// here, and the per-track list (`(trackFourCc if ManyTracksManyCodecs)
+/// | trackId(UI8) | (sizeOfAudioTrack(UI24) if not OneTrack) | body`)
+/// is decoded into [`AudioTag::multitrack`].
 pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
     if payload.is_empty() {
         return Err(Error::Other("FLV audio tag: empty".into()));
@@ -1121,14 +1512,70 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
             pos = next;
         }
 
-        if pos + 4 > payload.len() {
-            return Err(Error::Other(
-                "Enhanced RTMP audio tag: need 4 bytes for FourCC after header/ModEx".into(),
-            ));
+        // Multitrack prelude (enhanced-rtmp-v2.pdf §"ExAudioTagHeader"):
+        // a Multitrack AudioPacketType pulls in a `multitrackType
+        // (UB[4]) | realPacketType (UB[4])` byte and, when the
+        // multitrack mode is not ManyTracksManyCodecs, a shared FourCC.
+        // The body (per-track list) is decoded later via
+        // `Multitrack::parse`.
+        let mut multitrack_type: Option<u8> = None;
+        if packet_type == AUDIO_PACKET_TYPE_MULTITRACK {
+            if pos >= payload.len() {
+                return Err(Error::Other(
+                    "Enhanced RTMP audio Multitrack: truncated reading multitrackType nibble"
+                        .into(),
+                ));
+            }
+            let nibble = payload[pos];
+            pos += 1;
+            let mt_type = (nibble >> 4) & 0x0F;
+            let inner_pt = nibble & 0x0F;
+            // Spec: "This fetch MUST not result in a AudioPacketType.Multitrack"
+            if inner_pt == AUDIO_PACKET_TYPE_MULTITRACK {
+                return Err(Error::Other(
+                    "Enhanced RTMP audio Multitrack: inner PacketType MUST NOT be Multitrack"
+                        .into(),
+                ));
+            }
+            multitrack_type = Some(mt_type);
+            packet_type = inner_pt;
         }
-        let mut fcc = [0u8; 4];
-        fcc.copy_from_slice(&payload[pos..pos + 4]);
-        pos += 4;
+
+        let need_shared_fourcc = match multitrack_type {
+            Some(t) => t != AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS,
+            None => true,
+        };
+        let fcc_opt = if need_shared_fourcc {
+            if pos + 4 > payload.len() {
+                return Err(Error::Other(
+                    "Enhanced RTMP audio tag: need 4 bytes for FourCC after header/ModEx".into(),
+                ));
+            }
+            let mut fcc = [0u8; 4];
+            fcc.copy_from_slice(&payload[pos..pos + 4]);
+            pos += 4;
+            Some(fcc)
+        } else {
+            None
+        };
+
+        if let Some(mt_type) = multitrack_type {
+            let mt = Multitrack::parse(&payload[pos..], mt_type)?;
+            return Ok(AudioTag {
+                sound_format,
+                sound_rate: 0,
+                sound_size_16bit: false,
+                stereo: false,
+                aac_packet_type: None,
+                ex_packet_type: Some(packet_type),
+                audio_fourcc: fcc_opt,
+                body: Vec::new(),
+                mod_ex,
+                multitrack: Some(mt),
+            });
+        }
+
+        let fcc = fcc_opt.expect("non-Multitrack audio tag requires shared FourCC slot");
         Ok(AudioTag {
             sound_format,
             sound_rate: 0,
@@ -1139,6 +1586,7 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
             audio_fourcc: Some(fcc),
             body: payload[pos..].to_vec(),
             mod_ex,
+            multitrack: None,
         })
     } else {
         // --- Legacy pre-2023 framing ---
@@ -1159,6 +1607,7 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
                 audio_fourcc: None,
                 body: payload[2..].to_vec(),
                 mod_ex: Vec::new(),
+                multitrack: None,
             })
         } else {
             Ok(AudioTag {
@@ -1171,6 +1620,7 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
                 audio_fourcc: None,
                 body: payload[1..].to_vec(),
                 mod_ex: Vec::new(),
+                multitrack: None,
             })
         }
     }
@@ -1189,21 +1639,47 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
 /// FourCC, then `body`. The legacy SoundRate / SoundSize /
 /// SoundType bits are dropped per spec.
 pub fn build_audio(tag: &AudioTag) -> Vec<u8> {
-    if let Some(fcc) = tag.audio_fourcc {
-        let packet_type = tag.ex_packet_type.unwrap_or(AUDIO_PACKET_TYPE_CODED_FRAMES);
+    if tag.audio_fourcc.is_some() || tag.multitrack.is_some() {
+        let real_packet_type = tag.ex_packet_type.unwrap_or(AUDIO_PACKET_TYPE_CODED_FRAMES);
+        let multitrack_outer_pt = if tag.multitrack.is_some() {
+            Some(AUDIO_PACKET_TYPE_MULTITRACK)
+        } else {
+            None
+        };
+        let post_mod_ex_pt = multitrack_outer_pt.unwrap_or(real_packet_type);
         // When a ModEx prelude is present the header byte's
-        // AudioPacketType nibble is `ModEx`; the real packet type is
+        // AudioPacketType nibble is `ModEx`; the next packet type is
         // carried by the terminating nibble of the chain
-        // (enhanced-rtmp-v2.pdf §"ExAudioTagHeader").
+        // (enhanced-rtmp-v2.pdf §"ExAudioTagHeader"). For a multitrack
+        // tag the next packet type is `Multitrack`, not the real inner.
         let header_pt = if tag.mod_ex.is_empty() {
-            packet_type
+            post_mod_ex_pt
         } else {
             AUDIO_PACKET_TYPE_MOD_EX
         };
         let head = (AUDIO_FORMAT_EX_HEADER << 4) | (header_pt & 0x0F);
         let mut out = Vec::with_capacity(tag.body.len() + 5);
         out.push(head);
-        build_mod_ex_chain(&mut out, &tag.mod_ex, AUDIO_PACKET_TYPE_MOD_EX, packet_type);
+        build_mod_ex_chain(
+            &mut out,
+            &tag.mod_ex,
+            AUDIO_PACKET_TYPE_MOD_EX,
+            post_mod_ex_pt,
+        );
+        if let Some(mt) = &tag.multitrack {
+            // Multitrack nibble: `multitrackType (UB[4]) | realPacketType
+            // (UB[4])`.
+            out.push(((mt.multitrack_type & 0x0F) << 4) | (real_packet_type & 0x0F));
+            if mt.multitrack_type != AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS {
+                let fcc = tag.audio_fourcc.unwrap_or([0; 4]);
+                out.extend_from_slice(&fcc);
+            }
+            out.extend_from_slice(&mt.encode());
+            return out;
+        }
+        let fcc = tag
+            .audio_fourcc
+            .expect("Enhanced-RTMP non-Multitrack audio tag requires audio_fourcc");
         out.extend_from_slice(&fcc);
         out.extend_from_slice(&tag.body);
         out
@@ -1237,6 +1713,8 @@ mod tests {
             body: b"\x00\x00\x00\x05hello".to_vec(),
             ex_packet_type: None,
             fourcc: None,
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         assert_eq!(payload[0], 0x17); // keyframe + AVC
@@ -1255,6 +1733,8 @@ mod tests {
             body: vec![0x01],
             ex_packet_type: None,
             fourcc: None,
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         let back = parse_video(&payload).unwrap();
@@ -1276,6 +1756,8 @@ mod tests {
             body: b"\x01dummy-hvcc".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
             fourcc: Some(FOURCC_HEVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // Header byte: IsExHeader(1) | FrameType(001) | PacketType(0000)
@@ -1305,6 +1787,8 @@ mod tests {
             body: b"\x00\x00\x00\x04NALU".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
             fourcc: Some(FOURCC_HEVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=2 | PacketType=1 = 0b1010_0001 = 0xA1.
@@ -1333,6 +1817,8 @@ mod tests {
             body: b"\x00\x00\x00\x04NALU".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES_X),
             fourcc: Some(FOURCC_HEVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=2 | PacketType=3 = 0xA3.
@@ -1362,6 +1848,8 @@ mod tests {
             body: b"\x81\x05\x0c\x00".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
             fourcc: Some(FOURCC_AV1),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         assert_eq!(payload[0], 0x90);
@@ -1388,6 +1876,8 @@ mod tests {
             body: b"\x0a\x0b\x0cobu-stub".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
             fourcc: Some(FOURCC_AV1),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=1 | PacketType=1 = 0x91.
@@ -1413,6 +1903,8 @@ mod tests {
             body: b"vp9-frame-bytes".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
             fourcc: Some(FOURCC_VP9),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         assert_eq!(payload[0], 0x91);
@@ -1435,6 +1927,8 @@ mod tests {
             body: vec![],
             ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_END),
             fourcc: Some(FOURCC_HEVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=1 | PacketType=2 = 0x92.
@@ -1463,6 +1957,8 @@ mod tests {
             body: b"amf-stub".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_METADATA),
             fourcc: Some(FOURCC_HEVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=5 | PacketType=4 = 0xD4.
@@ -1495,6 +1991,8 @@ mod tests {
                 body: vec![0x00],
                 ex_packet_type: None,
                 fourcc: None,
+
+                multitrack: None,
             };
             let payload = build_video(&tag);
             assert_eq!(payload[0] & VIDEO_IS_EX_HEADER, 0, "ft={ft}");
@@ -1521,6 +2019,8 @@ mod tests {
             ],
             ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
             fourcc: Some(FOURCC_VP8),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=1 (key) | PacketType=0 = 0x90.
@@ -1546,6 +2046,8 @@ mod tests {
             body: b"vp8-frame-bytes".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
             fourcc: Some(FOURCC_VP8),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=2 | PacketType=1 = 0xA1.
@@ -1573,6 +2075,8 @@ mod tests {
             body: b"\x01\x42\xc0\x1edummy-avcc".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
             fourcc: Some(FOURCC_AVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=1 | PacketType=0 = 0x90.
@@ -1600,6 +2104,8 @@ mod tests {
             body: b"\x00\x00\x00\x05nalu1".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
             fourcc: Some(FOURCC_AVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=2 | PacketType=1 = 0xA1.
@@ -1626,6 +2132,8 @@ mod tests {
             body: b"\x00\x00\x00\x05nalu2".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES_X),
             fourcc: Some(FOURCC_AVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=2 | PacketType=3 = 0xA3.
@@ -1652,6 +2160,8 @@ mod tests {
             body: b"\xff\xfcdummy-vvcc".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
             fourcc: Some(FOURCC_VVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         assert_eq!(payload[0], 0x90);
@@ -1676,6 +2186,8 @@ mod tests {
             body: b"\x00\x00\x00\x06h266ku".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
             fourcc: Some(FOURCC_VVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=1 | PacketType=1 = 0x91.
@@ -1700,6 +2212,8 @@ mod tests {
             body: b"\x00\x00\x00\x03vvc".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES_X),
             fourcc: Some(FOURCC_VVC),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // IsExHeader=1 | FrameType=2 | PacketType=3 = 0xA3.
@@ -1740,6 +2254,8 @@ mod tests {
                 body: vec![0xDE, 0xAD, 0xBE, 0xEF],
                 ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_END),
                 fourcc: Some(fcc),
+
+                multitrack: None,
             };
             let payload = build_video(&tag);
             // SequenceEnd: ExHeader byte + FourCC, no body
@@ -1764,6 +2280,8 @@ mod tests {
             body: vec![0x12, 0x10], // LC-AAC 44.1k stereo AudioSpecificConfig
             ex_packet_type: None,
             audio_fourcc: None,
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         assert_eq!(payload[0], 0xAF); // AAC + rate 3 + 16-bit + stereo
@@ -1792,6 +2310,8 @@ mod tests {
             ex_packet_type: Some(AUDIO_PACKET_TYPE_SEQUENCE_START),
             audio_fourcc: Some(FOURCC_OPUS),
             body: b"OpusHead\x01\x02".to_vec(),
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         // Header byte: ExHeader(9) << 4 | PacketType(0) = 0x90.
@@ -1828,6 +2348,8 @@ mod tests {
             ex_packet_type: Some(AUDIO_PACKET_TYPE_CODED_FRAMES),
             audio_fourcc: Some(FOURCC_OPUS),
             body: b"opus-frame-bytes".to_vec(),
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         // ExHeader=9 | CodedFrames=1 = 0x91.
@@ -1856,6 +2378,8 @@ mod tests {
             ex_packet_type: Some(AUDIO_PACKET_TYPE_SEQUENCE_START),
             audio_fourcc: Some(FOURCC_FLAC),
             body: b"fLaC\x80\x00\x00\x22streaminfo".to_vec(),
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         assert_eq!(payload[0], 0x90);
@@ -1883,6 +2407,8 @@ mod tests {
             ex_packet_type: Some(AUDIO_PACKET_TYPE_CODED_FRAMES),
             audio_fourcc: Some(FOURCC_AC3),
             body: vec![0x0B, 0x77, 0x12, 0x34, 0x56, 0x78], // AC-3 sync + stub
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         assert_eq!(payload[0], 0x91);
@@ -1905,6 +2431,8 @@ mod tests {
             ex_packet_type: Some(AUDIO_PACKET_TYPE_CODED_FRAMES),
             audio_fourcc: Some(FOURCC_EAC3),
             body: vec![0x0B, 0x77, 0xAB, 0xCD],
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         assert_eq!(payload[0], 0x91);
@@ -1929,6 +2457,8 @@ mod tests {
             ex_packet_type: Some(AUDIO_PACKET_TYPE_CODED_FRAMES),
             audio_fourcc: Some(FOURCC_MP3),
             body: vec![0xFF, 0xFB, 0x90, 0x00], // MP3 sync header stub
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         assert_eq!(payload[0], 0x91);
@@ -1955,6 +2485,8 @@ mod tests {
             ex_packet_type: Some(AUDIO_PACKET_TYPE_SEQUENCE_START),
             audio_fourcc: Some(FOURCC_AAC),
             body: vec![0x12, 0x10], // LC-AAC 44.1k stereo ASC
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         assert_eq!(payload[0], 0x90);
@@ -1982,6 +2514,8 @@ mod tests {
             ex_packet_type: Some(AUDIO_PACKET_TYPE_SEQUENCE_END),
             audio_fourcc: Some(FOURCC_OPUS),
             body: vec![],
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         // ExHeader=9 | SequenceEnd=2 = 0x92.
@@ -2045,6 +2579,8 @@ mod tests {
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
             fourcc: Some(FOURCC_VVC),
             mod_ex: vec![ModEx::timestamp_offset_nano_entry(nano)],
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // byte 0 = IsExHeader|FrameType(2)|ModEx(7) = 0b1010_0111 = 0xA7.
@@ -2086,6 +2622,8 @@ mod tests {
                     data: vec![0xAA, 0xBB],
                 },
             ],
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // First entry: size byte (2 → 3-byte data), data, nibble
@@ -2125,6 +2663,8 @@ mod tests {
                 mod_ex_type: MOD_EX_TYPE_TIMESTAMP_OFFSET_NANO,
                 data: big.clone(),
             }],
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // size: 0xFF sentinel + UI16(len-1 = 299 = 0x012B).
@@ -2153,6 +2693,8 @@ mod tests {
             audio_fourcc: Some(FOURCC_OPUS),
             body: b"opus-pkt".to_vec(),
             mod_ex: vec![ModEx::timestamp_offset_nano_entry(nano)],
+
+            multitrack: None,
         };
         let payload = build_audio(&tag);
         // byte 0 = ExHeader(9) << 4 | ModEx(7) = 0x97.
@@ -2223,6 +2765,8 @@ mod tests {
             ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
             fourcc: Some(FOURCC_HEVC),
             mod_ex: Vec::new(),
+
+            multitrack: None,
         };
         let payload = build_video(&tag);
         // Header low nibble is the real packet type, not ModEx.
@@ -2416,6 +2960,8 @@ mod tests {
             audio_fourcc: Some(FOURCC_OPUS),
             body: vec![b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd'],
             mod_ex: Vec::new(),
+
+            multitrack: None,
         };
         assert!(!tag.is_multichannel_config());
         assert!(tag.multichannel_config().unwrap().is_none());
@@ -2437,6 +2983,8 @@ mod tests {
             audio_fourcc: None,
             body: vec![0x01, 0x06, 0x00, 0x00, 0x00, 0x3F],
             mod_ex: Vec::new(),
+
+            multitrack: None,
         };
         assert!(!tag.is_multichannel_config());
         assert!(tag.multichannel_config().unwrap().is_none());
@@ -2528,5 +3076,318 @@ mod tests {
                 "channel {ch} should map to mask bit (1 << {ch})"
             );
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Multitrack — Enhanced RTMP v2 §"ExVideoTagBody" / §"ExAudioTagBody"
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn multitrack_one_track_video_roundtrip() {
+        // OneTrack mode: no per-track FourCC, no UI24 size. The track
+        // body runs from after the UI8 trackId to end-of-buffer.
+        let mt = Multitrack {
+            multitrack_type: AV_MULTITRACK_TYPE_ONE_TRACK,
+            tracks: vec![MultitrackTrack {
+                fourcc: None,
+                track_id: 0,
+                body: b"\x00\x00\x00\x05hello".to_vec(),
+            }],
+        };
+        let tag = VideoTag::multitrack_tag(
+            VIDEO_FRAME_KEYFRAME,
+            EX_PACKET_TYPE_CODED_FRAMES,
+            Some(FOURCC_AVC),
+            mt.clone(),
+        );
+        assert!(tag.is_multitrack());
+        let wire = build_video(&tag);
+        // Header byte: IsExHeader(1) | FrameType(001) | PacketType(Multitrack=0110)
+        // = 0b1001_0110 = 0x96.
+        assert_eq!(wire[0], 0x96);
+        // Multitrack nibble byte: (OneTrack=0 << 4) | (CodedFrames=1) = 0x01.
+        assert_eq!(wire[1], 0x01);
+        // Shared FourCC sits next (OneTrack uses a shared codec).
+        assert_eq!(&wire[2..6], b"avc1");
+        // Then trackId, then body bytes (NO UI24 size).
+        assert_eq!(wire[6], 0x00);
+        assert_eq!(&wire[7..], b"\x00\x00\x00\x05hello");
+        let back = parse_video(&wire).unwrap();
+        assert_eq!(back, tag);
+        assert_eq!(back.multitrack.as_ref().unwrap(), &mt);
+        assert_eq!(back.ex_packet_type, Some(EX_PACKET_TYPE_CODED_FRAMES));
+        assert_eq!(back.fourcc, Some(FOURCC_AVC));
+    }
+
+    #[test]
+    fn multitrack_many_tracks_video_roundtrip() {
+        // ManyTracks mode: shared FourCC, per-track UI24 sizeOfTrack.
+        // Two HEVC tracks of different sizes.
+        let mt = Multitrack {
+            multitrack_type: AV_MULTITRACK_TYPE_MANY_TRACKS,
+            tracks: vec![
+                MultitrackTrack {
+                    fourcc: None,
+                    track_id: 0,
+                    body: b"hevc-track-0".to_vec(),
+                },
+                MultitrackTrack {
+                    fourcc: None,
+                    track_id: 1,
+                    body: b"hevc-track-1-longer".to_vec(),
+                },
+            ],
+        };
+        let tag = VideoTag::multitrack_tag(
+            VIDEO_FRAME_INTER,
+            EX_PACKET_TYPE_CODED_FRAMES,
+            Some(FOURCC_HEVC),
+            mt.clone(),
+        );
+        let wire = build_video(&tag);
+        // Header byte: IsExHeader(1) | FrameType(010) | PacketType(0110)
+        // = 0b1010_0110 = 0xA6.
+        assert_eq!(wire[0], 0xA6);
+        // Multitrack nibble: (ManyTracks=1 << 4) | (CodedFrames=1) = 0x11.
+        assert_eq!(wire[1], 0x11);
+        assert_eq!(&wire[2..6], b"hvc1");
+        // track 0: trackId(0) + UI24 size(12) + 12 body bytes
+        assert_eq!(wire[6], 0x00);
+        assert_eq!(&wire[7..10], &[0, 0, 12]);
+        assert_eq!(&wire[10..22], b"hevc-track-0");
+        // track 1: trackId(1) + UI24 size(19) + 19 body bytes
+        assert_eq!(wire[22], 0x01);
+        assert_eq!(&wire[23..26], &[0, 0, 19]);
+        assert_eq!(&wire[26..45], b"hevc-track-1-longer");
+        let back = parse_video(&wire).unwrap();
+        assert_eq!(back, tag);
+    }
+
+    #[test]
+    fn multitrack_many_tracks_many_codecs_video_roundtrip() {
+        // ManyTracksManyCodecs: no shared FourCC, each track carries its
+        // own FourCC, each track has a UI24 size.
+        let mt = Multitrack {
+            multitrack_type: AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS,
+            tracks: vec![
+                MultitrackTrack {
+                    fourcc: Some(FOURCC_HEVC),
+                    track_id: 0,
+                    body: b"hevc-data".to_vec(),
+                },
+                MultitrackTrack {
+                    fourcc: Some(FOURCC_AV1),
+                    track_id: 1,
+                    body: b"av1-obu-bytes".to_vec(),
+                },
+            ],
+        };
+        // For ManyTracksManyCodecs the shared outer FourCC is None.
+        let tag = VideoTag::multitrack_tag(
+            VIDEO_FRAME_KEYFRAME,
+            EX_PACKET_TYPE_CODED_FRAMES,
+            None,
+            mt.clone(),
+        );
+        let wire = build_video(&tag);
+        // Header byte: 0x96 (same as OneTrack — IsExHeader | KF | Multitrack).
+        assert_eq!(wire[0], 0x96);
+        // Multitrack nibble: (MTMC=2 << 4) | (CodedFrames=1) = 0x21.
+        assert_eq!(wire[1], 0x21);
+        // No shared FourCC follows — track 0 starts at offset 2.
+        assert_eq!(&wire[2..6], b"hvc1");
+        assert_eq!(wire[6], 0x00);
+        assert_eq!(&wire[7..10], &[0, 0, 9]);
+        assert_eq!(&wire[10..19], b"hevc-data");
+        // Track 1.
+        assert_eq!(&wire[19..23], b"av01");
+        assert_eq!(wire[23], 0x01);
+        assert_eq!(&wire[24..27], &[0, 0, 13]);
+        assert_eq!(&wire[27..40], b"av1-obu-bytes");
+        let back = parse_video(&wire).unwrap();
+        assert_eq!(back, tag);
+        assert_eq!(back.fourcc, None);
+    }
+
+    #[test]
+    fn multitrack_audio_one_track_roundtrip() {
+        // OneTrack audio Multitrack carrying an Opus CodedFrames body.
+        let mt = Multitrack {
+            multitrack_type: AV_MULTITRACK_TYPE_ONE_TRACK,
+            tracks: vec![MultitrackTrack {
+                fourcc: None,
+                track_id: 0,
+                body: b"opus-packet-bytes".to_vec(),
+            }],
+        };
+        let tag = AudioTag::multitrack_tag(
+            AUDIO_PACKET_TYPE_CODED_FRAMES,
+            Some(FOURCC_OPUS),
+            mt.clone(),
+        );
+        assert!(tag.is_multitrack());
+        let wire = build_audio(&tag);
+        // Header byte: ExHeader(9) | AudioPacketType(Multitrack=5) = 0x95.
+        assert_eq!(wire[0], 0x95);
+        // Multitrack nibble: (OneTrack=0 << 4) | (CodedFrames=1) = 0x01.
+        assert_eq!(wire[1], 0x01);
+        assert_eq!(&wire[2..6], b"Opus");
+        assert_eq!(wire[6], 0x00); // trackId 0
+        assert_eq!(&wire[7..], b"opus-packet-bytes");
+        let back = parse_audio(&wire).unwrap();
+        assert_eq!(back, tag);
+        assert_eq!(back.ex_packet_type, Some(AUDIO_PACKET_TYPE_CODED_FRAMES));
+        assert_eq!(back.audio_fourcc, Some(FOURCC_OPUS));
+    }
+
+    #[test]
+    fn multitrack_audio_many_tracks_many_codecs_roundtrip() {
+        // Mixed Opus + AAC audio multitrack — ManyTracksManyCodecs.
+        let mt = Multitrack {
+            multitrack_type: AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS,
+            tracks: vec![
+                MultitrackTrack {
+                    fourcc: Some(FOURCC_OPUS),
+                    track_id: 0,
+                    body: b"opus-bytes".to_vec(),
+                },
+                MultitrackTrack {
+                    fourcc: Some(FOURCC_AAC),
+                    track_id: 7,
+                    body: b"aac-raw-frame".to_vec(),
+                },
+            ],
+        };
+        let tag = AudioTag::multitrack_tag(AUDIO_PACKET_TYPE_CODED_FRAMES, None, mt.clone());
+        let wire = build_audio(&tag);
+        assert_eq!(wire[0], 0x95);
+        assert_eq!(wire[1], 0x21);
+        // Track 0
+        assert_eq!(&wire[2..6], b"Opus");
+        assert_eq!(wire[6], 0x00);
+        assert_eq!(&wire[7..10], &[0, 0, 10]);
+        assert_eq!(&wire[10..20], b"opus-bytes");
+        // Track 1
+        assert_eq!(&wire[20..24], b"mp4a");
+        assert_eq!(wire[24], 0x07);
+        assert_eq!(&wire[25..28], &[0, 0, 13]);
+        assert_eq!(&wire[28..41], b"aac-raw-frame");
+        let back = parse_audio(&wire).unwrap();
+        assert_eq!(back, tag);
+        assert_eq!(back.audio_fourcc, None);
+    }
+
+    #[test]
+    fn multitrack_video_inner_packet_type_must_not_be_multitrack() {
+        // Spec: "This fetch MUST not result in a VideoPacketType.Multitrack"
+        // Header 0x96 (Ex/KF/Multitrack), then nibble byte 0x06 (OneTrack |
+        // inner=Multitrack=6). The parser must reject without recursing.
+        let wire = [0x96u8, 0x06, b'a', b'v', b'c', b'1', 0x00];
+        let err = parse_video(&wire).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("MUST NOT"), "got: {msg}");
+    }
+
+    #[test]
+    fn multitrack_audio_inner_packet_type_must_not_be_multitrack() {
+        // Same constraint for audio (AudioPacketType.Multitrack = 5).
+        let wire = [0x95u8, 0x05, b'O', b'p', b'u', b's', 0x00];
+        let err = parse_audio(&wire).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("MUST NOT"), "got: {msg}");
+    }
+
+    #[test]
+    fn multitrack_video_truncated_size_overruns_error() {
+        // ManyTracks: trackId(0) + UI24 size=100 + only 5 bytes follow.
+        // The parser must surface a clean error, not panic.
+        // Layout: header(0x96) + mt-nibble(0x11) + shared FourCC(avc1) +
+        // track0 trackId(0) + size UI24 = 100 + only 5 body bytes.
+        let mut wire = vec![0x96u8, 0x11];
+        wire.extend_from_slice(b"avc1");
+        wire.push(0x00); // trackId
+        wire.extend_from_slice(&[0x00, 0x00, 100]); // size = 100
+        wire.extend_from_slice(b"short"); // only 5 bytes
+        let err = parse_video(&wire).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("overruns"),
+            "expected size-overrun error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn multitrack_truncation_paths_audio_video() {
+        // Truncated reading the multitrack nibble byte (header byte
+        // says Multitrack but no payload follows).
+        assert!(parse_video(&[0x96]).is_err());
+        assert!(parse_audio(&[0x95]).is_err());
+        // Multitrack nibble present, but missing shared FourCC (OneTrack +
+        // CodedFrames inner — needs 4 bytes for the shared FourCC).
+        assert!(parse_video(&[0x96, 0x01]).is_err());
+        assert!(parse_audio(&[0x95, 0x01]).is_err());
+        // Multitrack with shared FourCC but no trackId.
+        // For OneTrack with no trackId after FourCC the loop reports
+        // empty-track-list.
+        assert!(parse_video(&[0x96, 0x01, b'a', b'v', b'c', b'1']).is_err());
+        // ManyTracksManyCodecs needs no shared FourCC but a per-track
+        // FourCC; a buffer with only the multitrack nibble fails the
+        // empty-list path.
+        assert!(parse_video(&[0x96, 0x21]).is_err());
+    }
+
+    #[test]
+    fn multitrack_video_roundtrips_through_mod_ex_prelude() {
+        // The ModEx prelude and the Multitrack prelude compose: the
+        // header byte's PacketType nibble is ModEx; the chain's
+        // terminating nibble is Multitrack; the nibble byte that
+        // follows the FourCC-less position carries `multitrackType |
+        // realPacketType`. This test confirms the parse / build path
+        // round-trips that compound prelude.
+        let mt = Multitrack {
+            multitrack_type: AV_MULTITRACK_TYPE_ONE_TRACK,
+            tracks: vec![MultitrackTrack {
+                fourcc: None,
+                track_id: 0,
+                body: b"hevc-nalus".to_vec(),
+            }],
+        };
+        let mut tag = VideoTag::multitrack_tag(
+            VIDEO_FRAME_KEYFRAME,
+            EX_PACKET_TYPE_CODED_FRAMES,
+            Some(FOURCC_HEVC),
+            mt.clone(),
+        );
+        tag.mod_ex = vec![ModEx::timestamp_offset_nano_entry(123_456)];
+        let wire = build_video(&tag);
+        let back = parse_video(&wire).unwrap();
+        assert_eq!(back, tag);
+        assert_eq!(back.timestamp_offset_nano(), 123_456);
+        assert!(back.is_multitrack());
+    }
+
+    #[test]
+    fn multitrack_helpers_round_trip_through_body_encode_parse() {
+        // Direct Multitrack::encode + Multitrack::parse symmetry, with
+        // a reserved multitrack_type (4) preserved verbatim (it's not
+        // OneTrack so a UI24 size IS emitted; tracks are still decodable).
+        let mt = Multitrack {
+            multitrack_type: 4,
+            tracks: vec![
+                MultitrackTrack {
+                    fourcc: None,
+                    track_id: 2,
+                    body: vec![0xDE, 0xAD],
+                },
+                MultitrackTrack {
+                    fourcc: None,
+                    track_id: 3,
+                    body: vec![0xBE, 0xEF, 0xCA, 0xFE],
+                },
+            ],
+        };
+        let bytes = mt.encode();
+        let back = Multitrack::parse(&bytes, 4).unwrap();
+        assert_eq!(back, mt);
     }
 }

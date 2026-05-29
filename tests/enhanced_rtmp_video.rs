@@ -251,6 +251,8 @@ fn build_then_parse_then_build_is_idempotent_for_all_fourccs() {
             body,
             ex_packet_type: Some(pt),
             fourcc: Some(fcc),
+
+            multitrack: None,
         };
         let bytes1 = build_video(&tag1);
         let tag2 = parse_video(&bytes1).unwrap_or_else(|e| panic!("{label}: parse: {e:?}"));

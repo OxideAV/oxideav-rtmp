@@ -253,6 +253,8 @@ impl RtmpClient {
             body: avc_c.to_vec(),
             ex_packet_type: None,
             fourcc: None,
+
+            multitrack: None,
         };
         self.send_video_tag(0, &tag)
     }
@@ -274,6 +276,8 @@ impl RtmpClient {
             body: body.to_vec(),
             ex_packet_type: None,
             fourcc: None,
+
+            multitrack: None,
         };
         self.send_video_tag(timestamp_ms, &tag)
     }
@@ -307,6 +311,8 @@ impl RtmpClient {
             body: asc.to_vec(),
             ex_packet_type: None,
             audio_fourcc: None,
+
+            multitrack: None,
         };
         self.send_audio_tag(0, &tag)
     }
@@ -323,6 +329,8 @@ impl RtmpClient {
             body: aac_frame.to_vec(),
             ex_packet_type: None,
             audio_fourcc: None,
+
+            multitrack: None,
         };
         self.send_audio_tag(timestamp_ms, &tag)
     }

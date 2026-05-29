@@ -115,8 +115,20 @@ client.close()?;
   `AudioTag::multichannel_config_tag` rebuilds the matching outbound tag.
   `audio_channel` / `audio_channel_mask` public submodules name all 24
   spec-defined positions (including the 22.2 surround extras from SMPTE
-  ST 2036-2-2008). `Multitrack` still parses to an opaque body pending a
-  follow-up round.
+  ST 2036-2-2008). The `Multitrack` AudioPacketType / VideoPacketType
+  is also wired end-to-end: the `multitrackType (UB[4]) | realPacketType
+  (UB[4])` byte plus the optional shared FourCC (per spec, omitted in
+  `ManyTracksManyCodecs` mode) are consumed inline by `parse_audio` /
+  `parse_video`, and the per-track list
+  (`(trackFourCc if ManyTracksManyCodecs) | trackId(UI8) |
+  (sizeOfTrack(UI24) if not OneTrack) | body`) lifts to a typed
+  [`Multitrack { multitrack_type, tracks: Vec<MultitrackTrack> }`] on
+  `VideoTag::multitrack` / `AudioTag::multitrack`. `OneTrack` /
+  `ManyTracks` / `ManyTracksManyCodecs` all round-trip — including the
+  inner-PacketType-MUST-NOT-be-Multitrack invariant from the spec — via
+  the new `VideoTag::multitrack_tag` / `AudioTag::multitrack_tag`
+  builders. Reserved `multitrackType` values (3..=15) pass through
+  verbatim so a forwarding ingest preserves future modes.
 - **Graceful session close**. `RtmpSession::close` emits a
   `UserControl StreamEOF(stream_id)` (RTMP 1.0 §7.1.7) before
   `onStatus("NetStream.Unpublish.Success")`, flushes the chunk writer,

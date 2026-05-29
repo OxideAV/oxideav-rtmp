@@ -793,6 +793,8 @@ mod tests {
             body: vec![0x12, 0x10],
             ex_packet_type: None,
             audio_fourcc: None,
+
+            multitrack: None,
         };
         let pkt = audio_to_packet(0, &tag);
         assert_eq!(pkt.stream_index, AUDIO_STREAM_INDEX);
@@ -816,6 +818,8 @@ mod tests {
             body: vec![0xAB, 0xCD, 0xEF],
             ex_packet_type: None,
             audio_fourcc: None,
+
+            multitrack: None,
         };
         let pkt = audio_to_packet(123, &tag);
         assert_eq!(pkt.pts, Some(123));
@@ -836,6 +840,8 @@ mod tests {
             body: vec![0xFF, 0xFB, 0x90, 0x00],
             ex_packet_type: None,
             audio_fourcc: None,
+
+            multitrack: None,
         };
         let pkt = audio_to_packet(40, &tag);
         // No AAC marker prepended for non-AAC.
@@ -857,6 +863,8 @@ mod tests {
             body: vec![],
             ex_packet_type: None,
             audio_fourcc: None,
+
+            multitrack: None,
         };
         assert_eq!(audio_codec_id_for_tag(&legacy_aac).as_str(), "aac");
         for (fcc, expected) in [
@@ -877,6 +885,8 @@ mod tests {
                 ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_CODED_FRAMES),
                 audio_fourcc: Some(fcc),
                 body: vec![],
+
+                multitrack: None,
             };
             assert_eq!(audio_codec_id_for_tag(&t).as_str(), expected);
         }
@@ -901,6 +911,8 @@ mod tests {
             ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_START),
             audio_fourcc: Some(flv::FOURCC_OPUS),
             body: b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00".to_vec(),
+
+            multitrack: None,
         };
         let pkt = audio_to_packet(0, &tag);
         assert_eq!(pkt.stream_index, AUDIO_STREAM_INDEX);
@@ -926,6 +938,8 @@ mod tests {
             ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_CODED_FRAMES),
             audio_fourcc: Some(flv::FOURCC_AC3),
             body: vec![0x0B, 0x77, 0xAB, 0xCD, 0xEF],
+
+            multitrack: None,
         };
         let pkt = audio_to_packet(200, &tag);
         assert!(!pkt.flags.header);
@@ -947,6 +961,8 @@ mod tests {
             ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_END),
             audio_fourcc: Some(flv::FOURCC_OPUS),
             body: vec![],
+
+            multitrack: None,
         };
         let pkt = audio_to_packet(999, &tag);
         // SequenceEnd is a flush boundary — header flag lets the
@@ -969,6 +985,8 @@ mod tests {
             ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_START),
             audio_fourcc: Some(flv::FOURCC_FLAC),
             body: b"fLaC\x80\x00\x00\x22streaminfo-body-bytes".to_vec(),
+
+            multitrack: None,
         };
         let p = audio_codec_params(&tag);
         assert_eq!(p.codec_id.as_str(), "flac");
@@ -996,6 +1014,8 @@ mod tests {
             ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_CODED_FRAMES),
             audio_fourcc: Some(flv::FOURCC_AC3),
             body: vec![0x0B, 0x77, 0xAB, 0xCD],
+
+            multitrack: None,
         };
         let p = audio_codec_params(&tag);
         assert_eq!(p.codec_id.as_str(), "ac3");
@@ -1013,6 +1033,8 @@ mod tests {
             body: b"\x00\x00\x00\x05hello".to_vec(),
             ex_packet_type: None,
             fourcc: None,
+
+            multitrack: None,
         };
         let pkt = video_to_packet(33, &tag);
         assert_eq!(pkt.stream_index, VIDEO_STREAM_INDEX);
@@ -1034,6 +1056,8 @@ mod tests {
             body: vec![1, 2, 3],
             ex_packet_type: None,
             fourcc: None,
+
+            multitrack: None,
         };
         let pkt = video_to_packet(100, &tag);
         assert!(!pkt.flags.keyframe);
@@ -1052,6 +1076,8 @@ mod tests {
             body: b"\x01\x42\x80\x1e".to_vec(),
             ex_packet_type: None,
             fourcc: None,
+
+            multitrack: None,
         };
         let pkt = video_to_packet(0, &tag);
         assert!(pkt.flags.keyframe);
@@ -1070,6 +1096,8 @@ mod tests {
             body: vec![0xAA, 0xBB, 0xCC],
             ex_packet_type: None,
             fourcc: None,
+
+            multitrack: None,
         };
         let pkt = video_to_packet(50, &tag);
         assert_eq!(pkt.pts, pkt.dts);
@@ -1089,6 +1117,8 @@ mod tests {
             body: vec![],
             ex_packet_type: None,
             fourcc: None,
+
+            multitrack: None,
         };
         assert_eq!(video_codec_id_for_tag(&avc).as_str(), "h264");
         for (fcc, expected) in [
@@ -1105,6 +1135,8 @@ mod tests {
                 body: vec![],
                 ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
                 fourcc: Some(fcc),
+
+                multitrack: None,
             };
             assert_eq!(video_codec_id_for_tag(&t).as_str(), expected);
         }
@@ -1125,6 +1157,8 @@ mod tests {
             body: b"\x01hvcc-stub".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
             fourcc: Some(FOURCC_HEVC),
+
+            multitrack: None,
         };
         let pkt = video_to_packet(0, &tag);
         assert!(pkt.flags.header);
@@ -1147,6 +1181,8 @@ mod tests {
             body: b"\x00\x00\x00\x04NALU".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
             fourcc: Some(FOURCC_HEVC),
+
+            multitrack: None,
         };
         let pkt = video_to_packet(200, &tag);
         assert!(!pkt.flags.keyframe);
@@ -1167,6 +1203,8 @@ mod tests {
             body: vec![0x0a, 0x0b],
             ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
             fourcc: Some(FOURCC_AV1),
+
+            multitrack: None,
         };
         let pkt = video_to_packet(500, &tag);
         assert!(pkt.flags.keyframe);
@@ -1190,6 +1228,8 @@ mod tests {
             body: b"amf-payload".to_vec(),
             ex_packet_type: Some(EX_PACKET_TYPE_METADATA),
             fourcc: Some(FOURCC_HEVC),
+
+            multitrack: None,
         };
         let pkt = video_to_packet(123, &tag);
         assert!(!pkt.flags.keyframe);

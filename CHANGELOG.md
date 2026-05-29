@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enhanced RTMP v2 `Multitrack` audio + video body parser + builder**
+  (`src/flv.rs`, `tests/multitrack.rs`). The `VideoPacketType.Multitrack = 6`
+  and `AudioPacketType.Multitrack = 5` body shapes from
+  `enhanced-rtmp-v2.pdf` §"ExVideoTagBody" / §"ExAudioTagBody" are now
+  decoded end-to-end. The `multitrackType (UB[4]) | realPacketType
+  (UB[4])` byte plus the optional shared FourCC (omitted in
+  `ManyTracksManyCodecs` mode per spec) are consumed inline by
+  `parse_video` / `parse_audio` ahead of the existing FourCC slot, and
+  the per-track list (`(trackFourCc if ManyTracksManyCodecs) |
+  trackId(UI8) | (sizeOfTrack(UI24) if not OneTrack) | body`) is lifted
+  into a typed `Multitrack { multitrack_type, tracks }` struct on the
+  new `VideoTag::multitrack` / `AudioTag::multitrack` fields. The
+  outer tag's `ex_packet_type` now holds the *real* inner PacketType
+  (e.g. `CodedFrames`, `SequenceStart`) so a downstream `ex_packet_type
+  == SequenceStart` check still works for multitrack tags, and
+  `fourcc` / `audio_fourcc` hold the shared codec for `OneTrack` /
+  `ManyTracks` modes (and `None` for `ManyTracksManyCodecs`, where each
+  `MultitrackTrack::fourcc` carries the per-track codec).
+  `VideoTag::multitrack_tag` and `AudioTag::multitrack_tag` are the
+  outbound builders; `VideoTag::is_multitrack()` / `AudioTag::is_multitrack()`
+  are the discriminators. New constants `AV_MULTITRACK_TYPE_ONE_TRACK`
+  / `AV_MULTITRACK_TYPE_MANY_TRACKS` / `AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS`
+  cover the spec's `enum AvMultitrackType`. Reserved discriminators
+  (3..=15) round-trip verbatim through `Multitrack::parse` /
+  `Multitrack::encode` so a forwarding ingest preserves future modes.
+  The spec invariant that the inner real PacketType MUST NOT itself be
+  `Multitrack` is enforced — a forged inner nibble of `6` (video) or
+  `5` (audio) surfaces a clean `Error::Other("…MUST NOT…")` rather
+  than recursing, and a truncated `sizeOfTrack` overrun yields a clean
+  `…overruns remaining N bytes` error. 23 new tests (11 unit in
+  `src/flv.rs`, 12 integration in `tests/multitrack.rs`) cover: video
+  `OneTrack` AVC CodedFrames byte-exact wire layout; video `ManyTracks`
+  HEVC two-track byte-exact UI24 sizes; video `ManyTracksManyCodecs`
+  HEVC+AV1; video `SequenceStart` `ManyTracks` VVC; audio `OneTrack`
+  Opus CodedFrames; audio `ManyTracksManyCodecs` Opus+FLAC mixed-codec;
+  audio `ManyTracks` AAC; audio `SequenceStart` `ManyTracks` AAC with
+  per-track ASC; the inner-PacketType-MUST-NOT-be-Multitrack invariant
+  for both audio and video; size-overrun-error and three other
+  truncation paths; track ordering preserved verbatim through round-trip
+  (trackIds `[7, 0, 3]` stay `[7, 0, 3]`); empty per-track body
+  (`sizeOfTrack = 0`) round-trips; `ManyTracks` ModEx-prelude
+  composition with `TimestampOffsetNano = 123_456` (proves the
+  ModEx + Multitrack preludes compose on the wire); and a reserved
+  `multitrack_type = 4` direct `Multitrack::encode`+`parse` symmetry.
+  Resolves the `Multitrack` portion of the r177 / r186 README notes
+  "`Multitrack` still parses to an opaque body pending a follow-up
+  round." Total integration-test count: 49 → 61 (+12); total tests:
+  191 → 202.
+
 - **Enhanced RTMP v2 `MultichannelConfig` audio body parser + builder**
   (`src/flv.rs`). The `AudioPacketType.MultichannelConfig = 4` body
   shape from `enhanced-rtmp-v2.pdf` §"ExAudioTagBody" is now decoded
