@@ -320,7 +320,9 @@ pub const AUDIO_PACKET_TYPE_SEQUENCE_END: u8 = 2;
 /// `MultichannelConfig` — body specifies AudioChannelOrder +
 /// channel count + (optionally) per-channel speaker mapping or a
 /// 32-bit AudioChannelFlags mask. See §"ExAudioTagBody" pseudocode
-/// for the layout.
+/// for the layout. The body shape is decoded by
+/// [`MultichannelConfig`]; see [`AudioTag::multichannel_config`] for
+/// the lift / round-trip helpers.
 pub const AUDIO_PACKET_TYPE_MULTICHANNEL_CONFIG: u8 = 4;
 /// `Multitrack` — turns on audio multitrack mode. Body shape
 /// (AvMultitrackType + per-track FourCc + track id +
@@ -345,6 +347,261 @@ pub const FOURCC_AAC: [u8; 4] = *b"mp4a";
 
 pub const AAC_PACKET_TYPE_SEQUENCE_HEADER: u8 = 0;
 pub const AAC_PACKET_TYPE_RAW: u8 = 1;
+
+// ---------------------------------------------------------------------------
+// MultichannelConfig — Enhanced RTMP v2 §"ExAudioTagBody"
+// ---------------------------------------------------------------------------
+//
+// When AudioPacketType == MultichannelConfig (= 4) the per-packet body
+// has the layout:
+//
+//   audioChannelOrder = UI8 as AudioChannelOrder
+//   channelCount      = UI8
+//   if (audioChannelOrder == Custom)  audioChannelMapping = UI8[channelCount]
+//   if (audioChannelOrder == Native)  audioChannelFlags   = UI32
+//   if (audioChannelOrder == Unspecified) nothing further
+//
+// This block is sent on a separate `MultichannelConfig` audio message and
+// applies to the surrounding sequence; it does NOT itself carry codec
+// bitstream bytes.
+
+/// AudioChannelOrder discriminator (UI8) per enhanced-rtmp-v2.pdf
+/// §"ExAudioTagBody" `enum AudioChannelOrder`: only the channel count
+/// is specified, channel order is left to the codec / app.
+pub const AUDIO_CHANNEL_ORDER_UNSPECIFIED: u8 = 0;
+/// AudioChannelOrder.Native: the channels are in the order defined by
+/// the AudioChannel enum; an `AudioChannelFlags` UI32 mask follows the
+/// channel count, with bits indexing into [`audio_channel_mask`].
+pub const AUDIO_CHANNEL_ORDER_NATIVE: u8 = 1;
+/// AudioChannelOrder.Custom: each channel's speaker assignment is
+/// spelled out by `audioChannelMapping = UI8[channelCount]`, where each
+/// UI8 is an `AudioChannel` value (see [`audio_channel`]).
+pub const AUDIO_CHANNEL_ORDER_CUSTOM: u8 = 2;
+
+/// `AudioChannel` enum values (UI8) per enhanced-rtmp-v2.pdf
+/// §"ExAudioTagBody" — speaker positions used for
+/// `AudioChannelOrder.Custom` mappings. The numeric values match the
+/// spec table 1:1 and align with the bit indices in
+/// [`audio_channel_mask`].
+pub mod audio_channel {
+    pub const FRONT_LEFT: u8 = 0;
+    pub const FRONT_RIGHT: u8 = 1;
+    pub const FRONT_CENTER: u8 = 2;
+    pub const LOW_FREQUENCY1: u8 = 3;
+    pub const BACK_LEFT: u8 = 4;
+    pub const BACK_RIGHT: u8 = 5;
+    pub const FRONT_LEFT_CENTER: u8 = 6;
+    pub const FRONT_RIGHT_CENTER: u8 = 7;
+    pub const BACK_CENTER: u8 = 8;
+    pub const SIDE_LEFT: u8 = 9;
+    pub const SIDE_RIGHT: u8 = 10;
+    pub const TOP_CENTER: u8 = 11;
+    pub const TOP_FRONT_LEFT: u8 = 12;
+    pub const TOP_FRONT_CENTER: u8 = 13;
+    pub const TOP_FRONT_RIGHT: u8 = 14;
+    pub const TOP_BACK_LEFT: u8 = 15;
+    pub const TOP_BACK_CENTER: u8 = 16;
+    pub const TOP_BACK_RIGHT: u8 = 17;
+    // mappings completing 22.2 multichannel audio (SMPTE ST 2036-2-2008)
+    pub const LOW_FREQUENCY2: u8 = 18;
+    pub const TOP_SIDE_LEFT: u8 = 19;
+    pub const TOP_SIDE_RIGHT: u8 = 20;
+    pub const BOTTOM_FRONT_CENTER: u8 = 21;
+    pub const BOTTOM_FRONT_LEFT: u8 = 22;
+    pub const BOTTOM_FRONT_RIGHT: u8 = 23;
+    /// Channel is empty / can be safely skipped.
+    pub const UNUSED: u8 = 0xfe;
+    /// Channel contains data, but its speaker configuration is unknown.
+    pub const UNKNOWN: u8 = 0xff;
+}
+
+/// `AudioChannelMask` bitmask values (UI32) per enhanced-rtmp-v2.pdf
+/// §"ExAudioTagBody" — used with `AudioChannelOrder.Native` to indicate
+/// which channels of the standard layout are present.
+pub mod audio_channel_mask {
+    pub const FRONT_LEFT: u32 = 0x000001;
+    pub const FRONT_RIGHT: u32 = 0x000002;
+    pub const FRONT_CENTER: u32 = 0x000004;
+    pub const LOW_FREQUENCY1: u32 = 0x000008;
+    pub const BACK_LEFT: u32 = 0x000010;
+    pub const BACK_RIGHT: u32 = 0x000020;
+    pub const FRONT_LEFT_CENTER: u32 = 0x000040;
+    pub const FRONT_RIGHT_CENTER: u32 = 0x000080;
+    pub const BACK_CENTER: u32 = 0x000100;
+    pub const SIDE_LEFT: u32 = 0x000200;
+    pub const SIDE_RIGHT: u32 = 0x000400;
+    pub const TOP_CENTER: u32 = 0x000800;
+    pub const TOP_FRONT_LEFT: u32 = 0x001000;
+    pub const TOP_FRONT_CENTER: u32 = 0x002000;
+    pub const TOP_FRONT_RIGHT: u32 = 0x004000;
+    pub const TOP_BACK_LEFT: u32 = 0x008000;
+    pub const TOP_BACK_CENTER: u32 = 0x010000;
+    pub const TOP_BACK_RIGHT: u32 = 0x020000;
+    // 22.2 surround additions
+    pub const LOW_FREQUENCY2: u32 = 0x040000;
+    pub const TOP_SIDE_LEFT: u32 = 0x080000;
+    pub const TOP_SIDE_RIGHT: u32 = 0x100000;
+    pub const BOTTOM_FRONT_CENTER: u32 = 0x200000;
+    pub const BOTTOM_FRONT_LEFT: u32 = 0x400000;
+    pub const BOTTOM_FRONT_RIGHT: u32 = 0x800000;
+}
+
+/// Decoded body of an Enhanced RTMP v2
+/// `AudioPacketType.MultichannelConfig` message
+/// (enhanced-rtmp-v2.pdf §"ExAudioTagBody"). The body sits in
+/// [`AudioTag::body`] verbatim on parse; callers can lift it into this
+/// strongly-typed view via [`MultichannelConfig::parse`] and round-trip
+/// back through [`MultichannelConfig::encode`] / [`AudioTag::with_multichannel_config`].
+///
+/// Per spec the body length depends on `audio_channel_order`:
+///   - `Unspecified` (`0`): 2 bytes (`order`, `channel_count`).
+///   - `Native` (`1`): 6 bytes (`order`, `channel_count`, UI32 flags).
+///   - `Custom` (`2`): `2 + channel_count` bytes (mapping is a UI8 per
+///     channel).
+///
+/// Any UI8 `audio_channel_order` value that is not one of those three
+/// surfaces as [`MultichannelConfigOrder::Reserved`] — the parser does
+/// not invent a layout, and the build path will encode just the
+/// `(order, channel_count)` prefix, leaving any trailing bytes to the
+/// caller via [`MultichannelConfig::extra`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultichannelConfig {
+    /// The full discriminator union from the spec table. See
+    /// [`MultichannelConfigOrder`] for the shape per variant.
+    pub order: MultichannelConfigOrder,
+    /// Number of channels in the multichannel stream. UI8 on the wire,
+    /// so values 0..=255 are representable.
+    pub channel_count: u8,
+    /// Trailing bytes preserved verbatim when [`order`] is
+    /// [`MultichannelConfigOrder::Reserved`] (forward-compat with
+    /// future spec additions). Empty for the three recognised orders.
+    pub extra: Vec<u8>,
+}
+
+/// Discriminated union of the per-`audioChannelOrder` body shape from
+/// `ExAudioTagBody`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultichannelConfigOrder {
+    /// `AudioChannelOrder.Unspecified` — only the channel count is
+    /// specified, no trailing per-channel data.
+    Unspecified,
+    /// `AudioChannelOrder.Native` — channels appear in the order
+    /// defined by the `AudioChannel` enum. The 32-bit
+    /// `audioChannelFlags` mask reports which of the standard channels
+    /// are present; bit positions match [`audio_channel_mask`].
+    Native { flags: u32 },
+    /// `AudioChannelOrder.Custom` — `audioChannelMapping[channelCount]`
+    /// names the speaker (an `AudioChannel` value) for each channel,
+    /// in stream order. Length equals
+    /// [`MultichannelConfig::channel_count`].
+    Custom { mapping: Vec<u8> },
+    /// A reserved / forward-compat `audioChannelOrder` value the parser
+    /// did not recognise. The raw discriminator byte is preserved here
+    /// so callers can pass the message through unchanged; trailing
+    /// body bytes (if any) sit in [`MultichannelConfig::extra`].
+    Reserved(u8),
+}
+
+impl MultichannelConfigOrder {
+    /// UI8 discriminator value as it appears on the wire.
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            MultichannelConfigOrder::Unspecified => AUDIO_CHANNEL_ORDER_UNSPECIFIED,
+            MultichannelConfigOrder::Native { .. } => AUDIO_CHANNEL_ORDER_NATIVE,
+            MultichannelConfigOrder::Custom { .. } => AUDIO_CHANNEL_ORDER_CUSTOM,
+            MultichannelConfigOrder::Reserved(v) => *v,
+        }
+    }
+}
+
+impl MultichannelConfig {
+    /// Parse the body bytes of an `AudioPacketType.MultichannelConfig`
+    /// audio message (the bytes that sit in [`AudioTag::body`] after a
+    /// successful [`parse_audio`] call). Returns `Err(Error::Other)` on
+    /// truncation; an unrecognised `audioChannelOrder` does NOT trigger
+    /// an error — it is preserved as [`MultichannelConfigOrder::Reserved`]
+    /// and any trailing bytes flow through [`MultichannelConfig::extra`].
+    pub fn parse(body: &[u8]) -> Result<MultichannelConfig> {
+        if body.len() < 2 {
+            return Err(Error::Other(
+                "MultichannelConfig: need 2 bytes (order + channelCount)".into(),
+            ));
+        }
+        let order_byte = body[0];
+        let channel_count = body[1];
+        match order_byte {
+            AUDIO_CHANNEL_ORDER_UNSPECIFIED => {
+                if body.len() != 2 {
+                    return Err(Error::Other(
+                        "MultichannelConfig.Unspecified: trailing bytes after channelCount".into(),
+                    ));
+                }
+                Ok(MultichannelConfig {
+                    order: MultichannelConfigOrder::Unspecified,
+                    channel_count,
+                    extra: Vec::new(),
+                })
+            }
+            AUDIO_CHANNEL_ORDER_NATIVE => {
+                if body.len() != 6 {
+                    return Err(Error::Other(
+                        "MultichannelConfig.Native: need 6 bytes (order + count + UI32 flags)"
+                            .into(),
+                    ));
+                }
+                let flags = u32::from_be_bytes([body[2], body[3], body[4], body[5]]);
+                Ok(MultichannelConfig {
+                    order: MultichannelConfigOrder::Native { flags },
+                    channel_count,
+                    extra: Vec::new(),
+                })
+            }
+            AUDIO_CHANNEL_ORDER_CUSTOM => {
+                let need = 2 + channel_count as usize;
+                if body.len() != need {
+                    return Err(Error::Other(format!(
+                        "MultichannelConfig.Custom: need {need} bytes for channelCount={channel_count}, got {}",
+                        body.len()
+                    )));
+                }
+                Ok(MultichannelConfig {
+                    order: MultichannelConfigOrder::Custom {
+                        mapping: body[2..need].to_vec(),
+                    },
+                    channel_count,
+                    extra: Vec::new(),
+                })
+            }
+            other => Ok(MultichannelConfig {
+                order: MultichannelConfigOrder::Reserved(other),
+                channel_count,
+                extra: body[2..].to_vec(),
+            }),
+        }
+    }
+
+    /// Serialise to the byte layout `parse` consumes. The output is
+    /// what [`AudioTag::body`] needs to hold when constructing an
+    /// outgoing `MultichannelConfig` message.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8);
+        out.push(self.order.as_u8());
+        out.push(self.channel_count);
+        match &self.order {
+            MultichannelConfigOrder::Unspecified => {}
+            MultichannelConfigOrder::Native { flags } => {
+                out.extend_from_slice(&flags.to_be_bytes());
+            }
+            MultichannelConfigOrder::Custom { mapping } => {
+                out.extend_from_slice(mapping);
+            }
+            MultichannelConfigOrder::Reserved(_) => {
+                out.extend_from_slice(&self.extra);
+            }
+        }
+        out
+    }
+}
 
 /// Decoded FLV video-tag header + payload. For H.264 the
 /// `composition_time` is the signed CTS offset (ms) between the
@@ -752,6 +1009,46 @@ impl AudioTag {
             .filter_map(ModEx::timestamp_offset_nano)
             .fold(0u32, |acc, n| acc.saturating_add(n))
     }
+
+    /// True when this tag is an Enhanced-RTMP v2
+    /// `AudioPacketType.MultichannelConfig` message (per
+    /// enhanced-rtmp-v2.pdf §"ExAudioTagBody"). The body holds the
+    /// `audioChannelOrder + channelCount + (mapping | flags)` layout;
+    /// callers lift it via [`AudioTag::multichannel_config`].
+    pub fn is_multichannel_config(&self) -> bool {
+        self.audio_fourcc.is_some()
+            && self.ex_packet_type == Some(AUDIO_PACKET_TYPE_MULTICHANNEL_CONFIG)
+    }
+
+    /// Decode the `MultichannelConfig` body of this tag. Returns
+    /// `Ok(None)` when the tag is not a MultichannelConfig message.
+    /// Errors flow through from [`MultichannelConfig::parse`] on
+    /// truncated bodies.
+    pub fn multichannel_config(&self) -> Result<Option<MultichannelConfig>> {
+        if self.is_multichannel_config() {
+            Ok(Some(MultichannelConfig::parse(&self.body)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Build an Enhanced-RTMP v2 `MultichannelConfig` audio tag with
+    /// the given codec FourCC and decoded body. The returned tag has
+    /// `ex_packet_type = MultichannelConfig`, `audio_fourcc = fourcc`,
+    /// and `body` set to `cfg.encode()`. ModEx prelude is empty.
+    pub fn multichannel_config_tag(fourcc: [u8; 4], cfg: &MultichannelConfig) -> AudioTag {
+        AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(AUDIO_PACKET_TYPE_MULTICHANNEL_CONFIG),
+            audio_fourcc: Some(fourcc),
+            body: cfg.encode(),
+            mod_ex: Vec::new(),
+        }
+    }
 }
 
 /// Decode the FLV audio-tag header from an RTMP audio message
@@ -776,12 +1073,16 @@ impl AudioTag {
 /// The `ModEx` AudioPacketType prelude (a chain of
 /// `modExDataSize + modExData + modExType/packetType` entries before
 /// the real packet type) is now decoded into [`AudioTag::mod_ex`].
-/// The `Multitrack` and `MultichannelConfig` AudioPacketTypes still
-/// have nested layouts (per-track FourCC + size-prefixed track chunks;
-/// AudioChannelOrder + channel map) deferred to a follow-up round; if
-/// the nibble decodes to either value, the body is preserved verbatim
-/// and the caller is expected to skip the message rather than
-/// interpret it as a normal coded-frame tag.
+/// The `MultichannelConfig` AudioPacketType is also recognised — the
+/// body bytes (`audioChannelOrder + channelCount + flags|mapping`)
+/// sit in [`AudioTag::body`] verbatim and lift to the strongly-typed
+/// [`MultichannelConfig`] view through
+/// [`AudioTag::multichannel_config`]. The `Multitrack` AudioPacketType
+/// still has a nested layout (per-track FourCC + size-prefixed track
+/// chunks) deferred to a follow-up round; if the nibble decodes to
+/// `Multitrack`, the body is preserved verbatim and the caller is
+/// expected to skip the message rather than interpret it as a normal
+/// coded-frame tag.
 pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
     if payload.is_empty() {
         return Err(Error::Other("FLV audio tag: empty".into()));
@@ -1929,5 +2230,303 @@ mod tests {
         assert_eq!(&payload[1..5], b"hvc1");
         assert_eq!(&payload[5..], b"\x01cfg");
         assert_eq!(parse_video(&payload).unwrap(), tag);
+    }
+
+    // ------- Enhanced RTMP v2 MultichannelConfig (Veovera 2026) -------
+
+    #[test]
+    fn multichannel_config_unspecified_roundtrip() {
+        // 2-byte body: order=Unspecified(0), channelCount=2.
+        let cfg = MultichannelConfig {
+            order: MultichannelConfigOrder::Unspecified,
+            channel_count: 2,
+            extra: Vec::new(),
+        };
+        let bytes = cfg.encode();
+        assert_eq!(bytes, [0x00, 0x02]);
+        let back = MultichannelConfig::parse(&bytes).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn multichannel_config_native_5_1_layout() {
+        // 5.1 surround = FL + FR + FC + LFE1 + BL + BR
+        // = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 = 0x3F.
+        let mask = audio_channel_mask::FRONT_LEFT
+            | audio_channel_mask::FRONT_RIGHT
+            | audio_channel_mask::FRONT_CENTER
+            | audio_channel_mask::LOW_FREQUENCY1
+            | audio_channel_mask::BACK_LEFT
+            | audio_channel_mask::BACK_RIGHT;
+        assert_eq!(mask, 0x0000_003F);
+        let cfg = MultichannelConfig {
+            order: MultichannelConfigOrder::Native { flags: mask },
+            channel_count: 6,
+            extra: Vec::new(),
+        };
+        let bytes = cfg.encode();
+        // order(1) | channelCount(6) | UI32-BE mask
+        assert_eq!(bytes, [0x01, 0x06, 0x00, 0x00, 0x00, 0x3F]);
+        let back = MultichannelConfig::parse(&bytes).unwrap();
+        assert_eq!(back, cfg);
+        if let MultichannelConfigOrder::Native { flags } = back.order {
+            assert_eq!(flags & audio_channel_mask::LOW_FREQUENCY1, 0x08);
+            assert_eq!(flags & audio_channel_mask::TOP_CENTER, 0); // not present
+        } else {
+            panic!("expected Native order");
+        }
+    }
+
+    #[test]
+    fn multichannel_config_custom_mapping_roundtrip() {
+        // Stereo with explicit speaker map: ch0=FL, ch1=FR.
+        let cfg = MultichannelConfig {
+            order: MultichannelConfigOrder::Custom {
+                mapping: vec![audio_channel::FRONT_LEFT, audio_channel::FRONT_RIGHT],
+            },
+            channel_count: 2,
+            extra: Vec::new(),
+        };
+        let bytes = cfg.encode();
+        // order(2) | channelCount(2) | mapping[2]
+        assert_eq!(bytes, [0x02, 0x02, 0x00, 0x01]);
+        let back = MultichannelConfig::parse(&bytes).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn multichannel_config_custom_22_2_layout() {
+        // 22.2 surround needs all 24 spec-defined channel positions
+        // including the SMPTE ST 2036-2 extras. Exercises every
+        // `audio_channel::*` constant on the wire.
+        let mapping: Vec<u8> = (0..24).collect();
+        let cfg = MultichannelConfig {
+            order: MultichannelConfigOrder::Custom {
+                mapping: mapping.clone(),
+            },
+            channel_count: 24,
+            extra: Vec::new(),
+        };
+        let bytes = cfg.encode();
+        assert_eq!(bytes.len(), 2 + 24);
+        assert_eq!(bytes[0], AUDIO_CHANNEL_ORDER_CUSTOM);
+        assert_eq!(bytes[1], 24);
+        assert_eq!(&bytes[2..], mapping.as_slice());
+        let back = MultichannelConfig::parse(&bytes).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn multichannel_config_custom_with_unused_unknown_sentinels() {
+        // The spec carves out 0xFE / 0xFF for empty / unknown channels;
+        // round-trip those as well so callers can encode "skip this
+        // channel" / "unknown speaker" without losing them.
+        let cfg = MultichannelConfig {
+            order: MultichannelConfigOrder::Custom {
+                mapping: vec![
+                    audio_channel::FRONT_LEFT,
+                    audio_channel::FRONT_RIGHT,
+                    audio_channel::UNUSED,
+                    audio_channel::UNKNOWN,
+                ],
+            },
+            channel_count: 4,
+            extra: Vec::new(),
+        };
+        let bytes = cfg.encode();
+        assert_eq!(bytes, [0x02, 0x04, 0x00, 0x01, 0xFE, 0xFF]);
+        assert_eq!(MultichannelConfig::parse(&bytes).unwrap(), cfg);
+    }
+
+    #[test]
+    fn multichannel_config_truncated_errors() {
+        // Empty body: needs at least order + channelCount.
+        assert!(MultichannelConfig::parse(&[]).is_err());
+        assert!(MultichannelConfig::parse(&[0x00]).is_err());
+        // Native missing the UI32 flags.
+        assert!(MultichannelConfig::parse(&[0x01, 0x06, 0x00]).is_err());
+        // Custom missing one mapping byte.
+        assert!(MultichannelConfig::parse(&[0x02, 0x03, 0x00, 0x01]).is_err());
+        // Unspecified with stray trailing bytes — caller likely
+        // misframed it; refuse to silently swallow them.
+        assert!(MultichannelConfig::parse(&[0x00, 0x02, 0xff]).is_err());
+    }
+
+    #[test]
+    fn multichannel_config_reserved_order_preserves_extra_bytes() {
+        // A reserved order value (anything outside 0..=2 for now) is
+        // preserved verbatim so the surrounding tag can be forwarded
+        // unchanged. The trailing bytes flow through `extra`.
+        let body = vec![0x05, 0x04, 0xAA, 0xBB, 0xCC];
+        let cfg = MultichannelConfig::parse(&body).unwrap();
+        assert_eq!(cfg.order, MultichannelConfigOrder::Reserved(0x05));
+        assert_eq!(cfg.channel_count, 4);
+        assert_eq!(cfg.extra, vec![0xAA, 0xBB, 0xCC]);
+        // Round-trip preserves the bytes.
+        assert_eq!(cfg.encode(), body);
+    }
+
+    #[test]
+    fn audio_tag_multichannel_config_full_roundtrip() {
+        // End-to-end: build an Enhanced-RTMP audio tag carrying a
+        // MultichannelConfig body for the Opus FourCC, drive it
+        // through build_audio + parse_audio, then re-lift to the
+        // strongly-typed view.
+        let cfg = MultichannelConfig {
+            order: MultichannelConfigOrder::Native {
+                flags: audio_channel_mask::FRONT_LEFT
+                    | audio_channel_mask::FRONT_RIGHT
+                    | audio_channel_mask::FRONT_CENTER,
+            },
+            channel_count: 3,
+            extra: Vec::new(),
+        };
+        let tag = AudioTag::multichannel_config_tag(FOURCC_OPUS, &cfg);
+        assert!(tag.is_multichannel_config());
+        assert_eq!(tag.audio_fourcc, Some(FOURCC_OPUS));
+        assert_eq!(
+            tag.ex_packet_type,
+            Some(AUDIO_PACKET_TYPE_MULTICHANNEL_CONFIG)
+        );
+        // Wire shape: header byte (ExHeader nibble + MultichannelConfig
+        // nibble) + 4-byte FourCC + 6-byte MultichannelConfig body.
+        let wire = build_audio(&tag);
+        assert_eq!(wire[0], (AUDIO_FORMAT_EX_HEADER << 4) | 0x04);
+        assert_eq!(&wire[1..5], b"Opus");
+        assert_eq!(wire.len(), 1 + 4 + 6);
+        // Round-trip back.
+        let back = parse_audio(&wire).unwrap();
+        assert_eq!(back, tag);
+        let cfg_back = back.multichannel_config().unwrap().unwrap();
+        assert_eq!(cfg_back, cfg);
+    }
+
+    #[test]
+    fn audio_tag_multichannel_config_accessor_returns_none_for_other_packet_types() {
+        // A SequenceStart tag is not a MultichannelConfig — the helper
+        // returns None rather than mis-parsing the sequence header
+        // bytes as a channel layout.
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(AUDIO_PACKET_TYPE_SEQUENCE_START),
+            audio_fourcc: Some(FOURCC_OPUS),
+            body: vec![b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd'],
+            mod_ex: Vec::new(),
+        };
+        assert!(!tag.is_multichannel_config());
+        assert!(tag.multichannel_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn multichannel_config_disjoint_from_legacy_audio() {
+        // A legacy (non-Enhanced) audio tag never lifts as a
+        // MultichannelConfig — the accessor returns None even if the
+        // legacy body happens to start with a 0/1/2 byte the
+        // MultichannelConfig parser would otherwise accept.
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_AAC,
+            sound_rate: 3,
+            sound_size_16bit: true,
+            stereo: true,
+            aac_packet_type: Some(AAC_PACKET_TYPE_RAW),
+            ex_packet_type: None,
+            audio_fourcc: None,
+            body: vec![0x01, 0x06, 0x00, 0x00, 0x00, 0x3F],
+            mod_ex: Vec::new(),
+        };
+        assert!(!tag.is_multichannel_config());
+        assert!(tag.multichannel_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn audio_channel_mask_22_2_bit_assignments() {
+        // The 24 bit positions in audio_channel_mask must line up
+        // 1:1 with the AudioChannel UI8 indices when bits are read
+        // as `1 << channel_index`. Spec table cross-check.
+        let pairs = [
+            (audio_channel::FRONT_LEFT, audio_channel_mask::FRONT_LEFT),
+            (audio_channel::FRONT_RIGHT, audio_channel_mask::FRONT_RIGHT),
+            (
+                audio_channel::FRONT_CENTER,
+                audio_channel_mask::FRONT_CENTER,
+            ),
+            (
+                audio_channel::LOW_FREQUENCY1,
+                audio_channel_mask::LOW_FREQUENCY1,
+            ),
+            (audio_channel::BACK_LEFT, audio_channel_mask::BACK_LEFT),
+            (audio_channel::BACK_RIGHT, audio_channel_mask::BACK_RIGHT),
+            (
+                audio_channel::FRONT_LEFT_CENTER,
+                audio_channel_mask::FRONT_LEFT_CENTER,
+            ),
+            (
+                audio_channel::FRONT_RIGHT_CENTER,
+                audio_channel_mask::FRONT_RIGHT_CENTER,
+            ),
+            (audio_channel::BACK_CENTER, audio_channel_mask::BACK_CENTER),
+            (audio_channel::SIDE_LEFT, audio_channel_mask::SIDE_LEFT),
+            (audio_channel::SIDE_RIGHT, audio_channel_mask::SIDE_RIGHT),
+            (audio_channel::TOP_CENTER, audio_channel_mask::TOP_CENTER),
+            (
+                audio_channel::TOP_FRONT_LEFT,
+                audio_channel_mask::TOP_FRONT_LEFT,
+            ),
+            (
+                audio_channel::TOP_FRONT_CENTER,
+                audio_channel_mask::TOP_FRONT_CENTER,
+            ),
+            (
+                audio_channel::TOP_FRONT_RIGHT,
+                audio_channel_mask::TOP_FRONT_RIGHT,
+            ),
+            (
+                audio_channel::TOP_BACK_LEFT,
+                audio_channel_mask::TOP_BACK_LEFT,
+            ),
+            (
+                audio_channel::TOP_BACK_CENTER,
+                audio_channel_mask::TOP_BACK_CENTER,
+            ),
+            (
+                audio_channel::TOP_BACK_RIGHT,
+                audio_channel_mask::TOP_BACK_RIGHT,
+            ),
+            (
+                audio_channel::LOW_FREQUENCY2,
+                audio_channel_mask::LOW_FREQUENCY2,
+            ),
+            (
+                audio_channel::TOP_SIDE_LEFT,
+                audio_channel_mask::TOP_SIDE_LEFT,
+            ),
+            (
+                audio_channel::TOP_SIDE_RIGHT,
+                audio_channel_mask::TOP_SIDE_RIGHT,
+            ),
+            (
+                audio_channel::BOTTOM_FRONT_CENTER,
+                audio_channel_mask::BOTTOM_FRONT_CENTER,
+            ),
+            (
+                audio_channel::BOTTOM_FRONT_LEFT,
+                audio_channel_mask::BOTTOM_FRONT_LEFT,
+            ),
+            (
+                audio_channel::BOTTOM_FRONT_RIGHT,
+                audio_channel_mask::BOTTOM_FRONT_RIGHT,
+            ),
+        ];
+        for (ch, mask) in pairs {
+            assert_eq!(
+                1u32 << ch as u32,
+                mask,
+                "channel {ch} should map to mask bit (1 << {ch})"
+            );
+        }
     }
 }

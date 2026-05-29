@@ -107,8 +107,16 @@ client.close()?;
   `fLaC + STREAMINFO` per Xiph FLAC §7 for FLAC SequenceStart, ATSC
   sync frames for AC-3 / E-AC-3 CodedFrames, MPEG Layer III frames
   for MP3, ISO/IEC 14496-3 `AudioSpecificConfig` for FourCC-AAC
-  SequenceStart). `Multitrack` and `MultichannelConfig`
-  AudioPacketTypes parse to opaque bodies pending follow-up rounds.
+  SequenceStart). The `MultichannelConfig` AudioPacketType is also
+  decoded end-to-end: `AudioTag::multichannel_config()` lifts the body
+  into the strongly-typed `MultichannelConfig` view (per `enhanced-rtmp-v2.pdf`
+  §"ExAudioTagBody" — `audioChannelOrder(UI8) | channelCount(UI8) |
+  (audioChannelMapping[UI8] | audioChannelFlags(UI32))`), and
+  `AudioTag::multichannel_config_tag` rebuilds the matching outbound tag.
+  `audio_channel` / `audio_channel_mask` public submodules name all 24
+  spec-defined positions (including the 22.2 surround extras from SMPTE
+  ST 2036-2-2008). `Multitrack` still parses to an opaque body pending a
+  follow-up round.
 - **Graceful session close**. `RtmpSession::close` emits a
   `UserControl StreamEOF(stream_id)` (RTMP 1.0 §7.1.7) before
   `onStatus("NetStream.Unpublish.Success")`, flushes the chunk writer,

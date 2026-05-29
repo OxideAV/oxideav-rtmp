@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enhanced RTMP v2 `MultichannelConfig` audio body parser + builder**
+  (`src/flv.rs`). The `AudioPacketType.MultichannelConfig = 4` body
+  shape from `enhanced-rtmp-v2.pdf` §"ExAudioTagBody" is now decoded
+  end-to-end via the new `MultichannelConfig` struct + the
+  `MultichannelConfigOrder` discriminated union (`Unspecified` /
+  `Native { flags: u32 }` / `Custom { mapping: Vec<u8> }` /
+  `Reserved(u8)`). On the wire the body is
+  `audioChannelOrder(UI8) | channelCount(UI8) | (mapping[UI8] |
+  flags(UI32) | nothing)`; lengths line up at 2 bytes for `Unspecified`,
+  6 bytes for `Native`, and `2 + channelCount` for `Custom`. Truncated
+  bodies, stray trailing bytes on `Unspecified`, and short `Custom`
+  mappings all return `Err(Error::Other)` cleanly; an unrecognised
+  `audioChannelOrder` value is preserved as
+  `MultichannelConfigOrder::Reserved` with the trailing bytes in
+  `extra` so a forwarding tag never silently loses data.
+  `AudioTag::is_multichannel_config()`,
+  `AudioTag::multichannel_config()`, and
+  `AudioTag::multichannel_config_tag(fourcc, &cfg)` provide the
+  lift / round-trip helpers; the existing `parse_audio` / `build_audio`
+  bytes path is unchanged (the body is still carried verbatim through
+  `AudioTag::body`). New `audio_channel` and `audio_channel_mask`
+  public submodules expose the 24 spec-defined channel positions and
+  their corresponding UI32 mask bits (including the 22.2 surround
+  extensions per SMPTE ST 2036-2-2008), plus `audio_channel::UNUSED`
+  (0xFE) and `UNKNOWN` (0xFF) sentinels. New
+  `AUDIO_CHANNEL_ORDER_UNSPECIFIED` / `_NATIVE` / `_CUSTOM` constants
+  cover the order discriminator. 10 new unit tests cover: 2-byte
+  `Unspecified` round-trip; 6-byte `Native` 5.1 mask round-trip with
+  byte-exact wire bytes; `Custom` stereo round-trip; full 22.2
+  `Custom` (24-byte mapping) round-trip exercising every
+  `audio_channel::*` constant; `UNUSED` / `UNKNOWN` sentinel
+  preservation; six truncation paths (empty body, partial header,
+  partial flags, short mapping, stray bytes on `Unspecified`);
+  `Reserved` order verbatim round-trip; end-to-end build → parse →
+  lift through `build_audio` + `parse_audio` on an Opus FourCC tag;
+  accessor returns `None` for non-MultichannelConfig packet types and
+  for legacy tags whose body happens to start with valid-looking
+  bytes; and a bit-position check confirming `1 << channel_index`
+  equals the matching `audio_channel_mask` entry for every one of the
+  24 channels. Resolves the `MultichannelConfig` portion of the r177
+  README note "`Multitrack` and `MultichannelConfig` AudioPacketTypes
+  parse to opaque bodies pending follow-up rounds." `Multitrack`
+  remains deferred — its `AvMultitrackType + per-track FourCc + track
+  id + sizeOfAudioTrack` framing needs a richer follow-up.
+
 - **Injection-robustness property tests + AMF0/AMF3 nested-container
   depth guards** (`src/amf.rs`, `src/amf3.rs`,
   `tests/injection_robustness.rs`). Every public parser surface — AMF0
