@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.4...v0.0.5) - 2026-05-29
+
+### Other
+
+- Enhanced RTMP v2 Multitrack body parser + builder (audio + video)
+- decode Enhanced-RTMP v2 MultichannelConfig audio body
+- injection-robust property tests + AMF nesting depth guards
+- poll_event surfaces server-originated UserControl + onStatus
+- emit UserControl StreamEOF before Unpublish.Success on close
+
 ### Added
 
 - **Enhanced RTMP v2 `Multitrack` audio + video body parser + builder**
