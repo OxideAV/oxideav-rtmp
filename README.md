@@ -213,5 +213,14 @@ non-standard:
 - `chunk::{ChunkReader, ChunkWriter, Message}`
 - `handshake::{client_handshake, server_handshake}`
 - `flv::{parse_video, build_video, parse_audio, build_audio, ModEx}`
+- `flv_file::{FlvWriter, FlvHeaderFlags, build_flv_header,
+  build_flv_tag}` — FLV file / byte-stream serializer (Annex E of
+  `flv_v10_1.pdf`). Frames `VideoTag` / `AudioTag` plus AMF0
+  script-data tags into the on-disk `.flv` layout (9-byte file
+  header + alternating `PreviousTagSize` / `FLVTAG` body). Useful
+  as a recorder for an `RtmpSession` (write each `StreamPacket` to
+  an `io::Write` sink) and as the foundation for an HTTP-FLV
+  bridge — the body of an HTTP-FLV response is exactly this
+  byte stream, served with `Content-Type: video/x-flv`.
 - `message::build_*` — builders for every protocol-control /
   command message we emit

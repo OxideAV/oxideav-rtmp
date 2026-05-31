@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **FLV file / byte-stream writer** (`src/flv_file.rs`,
+  `tests/flv_file_record.rs`). New `flv_file` module exposing
+  `FlvWriter<W: Write>`, `FlvHeaderFlags`, `build_flv_header`, and
+  `build_flv_tag` per `docs/container/flv/flv_v10_1.pdf` Annex E.
+  The writer emits the §E.2 9-byte file header (signature `F` `L`
+  `V`, version, `TypeFlagsAudio` / `TypeFlagsVideo`, `DataOffset =
+  9`) and the §E.3 alternating `PreviousTagSize` / `FLVTAG` body,
+  framing each `VideoTag` / `AudioTag` via the existing
+  `flv::build_video` / `flv::build_audio` paths and tracking the
+  `PreviousTagSize` back-pointer (`11 + DataSize`) automatically.
+  `write_script_data(timestamp_ms, name, &Amf0Value)` emits an
+  AMF0 `name + value` pair as a §E.4.4 script-data tag (type 18) —
+  the canonical use is an `onMetaData` tag emitted right after the
+  header. The §E.4.1 24-bit `Timestamp` + 8-bit `TimestampExtended`
+  splitting is handled transparently so callers pass a single
+  `u32` timestamp. `write_raw_tag` is the escape hatch for callers
+  who build their own payload (e.g. an Annex F encrypted body).
+  Composes with `RtmpSession` so an RTMP ingest can be recorded to
+  an `.flv` file or re-served over HTTP-FLV (an HTTP-FLV response
+  body is exactly this byte stream with `Content-Type:
+  video/x-flv`) without re-parsing any payload. 19 new tests (16
+  unit in `src/flv_file.rs`, 3 integration in
+  `tests/flv_file_record.rs`): header signature + flags + offset
+  bytes match §E.2 exactly; 9-byte UI24 `DataSize` + UI8
+  `TimestampExtended` layout matches §E.4.1 byte-for-byte (both
+  the timestamp-under-24-bit and timestamp-over-24-bit-needing-
+  TimestampExtended paths); `PreviousTagSize0` always 0 (§E.3);
+  multi-tag back-pointer tracking across an interleaved video +
+  audio + video sequence (20 / 16 / 23 byte tags); over-UI24
+  payload rejected as `InvalidInput` (16 MiB+ would forge the size
+  field otherwise); legacy AVC sequence-header round-trip through
+  `parse_video`; AAC sequence-header round-trip through
+  `parse_audio`; Enhanced-RTMP v2 HEVC `CodedFrames` ExHeader
+  round-trip preserves FourCC + composition_time; AMF0 onMetaData
+  script-tag name-then-value layout round-trips; `finish()`
+  idempotency; post-`finish` writes return `BrokenPipe`; the
+  escape-hatch `write_raw_tag` lets a caller pass an opaque
+  payload; empty FLV stream (header + `PreviousTagSize0`-only)
+  parses to zero tags; end-to-end RTMP loopback → `FlvWriter` →
+  byte-by-byte FLV walker → `parse_video` / `parse_audio` proves
+  every recorded payload re-parses unchanged. Total integration
+  tests: 61 → 64 (+3); total tests: 202 → 222 (+20 including the
+  new doc-test).
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.4...v0.0.5) - 2026-05-29
 
 ### Other

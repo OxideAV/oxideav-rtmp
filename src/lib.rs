@@ -49,6 +49,7 @@ pub mod chunk;
 pub mod client;
 pub mod error;
 pub mod flv;
+pub mod flv_file;
 pub mod handshake;
 pub mod message;
 pub mod server;
@@ -66,4 +67,5 @@ pub use flv::{
     AudioTag, ModEx, MultichannelConfig, MultichannelConfigOrder, Multitrack, MultitrackTrack,
     VideoTag,
 };
+pub use flv_file::{FlvHeaderFlags, FlvWriter};
 pub use server::{PublishRequest, RtmpServer, RtmpSession, StreamPacket};
