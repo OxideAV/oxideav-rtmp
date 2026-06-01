@@ -482,11 +482,11 @@ impl<R: Read> FlvReader<R> {
     }
 
     /// As [`FlvReader::new`] but with a custom upper bound on a
-    /// single tag payload. `max_tag_size` must be ≤ [`UI24_MAX`]; a
-    /// larger value is clamped to that bound. Callers handling
-    /// trusted local files may want to set this to [`UI24_MAX`] (the
-    /// 16 MiB ceiling the wire format allows); HTTP-FLV proxies
-    /// generally want a tighter cap.
+    /// single tag payload. `max_tag_size` must be ≤ the UI24 ceiling
+    /// (`0x00FF_FFFF`, 16 MiB); a larger value is clamped to that
+    /// bound. Callers handling trusted local files may want to set
+    /// this to [`DEFAULT_MAX_TAG_SIZE`] (the UI24 ceiling); HTTP-FLV
+    /// proxies generally want a tighter cap.
     pub fn with_max_tag_size(mut inner: R, max_tag_size: u32) -> Result<Self> {
         let mut header = [0u8; 9];
         read_exact_eof(&mut inner, &mut header)?;
