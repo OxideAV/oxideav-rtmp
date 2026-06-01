@@ -4,10 +4,10 @@
 //! 3.0 object graphs. RTMP can switch a channel from AMF0 to AMF3 via the
 //! AMF0 `avmplus-object-marker` (0x11), and also dedicates message type
 //! IDs 15 (Data), 16 (Shared Object) and 17 (Command) for streams that
-//! are AMF3-encoded from the start. Real-world ingest endpoints
-//! (nginx-rtmp / OBS / Wirecast) negotiate down to AMF0 in practice, but
-//! a small fraction of Adobe Media Server clients open AMF3 channels —
-//! this module gives us the parser surface those clients need.
+//! are AMF3-encoded from the start. Most commodity ingest endpoints
+//! negotiate down to AMF0 in practice, but a small fraction of Adobe
+//! Media Server clients open AMF3 channels — this module gives us the
+//! parser surface those clients need.
 //!
 //! Reference: Adobe "Action Message Format -- AMF 3" (January 2013),
 //! mirrored under `docs/streaming/rtmp/amf3-file-format-spec-adobe.pdf`.

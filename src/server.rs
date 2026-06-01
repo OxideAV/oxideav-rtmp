@@ -34,7 +34,7 @@ use crate::flv::{parse_audio, parse_video, AudioTag, VideoTag};
 use crate::message::*;
 
 /// After-connect server chunk size. Larger = fewer chunk headers per
-/// message. 4 KiB is what FFmpeg and OBS negotiate in practice.
+/// message. 4 KiB is what most commodity ingest paths negotiate in practice.
 const SERVER_CHUNK_SIZE: u32 = 4096;
 /// Initial window-ack size advertised to the peer. Values of this
 /// order are what "normal" RTMP servers announce.
@@ -461,8 +461,8 @@ fn drive_until_publish(stream: TcpStream, peer_addr: SocketAddr) -> Result<Publi
                     .to_owned();
 
                 // Reply: WindowAckSize + SetPeerBandwidth + StreamBegin
-                // + _result + SetChunkSize. Order matches what nginx-rtmp
-                // and FFmpeg's rtmpproto send.
+                // + _result + SetChunkSize. Order matches what most
+                // commodity ingest servers send.
                 writer.write_message(
                     CSID_PROTOCOL_CONTROL,
                     &build_window_ack_size(WINDOW_ACK_SIZE),

@@ -6,8 +6,8 @@
 //! array, date, long string, end-of-object sentinel. We never emit nor
 //! consume AMF3 — RTMP occasionally upgrades a channel to AMF3 via the
 //! `avmplus` command, but we simply keep the channel on AMF0; every
-//! client / server we care about (OBS, Wirecast, nginx-rtmp, libavformat)
-//! stays in AMF0 for publish flows.
+//! commodity client / server we have interoperated with stays in AMF0
+//! for publish flows.
 //!
 //! See the "AMF0 File Format Specification" (Adobe, 2007) for marker
 //! tables; kept minimal here to avoid drift from the spec.
@@ -32,16 +32,16 @@ const M_LONG_STRING: u8 = 0x0C;
 
 /// One AMF0 value. Ordered-object semantics are preserved through the
 /// `Vec<(key, value)>` — RTMP command handlers sometimes care about
-/// the order of fields in the command object (libavformat walks them
-/// positionally), so we don't dedup into a map.
+/// the order of fields in the command object (some commodity peers walk
+/// them positionally), so we don't dedup into a map.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Amf0Value {
     Number(f64),
     Boolean(bool),
     String(String),
-    /// Ordered association list. Kept ordered because some peers
-    /// (libavformat's rtmpproto) expect the `tcUrl` field at a fixed
-    /// offset in connect's command object.
+    /// Ordered association list. Kept ordered because some commodity
+    /// peers expect the `tcUrl` field at a fixed offset in connect's
+    /// command object.
     Object(Vec<(String, Amf0Value)>),
     Null,
     Undefined,

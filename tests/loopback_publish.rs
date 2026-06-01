@@ -6,8 +6,8 @@
 //! If this test passes, the full pipeline — handshake, chunk stream,
 //! AMF0 command flow, FLV tag encoding, both directions — is at
 //! least internally consistent. It doesn't prove conformance with a
-//! third-party peer; that lives in manual testing against ffmpeg /
-//! OBS.
+//! third-party peer; that lives in manual testing against commodity
+//! ingest endpoints.
 
 use std::sync::mpsc;
 use std::thread;

@@ -161,8 +161,9 @@ impl<R: Read> ChunkReader<R> {
                 let mut b2 = [0u8; 2];
                 self.stream.read_exact(&mut b2)?;
                 // spec: second byte is high order, third byte low — but
-                // that's FFmpeg's interpretation; the official spec
-                // reads "2nd + 3rd byte * 256" which is little-endian.
+                // commodity peers in the wild interpret it the other way;
+                // the official spec reads "2nd + 3rd byte * 256" which is
+                // little-endian.
                 b2[0] as u32 + (b2[1] as u32) * 256 + 64
             }
             other => other as u32,

@@ -67,5 +67,5 @@ pub use flv::{
     AudioTag, ModEx, MultichannelConfig, MultichannelConfigOrder, Multitrack, MultitrackTrack,
     VideoTag,
 };
-pub use flv_file::{FlvHeaderFlags, FlvWriter};
+pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
 pub use server::{PublishRequest, RtmpServer, RtmpSession, StreamPacket};

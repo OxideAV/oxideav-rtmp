@@ -9,6 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **FLV file / byte-stream reader** (`src/flv_file.rs`,
+  `tests/flv_file_record.rs`). Inverse of the round-204 `FlvWriter`:
+  new `FlvReader<R: Read>` wraps a `Read` source and walks the §E.2
+  9-byte file header, the §E.3 alternating `PreviousTagSize` /
+  `FLVTAG` body, and each §E.4.1 `FLVTAG` header, surfacing every
+  tag as a strongly-typed `FlvTag` enum
+  (`Audio { timestamp_ms, tag: AudioTag }` /
+  `Video { timestamp_ms, tag: VideoTag }` /
+  `Script { timestamp_ms, name, value: Amf0Value }` /
+  `Unknown { tag_type, timestamp_ms, body }`). Audio + video bodies
+  decode through the existing `flv::parse_audio` / `flv::parse_video`
+  paths so every wire shape the writer emits — legacy AVC/AAC,
+  Enhanced-RTMP v1 FourCC (`hvc1` / `av01` / `vp09`), Enhanced-RTMP
+  v2 FourCC (`vp08` / `avc1` / `vvc1` / Opus / FLAC / AC-3 / E-AC-3 /
+  MP3 / FourCC-AAC), `Multitrack`, `MultichannelConfig`, and `ModEx`
+  preludes — round-trips byte-for-byte through reader → writer
+  without re-implementing the §E.3 walk. Script tags decode as an
+  AMF0 `Name + Value` pair per §E.4.4; a script body that fails AMF0
+  decode is preserved verbatim as `FlvTag::Unknown` (`tag_type =
+  18`) so a forwarding consumer never silently drops bytes.
+  `FlvReader::new` consumes the §E.2 header (signature `F` `L` `V` +
+  version + `TypeFlagsAudio` / `TypeFlagsVideo` + UI32 `DataOffset`)
+  and the mandatory `PreviousTagSize0 == 0` back-pointer eagerly,
+  refusing wrong-signature / wrong-version / nonzero-`PreviousTagSize0`
+  inputs up front. A larger `DataOffset` (forward-compatible header
+  extension) is skipped transparently. Verifies the §E.3
+  `PreviousTagSize == 11 + DataSize` invariant on every tag and
+  refuses to advance past a mismatch (forged producer / transport
+  corruption). UI24 `DataSize` is bounded by a configurable
+  `max_tag_size` (default = UI24 ceiling, `DEFAULT_MAX_TAG_SIZE`)
+  via the new `FlvReader::with_max_tag_size` constructor — HTTP-FLV
+  proxies generally want a tighter cap, trusted local files can
+  raise it back to the wire ceiling. The §E.4.1 `StreamID = 0`
+  invariant is enforced, the §E.4.1 `Filter = 1` (Annex F encrypted
+  body) surfaces as a clean `Error::Other` rather than silently
+  passing through, and truncated header / payload / back-pointer
+  all surface as `Error::UnexpectedEof`. `FlvReader::read_tag`
+  returns `Ok(None)` on a clean end-of-stream at a tag boundary and
+  latches so subsequent calls don't re-enter the reader on an
+  exhausted source. `FlvReader::read_all` consumes the rest of the
+  stream into a `Vec<FlvTag>` for one-shot use. 17 new tests (15
+  unit in `src/flv_file.rs`, 1 integration in
+  `tests/flv_file_record.rs`, plus 1 new doc-test added via the
+  module-level rewording): writer-then-reader round-trips for empty
+  stream / AVC sequence header / AAC sequence header / interleaved
+  video+audio+video triple / Enhanced-RTMP v2 HEVC `CodedFrames` /
+  full 4-tag stream (script + video SH + audio SH + video inter)
+  byte-for-byte through reader → writer; AMF0 `onMetaData`
+  name+value pair decoded into typed `EcmaArray`; `TimestampExtended`
+  high byte re-joined into a 32-bit value; bad signature / wrong
+  version / nonzero `PreviousTagSize0` / `DataOffset < 9` rejected
+  cleanly; forward-compatible header padding (`DataOffset = 11`)
+  skipped transparently; corrupt `PreviousTagSize` / oversize
+  `DataSize` / nonzero `StreamID` / `Filter = 1` rejected with
+  matching error variants; truncated FLVTAG header and payload
+  surface `Error::UnexpectedEof`; unknown `TagType` value (5) lifted
+  as `FlvTag::Unknown` with the verbatim body. End-to-end
+  integration test drives an RTMP loopback, records every received
+  `StreamPacket` to an in-memory FLV byte stream via `FlvWriter`,
+  then walks the resulting buffer back through `FlvReader` and
+  asserts every tag's body matches the publisher's input. Total lib
+  tests: 162 → 177 (+15); total integration tests: 64 → 65 (+1).
 - **FLV file / byte-stream writer** (`src/flv_file.rs`,
   `tests/flv_file_record.rs`). New `flv_file` module exposing
   `FlvWriter<W: Write>`, `FlvHeaderFlags`, `build_flv_header`, and

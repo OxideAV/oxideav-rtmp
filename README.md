@@ -69,7 +69,7 @@ client.close()?;
   publishers; the client pushes to remote servers. RTMP play
   (subscribe / pull) is a follow-up.
 - **AMF0 command flow** is what every commodity ingest endpoint
-  (OBS / Wirecast / nginx-rtmp / libavformat) negotiates. The
+  negotiates by default. The
   [`amf3`] module ships a complete AMF3 wire-format encoder +
   decoder — all thirteen markers plus the three reference tables —
   and AMF3 data / command messages are now **routed end-to-end**:
@@ -213,14 +213,27 @@ non-standard:
 - `chunk::{ChunkReader, ChunkWriter, Message}`
 - `handshake::{client_handshake, server_handshake}`
 - `flv::{parse_video, build_video, parse_audio, build_audio, ModEx}`
-- `flv_file::{FlvWriter, FlvHeaderFlags, build_flv_header,
-  build_flv_tag}` — FLV file / byte-stream serializer (Annex E of
-  `flv_v10_1.pdf`). Frames `VideoTag` / `AudioTag` plus AMF0
-  script-data tags into the on-disk `.flv` layout (9-byte file
-  header + alternating `PreviousTagSize` / `FLVTAG` body). Useful
-  as a recorder for an `RtmpSession` (write each `StreamPacket` to
-  an `io::Write` sink) and as the foundation for an HTTP-FLV
-  bridge — the body of an HTTP-FLV response is exactly this
-  byte stream, served with `Content-Type: video/x-flv`.
+- `flv_file::{FlvWriter, FlvReader, FlvTag, FlvHeaderFlags,
+  build_flv_header, build_flv_tag, DEFAULT_MAX_TAG_SIZE}` — FLV file
+  / byte-stream serializer + parser (Annex E of `flv_v10_1.pdf`).
+  `FlvWriter<W>` frames `VideoTag` / `AudioTag` plus AMF0 script-data
+  tags into the on-disk `.flv` layout (9-byte file header +
+  alternating `PreviousTagSize` / `FLVTAG` body). `FlvReader<R>` is
+  the inverse: walks the §E.2 header, the §E.3 alternating
+  back-pointers, and each §E.4.1 `FLVTAG`, surfacing each tag as a
+  strongly-typed [`FlvTag`] (`Audio` / `Video` / `Script` / opaque
+  `Unknown` for reserved `TagType` values). Verifies the §E.3
+  `PreviousTagSize == 11 + DataSize` invariant on every tag and
+  refuses to advance past a mismatch; bounds the per-tag `DataSize`
+  by [`DEFAULT_MAX_TAG_SIZE`] (UI24 ceiling = 16 MiB) or a
+  caller-supplied cap via [`FlvReader::with_max_tag_size`]; surfaces
+  a clean `Error::UnexpectedEof` on a truncated header / payload and
+  `Error::Other` on a forward-incompatible `Filter = 1` (Annex F
+  encrypted body). Useful as a recorder for an `RtmpSession` (write
+  each `StreamPacket` to an `io::Write` sink) and as the foundation
+  for an HTTP-FLV bridge — the body of an HTTP-FLV response is
+  exactly this byte stream, served with `Content-Type: video/x-flv`,
+  and a downstream consumer can re-decode it with `FlvReader`
+  without re-implementing the §E.3 walk.
 - `message::build_*` — builders for every protocol-control /
   command message we emit

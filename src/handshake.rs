@@ -10,8 +10,8 @@
 //!   C → S: C2 (1536 B = echo of S1)
 //! ```
 //!
-//! Most servers / clients we talk to (OBS, libavformat, nginx-rtmp,
-//! node-rtmp-server) accept this simple variant. The Adobe
+//! Most commodity servers / clients we have interoperated with accept
+//! this simple variant. The Adobe
 //! "complex" handshake embeds HMAC-SHA256 digests inside the 1528
 //! random bytes and is only actually validated by retired Flash
 //! clients + a few DRM boxes — skip for now.

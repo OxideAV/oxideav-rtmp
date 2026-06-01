@@ -17,8 +17,8 @@ use oxideav_rtmp::flv::{
     VIDEO_CODEC_AVC, VIDEO_FRAME_INTER, VIDEO_FRAME_KEYFRAME,
 };
 use oxideav_rtmp::flv_file::{
-    build_flv_header, FlvHeaderFlags, FlvWriter, FLV_HEADER_SIZE, FLV_TAG_TYPE_AUDIO,
-    FLV_TAG_TYPE_SCRIPT_DATA, FLV_TAG_TYPE_VIDEO,
+    build_flv_header, FlvHeaderFlags, FlvReader, FlvTag, FlvWriter, FLV_HEADER_SIZE,
+    FLV_TAG_TYPE_AUDIO, FLV_TAG_TYPE_SCRIPT_DATA, FLV_TAG_TYPE_VIDEO,
 };
 use oxideav_rtmp::{Amf0Value, AudioTag, RtmpClient, RtmpServer, StreamPacket, VideoTag};
 
@@ -236,6 +236,142 @@ fn empty_flv_stream_parses_to_zero_tags() {
         video: true,
     });
     assert_eq!(&buf[..9], &header);
+}
+
+/// End-to-end test for [`FlvReader`]: drive the same RTMP loopback
+/// the writer test above uses, but read the recorded stream back
+/// through the public reader API instead of the private byte-walker.
+/// Proves the writer's output round-trips through the reader without
+/// needing the integration-test-local `read_flv_stream` helper.
+#[test]
+fn record_rtmp_publish_then_read_back_through_flv_reader() {
+    let server = RtmpServer::bind("127.0.0.1:0").expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+    let (sink_tx, sink_rx) = mpsc::channel::<Vec<u8>>();
+
+    let server_thread = thread::spawn(move || {
+        let req = server.accept().expect("server accept");
+        let mut session = req.accept().expect("session accept");
+        session
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        let mut writer = FlvWriter::new(
+            Cursor::new(Vec::<u8>::new()),
+            FlvHeaderFlags {
+                audio: true,
+                video: true,
+            },
+        )
+        .expect("flv new");
+        writer
+            .write_script_data(
+                0,
+                "onMetaData",
+                &Amf0Value::EcmaArray(vec![(
+                    "source".into(),
+                    Amf0Value::String("loopback".into()),
+                )]),
+            )
+            .expect("write meta");
+        loop {
+            match session.next_packet() {
+                Ok(Some(StreamPacket::Audio { timestamp, tag })) => {
+                    writer.write_audio_tag(timestamp, &tag).expect("audio")
+                }
+                Ok(Some(StreamPacket::Video { timestamp, tag })) => {
+                    writer.write_video_tag(timestamp, &tag).expect("video")
+                }
+                Ok(Some(StreamPacket::Metadata(v))) => writer
+                    .write_script_data(0, "onMetaData", &v)
+                    .expect("meta rt"),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        sink_tx
+            .send(writer.finish().expect("finish").into_inner())
+            .expect("ship");
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let url = format!(
+        "rtmp://{}:{}/{APP}/{STREAM_KEY}-reader",
+        addr.ip(),
+        addr.port()
+    );
+    let mut client = RtmpClient::connect(&url).expect("client connect");
+    let avc_c = b"\x01\x42\x80\x1e\x00".to_vec();
+    client.send_video_sequence_header(&avc_c).expect("avc seq");
+    let asc = vec![0x12, 0x10];
+    client.send_audio_sequence_header(&asc).expect("aac seq");
+    let nalu_k: Vec<u8> = (0..150).map(|i| (i ^ 0x5A) as u8).collect();
+    client.send_video(0, true, &nalu_k).expect("keyframe");
+    let aac_a: Vec<u8> = (0..80).map(|i| (i * 7) as u8).collect();
+    client.send_audio(40, &aac_a).expect("audio frame");
+    client.close().expect("client close");
+    server_thread.join().expect("server thread");
+
+    let flv = sink_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("flv bytes");
+    let reader = FlvReader::new(Cursor::new(&flv[..])).expect("reader new");
+    assert_eq!(
+        reader.flags(),
+        FlvHeaderFlags {
+            audio: true,
+            video: true
+        }
+    );
+    let tags = reader.read_all().expect("read_all");
+
+    // The reader walked every tag the writer emitted — script +
+    // video sequence header + audio sequence header + keyframe +
+    // audio frame.
+    let videos: Vec<&FlvTag> = tags
+        .iter()
+        .filter(|t| t.tag_type() == FLV_TAG_TYPE_VIDEO)
+        .collect();
+    let audios: Vec<&FlvTag> = tags
+        .iter()
+        .filter(|t| t.tag_type() == FLV_TAG_TYPE_AUDIO)
+        .collect();
+    let scripts: Vec<&FlvTag> = tags
+        .iter()
+        .filter(|t| t.tag_type() == FLV_TAG_TYPE_SCRIPT_DATA)
+        .collect();
+    assert_eq!(videos.len(), 2, "expected seq-header + keyframe");
+    assert_eq!(audios.len(), 2, "expected seq-header + raw");
+    assert!(!scripts.is_empty(), "expected onMetaData");
+
+    match videos[0] {
+        FlvTag::Video { tag, .. } => {
+            assert!(tag.is_avc_sequence_header());
+            assert_eq!(tag.body, avc_c);
+        }
+        other => panic!("expected Video, got {other:?}"),
+    }
+    match videos[1] {
+        FlvTag::Video { timestamp_ms, tag } => {
+            assert_eq!(*timestamp_ms, 0);
+            assert_eq!(tag.body, nalu_k);
+        }
+        other => panic!("expected Video keyframe, got {other:?}"),
+    }
+    match audios[0] {
+        FlvTag::Audio { tag, .. } => assert_eq!(tag.body, asc),
+        other => panic!("expected Audio seq header, got {other:?}"),
+    }
+    match audios[1] {
+        FlvTag::Audio { timestamp_ms, tag } => {
+            assert_eq!(*timestamp_ms, 40);
+            assert_eq!(tag.body, aac_a);
+        }
+        other => panic!("expected Audio frame, got {other:?}"),
+    }
+    match scripts[0] {
+        FlvTag::Script { name, .. } => assert_eq!(name, "onMetaData"),
+        other => panic!("expected Script, got {other:?}"),
+    }
 }
 
 /// A direct round-trip: hand-build a VideoTag + AudioTag, frame each

@@ -33,8 +33,8 @@ pub const USR_STREAM_IS_RECORDED: u16 = 4;
 pub const USR_PING_REQUEST: u16 = 6;
 pub const USR_PING_RESPONSE: u16 = 7;
 
-// Chunk stream id conventions — not mandated by spec but used by
-// every major impl (FFmpeg, nginx-rtmp, OBS) so we match.
+// Chunk stream id conventions — not mandated by spec but used by every
+// major commodity implementation we have interoperated with, so we match.
 pub const CSID_PROTOCOL_CONTROL: u32 = 2;
 pub const CSID_COMMAND: u32 = 3;
 pub const CSID_AUDIO: u32 = 4;

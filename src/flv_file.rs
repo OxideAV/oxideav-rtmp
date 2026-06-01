@@ -1,8 +1,8 @@
-//! FLV file / byte-stream writer.
+//! FLV file / byte-stream writer + reader.
 //!
-//! Frames a sequence of audio / video / script-data tags into the
-//! wire layout an `.flv` file (and the body of an HTTP-FLV response)
-//! uses on disk:
+//! Frames (writer) and unframes (reader) a sequence of audio / video /
+//! script-data tags from the wire layout an `.flv` file (and the body
+//! of an HTTP-FLV response) uses on disk:
 //!
 //! ```text
 //!   FLV header  (9 bytes — 'F' 'L' 'V' | version | TypeFlags | DataOffset(UI32))
@@ -71,9 +71,10 @@
 //! let _file = w.finish().unwrap();
 //! ```
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use crate::amf::{self, Amf0Value};
+use crate::error::{Error, Result};
 use crate::flv::{self, AudioTag, VideoTag};
 
 /// FLV tag type — `TagType` field of an `FLVTAG`, §E.4.1.
@@ -341,6 +342,401 @@ impl<W: Write> FlvWriter<W> {
             self.finished = true;
         }
         Ok(self.inner)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reader
+// ---------------------------------------------------------------------------
+
+/// Default upper bound on a single `FLVTAG` payload accepted by
+/// [`FlvReader`]. UI24 `DataSize` (§E.4.1) can claim up to 16 MiB, but
+/// real-world FLV tags are a few KiB to a few hundred KiB; a 16 MiB
+/// claim almost always indicates a corrupted stream or a forged
+/// producer. Callers who need to lift the cap can do so via
+/// [`FlvReader::with_max_tag_size`].
+pub const DEFAULT_MAX_TAG_SIZE: u32 = UI24_MAX;
+
+/// A single decoded FLV tag — the variant carries the strongly-typed
+/// payload returned by [`FlvReader::read_tag`].
+///
+/// Per §E.4 each `FLVTAG` is one of three types:
+///
+/// * [`FlvTag::Audio`] — `TagType = 8`, payload parsed via
+///   [`crate::flv::parse_audio`].
+/// * [`FlvTag::Video`] — `TagType = 9`, payload parsed via
+///   [`crate::flv::parse_video`].
+/// * [`FlvTag::Script`] — `TagType = 18`, AMF0 `name + value` pair per
+///   §E.4.4.
+///
+/// `Unknown` is a forward-compatibility escape hatch for any reserved
+/// `TagType` value the spec adds in a future revision — the body bytes
+/// are preserved verbatim so a forwarding consumer never silently
+/// drops a tag it doesn't recognise.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlvTag {
+    /// `TagType = 8` audio tag, body parsed into the same
+    /// [`AudioTag`] shape the RTMP ingest path uses.
+    Audio { timestamp_ms: u32, tag: AudioTag },
+    /// `TagType = 9` video tag, body parsed into the same
+    /// [`VideoTag`] shape the RTMP ingest path uses.
+    Video { timestamp_ms: u32, tag: VideoTag },
+    /// `TagType = 18` script-data tag (§E.4.4). The wire body is an
+    /// AMF0 `Name + Value` pair, surfaced here as the decoded
+    /// [`Amf0Value::String`] name and the typed [`Amf0Value`] value.
+    /// The canonical use is `name = "onMetaData"`.
+    Script {
+        timestamp_ms: u32,
+        name: String,
+        value: Amf0Value,
+    },
+    /// Reserved `TagType` value not specified by §E.4. Preserved
+    /// verbatim so a forwarding consumer can keep the bytes around.
+    Unknown {
+        tag_type: u8,
+        timestamp_ms: u32,
+        body: Vec<u8>,
+    },
+}
+
+impl FlvTag {
+    /// `TagType` byte (`8` / `9` / `18` / other) for the variant.
+    pub fn tag_type(&self) -> u8 {
+        match self {
+            FlvTag::Audio { .. } => FLV_TAG_TYPE_AUDIO,
+            FlvTag::Video { .. } => FLV_TAG_TYPE_VIDEO,
+            FlvTag::Script { .. } => FLV_TAG_TYPE_SCRIPT_DATA,
+            FlvTag::Unknown { tag_type, .. } => *tag_type,
+        }
+    }
+
+    /// `Timestamp` + `TimestampExtended` re-joined into a single 32-bit
+    /// value (§E.4.1).
+    pub fn timestamp_ms(&self) -> u32 {
+        match self {
+            FlvTag::Audio { timestamp_ms, .. }
+            | FlvTag::Video { timestamp_ms, .. }
+            | FlvTag::Script { timestamp_ms, .. }
+            | FlvTag::Unknown { timestamp_ms, .. } => *timestamp_ms,
+        }
+    }
+}
+
+/// FLV file / byte-stream reader.
+///
+/// Wraps a `R: Read` source and walks the §E.2 9-byte file header
+/// followed by the §E.3 alternating `PreviousTagSize` / `FLVTAG` body,
+/// surfacing each tag as a strongly-typed [`FlvTag`].
+///
+/// The reader is the inverse of [`FlvWriter`]: a buffer that
+/// `FlvWriter` produced reads back through `FlvReader` and re-decodes
+/// to the original `VideoTag` / `AudioTag` / `Amf0Value` instances.
+/// The body of an HTTP-FLV response is exactly this byte stream
+/// (`Content-Type: video/x-flv`) so the same reader works for both
+/// disk and network sources.
+///
+/// Error semantics:
+///
+/// * Truncated header / FLVTAG header / payload — `Error::UnexpectedEof`.
+/// * Wrong `F`/`L`/`V` signature or unsupported version — `Error::Other`.
+/// * `DataSize` exceeds the configured cap — `Error::Other` (the cap
+///   defaults to [`DEFAULT_MAX_TAG_SIZE`]).
+/// * `PreviousTagSize` mismatch — `Error::Other`. The §E.3 invariant
+///   is `PreviousTagSize == 11 + DataSize`; a mismatch indicates a
+///   producer or transport corruption and the reader refuses to
+///   advance past it.
+/// * Script-tag body that isn't AMF0 `String + Value` — surfaced as an
+///   [`FlvTag::Unknown`] with `tag_type = 18` so the caller can choose
+///   to skip rather than fail the whole stream.
+#[derive(Debug)]
+pub struct FlvReader<R: Read> {
+    inner: R,
+    /// Header byte from §E.2 (`TypeFlagsAudio` / `TypeFlagsVideo`).
+    /// Stored so callers can introspect after construction.
+    flags: FlvHeaderFlags,
+    /// Largest payload (UI24 `DataSize`) the reader will accept.
+    max_tag_size: u32,
+    /// Size of the most recently decoded FLVTAG (11 + DataSize). The
+    /// `PreviousTagSize` back-pointer between tags is checked against
+    /// this value before the next tag is read.
+    last_tag_size: u32,
+    /// `true` once the underlying reader returned EOF on a clean
+    /// boundary (between tags). Subsequent `read_tag` calls return
+    /// `Ok(None)` rather than re-entering the reader on an exhausted
+    /// stream.
+    exhausted: bool,
+    /// Total bytes consumed so far (header + every back-pointer +
+    /// every framed tag). Useful for `Content-Length` accounting in
+    /// an HTTP-FLV proxy.
+    bytes_read: u64,
+}
+
+impl<R: Read> FlvReader<R> {
+    /// Wrap a `Read` source and consume the 9-byte §E.2 file header +
+    /// the mandatory `PreviousTagSize0 == 0` back-pointer (§E.3).
+    ///
+    /// Returns `Err` if the signature is not `F` `L` `V` or the
+    /// version byte is not [`FLV_VERSION`].
+    pub fn new(inner: R) -> Result<Self> {
+        Self::with_max_tag_size(inner, DEFAULT_MAX_TAG_SIZE)
+    }
+
+    /// As [`FlvReader::new`] but with a custom upper bound on a
+    /// single tag payload. `max_tag_size` must be ≤ [`UI24_MAX`]; a
+    /// larger value is clamped to that bound. Callers handling
+    /// trusted local files may want to set this to [`UI24_MAX`] (the
+    /// 16 MiB ceiling the wire format allows); HTTP-FLV proxies
+    /// generally want a tighter cap.
+    pub fn with_max_tag_size(mut inner: R, max_tag_size: u32) -> Result<Self> {
+        let mut header = [0u8; 9];
+        read_exact_eof(&mut inner, &mut header)?;
+        if header[0] != b'F' || header[1] != b'L' || header[2] != b'V' {
+            return Err(Error::Other(format!(
+                "FLV: bad signature {:02x} {:02x} {:02x}, want 'F' 'L' 'V'",
+                header[0], header[1], header[2],
+            )));
+        }
+        if header[3] != FLV_VERSION {
+            return Err(Error::Other(format!(
+                "FLV: unsupported version {:#x}, only {:#x} (version 1) is defined",
+                header[3], FLV_VERSION,
+            )));
+        }
+        let flags = FlvHeaderFlags::from_byte(header[4]);
+        let data_offset = u32::from_be_bytes([header[5], header[6], header[7], header[8]]);
+        // §E.2 — `DataOffset` is the length of this header. We accept
+        // 9 (the only value version 1 has ever defined) and any
+        // larger forward-compatibility offset by skipping the extra
+        // bytes. Refuse `< 9` outright since that would imply the
+        // header overlapped its own DataOffset field.
+        if data_offset < FLV_HEADER_SIZE {
+            return Err(Error::Other(format!(
+                "FLV: DataOffset {data_offset} < header size {FLV_HEADER_SIZE}"
+            )));
+        }
+        let mut bytes_read = u64::from(FLV_HEADER_SIZE);
+        if data_offset > FLV_HEADER_SIZE {
+            // Skip forward-compatible header padding.
+            let extra = (data_offset - FLV_HEADER_SIZE) as usize;
+            let mut skip = vec![0u8; extra];
+            read_exact_eof(&mut inner, &mut skip)?;
+            bytes_read += extra as u64;
+        }
+        // §E.3 — `PreviousTagSize0` is always 0.
+        let mut p0 = [0u8; 4];
+        read_exact_eof(&mut inner, &mut p0)?;
+        let prev0 = u32::from_be_bytes(p0);
+        if prev0 != 0 {
+            return Err(Error::Other(format!(
+                "FLV: PreviousTagSize0 must be 0, got {prev0}"
+            )));
+        }
+        bytes_read += 4;
+        let cap = max_tag_size.min(UI24_MAX);
+        Ok(Self {
+            inner,
+            flags,
+            max_tag_size: cap,
+            last_tag_size: 0,
+            exhausted: false,
+            bytes_read,
+        })
+    }
+
+    /// `TypeFlagsAudio` / `TypeFlagsVideo` decoded from the §E.2
+    /// header.
+    pub fn flags(&self) -> FlvHeaderFlags {
+        self.flags
+    }
+
+    /// Largest UI24 `DataSize` the reader will accept.
+    pub fn max_tag_size(&self) -> u32 {
+        self.max_tag_size
+    }
+
+    /// Bytes consumed from the underlying reader so far (header +
+    /// every back-pointer + every framed tag).
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Size of the most recently decoded FLVTAG (11 + DataSize), or 0
+    /// before the first tag is decoded.
+    pub fn last_tag_size(&self) -> u32 {
+        self.last_tag_size
+    }
+
+    /// Borrow the underlying source. Reads that bypass this type leave
+    /// the back-pointer / `bytes_read` tracking inconsistent — use
+    /// sparingly.
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    /// Read and decode the next `FLVTAG` (plus the trailing
+    /// `PreviousTagSize` back-pointer). Returns `Ok(None)` on a clean
+    /// end-of-stream at a tag boundary; any truncation mid-tag
+    /// surfaces as `Err(Error::UnexpectedEof)`.
+    pub fn read_tag(&mut self) -> Result<Option<FlvTag>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+        // Before the next FLVTAG, consume the back-pointer from the
+        // tag we last decoded (or the initial `PreviousTagSize0` for
+        // the very first call). The §E.3 invariant: this value MUST
+        // equal `11 + DataSize` of the previous tag. We consumed
+        // `PreviousTagSize0` (always 0) in `new`, so on the first call
+        // `last_tag_size == 0` and there is no back-pointer to read
+        // here — the FLVTAG header comes next.
+        //
+        // For subsequent calls, the back-pointer was already read at
+        // the end of the previous `read_tag` to detect a clean EOF
+        // boundary cleanly. So no preamble work needed.
+
+        let mut header = [0u8; 11];
+        match self.inner.read(&mut header[..1]) {
+            Ok(0) => {
+                // Clean EOF at tag boundary.
+                self.exhausted = true;
+                return Ok(None);
+            }
+            Ok(1) => {}
+            Ok(_) => unreachable!("read into 1-byte slice returned > 1"),
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.exhausted = true;
+                return Ok(None);
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+        read_exact_eof(&mut self.inner, &mut header[1..])?;
+        self.bytes_read += 11;
+        let raw_type = header[0];
+        // UB[2] reserved + UB[1] filter + UB[5] tag type.
+        let filter = (raw_type >> 5) & 0x01;
+        if filter != 0 {
+            // §E.4.1 — the Filter bit means the body is encrypted per
+            // Annex F. We don't implement the Annex F decrypt path
+            // here; surface the situation as a structured error so
+            // the caller can either route to a decryption stage or
+            // skip the tag.
+            return Err(Error::Other(
+                "FLV: encrypted tag (Filter=1, Annex F) — decryption not implemented".into(),
+            ));
+        }
+        let tag_type = raw_type & 0x1F;
+        let data_size = ((header[1] as u32) << 16) | ((header[2] as u32) << 8) | header[3] as u32;
+        if data_size > self.max_tag_size {
+            return Err(Error::Other(format!(
+                "FLV: DataSize {data_size} exceeds max_tag_size {}",
+                self.max_tag_size
+            )));
+        }
+        let ts_lo = ((header[4] as u32) << 16) | ((header[5] as u32) << 8) | header[6] as u32;
+        let ts_hi = header[7] as u32;
+        let timestamp_ms = (ts_hi << 24) | ts_lo;
+        let stream_id = ((header[8] as u32) << 16) | ((header[9] as u32) << 8) | header[10] as u32;
+        if stream_id != 0 {
+            return Err(Error::Other(format!(
+                "FLV: StreamID {stream_id} != 0 (§E.4.1 'Always 0')"
+            )));
+        }
+        let mut body = vec![0u8; data_size as usize];
+        read_exact_eof(&mut self.inner, &mut body)?;
+        self.bytes_read += data_size as u64;
+
+        // Read trailing `PreviousTagSize` and verify the §E.3
+        // invariant. Doing this before returning means a corrupt
+        // back-pointer surfaces on the same tag rather than poisoning
+        // the next read.
+        let mut prev = [0u8; 4];
+        read_exact_eof(&mut self.inner, &mut prev)?;
+        let prev_tag_size = u32::from_be_bytes(prev);
+        let expected = 11u32.saturating_add(data_size);
+        if prev_tag_size != expected {
+            return Err(Error::Other(format!(
+                "FLV: PreviousTagSize {prev_tag_size} != 11 + DataSize {expected} (§E.3)"
+            )));
+        }
+        self.bytes_read += 4;
+        self.last_tag_size = expected;
+
+        let decoded = match tag_type {
+            FLV_TAG_TYPE_AUDIO => {
+                let tag = flv::parse_audio(&body)
+                    .map_err(|e| Error::Other(format!("FLV audio body: {e}")))?;
+                FlvTag::Audio { timestamp_ms, tag }
+            }
+            FLV_TAG_TYPE_VIDEO => {
+                let tag = flv::parse_video(&body)
+                    .map_err(|e| Error::Other(format!("FLV video body: {e}")))?;
+                FlvTag::Video { timestamp_ms, tag }
+            }
+            FLV_TAG_TYPE_SCRIPT_DATA => match parse_script_body(&body) {
+                Ok((name, value)) => FlvTag::Script {
+                    timestamp_ms,
+                    name,
+                    value,
+                },
+                Err(_) => FlvTag::Unknown {
+                    tag_type,
+                    timestamp_ms,
+                    body,
+                },
+            },
+            _ => FlvTag::Unknown {
+                tag_type,
+                timestamp_ms,
+                body,
+            },
+        };
+        Ok(Some(decoded))
+    }
+
+    /// Consume the entire stream. Equivalent to repeatedly calling
+    /// [`FlvReader::read_tag`] until it returns `Ok(None)`.
+    pub fn read_all(mut self) -> Result<Vec<FlvTag>> {
+        let mut out = Vec::new();
+        while let Some(t) = self.read_tag()? {
+            out.push(t);
+        }
+        Ok(out)
+    }
+}
+
+/// Decode an §E.4.4 `ScriptTagBody` — AMF0 `Name + Value` pair where
+/// the name is required to be a `String` per the spec ("Method or
+/// object name. SCRIPTDATAVALUE.Type = 2 (String)").
+fn parse_script_body(body: &[u8]) -> Result<(String, Amf0Value)> {
+    let mut pos = 0;
+    let name_v = amf::decode(body, &mut pos)?;
+    let name = match name_v {
+        Amf0Value::String(s) => s,
+        other => {
+            return Err(Error::InvalidAmf0(format!(
+                "script tag name must be String (§E.4.4), got {other:?}"
+            )));
+        }
+    };
+    let value = amf::decode(body, &mut pos)?;
+    // Trailing bytes after the value are tolerated — some encoders
+    // append an extra `Amf0Value::ObjectEnd` or padding. Walk through
+    // any extras to keep `pos` advancing; refuse only outright
+    // garbage that fails to decode.
+    while pos < body.len() {
+        if amf::decode(body, &mut pos).is_err() {
+            break;
+        }
+    }
+    Ok((name, value))
+}
+
+/// Like `inner.read_exact` but maps `io::ErrorKind::UnexpectedEof`
+/// onto our [`Error::UnexpectedEof`] variant.
+fn read_exact_eof<R: Read>(inner: &mut R, buf: &mut [u8]) -> Result<()> {
+    match inner.read_exact(buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(Error::UnexpectedEof),
+        Err(e) => Err(Error::Io(e)),
     }
 }
 
@@ -797,5 +1193,545 @@ mod tests {
         assert_eq!(&buf[24..27], &[0x99, 0x88, 0x77]);
         // PreviousTagSize at end = 11 + 3 = 14.
         assert_eq!(&buf[buf.len() - 4..], &14u32.to_be_bytes());
+    }
+
+    // ---- Reader tests --------------------------------------------------
+
+    use std::io::Cursor;
+
+    #[test]
+    fn reader_empty_stream_round_trips_through_writer() {
+        // Brand-new writer with no tags → header + PreviousTagSize0
+        // only. Reader returns `Ok(None)` on the first call.
+        let w = FlvWriter::new(
+            Vec::new(),
+            FlvHeaderFlags {
+                audio: true,
+                video: false,
+            },
+        )
+        .expect("new");
+        let buf = w.finish().expect("finish");
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        assert_eq!(
+            r.flags(),
+            FlvHeaderFlags {
+                audio: true,
+                video: false
+            }
+        );
+        assert_eq!(r.bytes_read(), 13); // header(9) + PrevTagSize0(4)
+        assert!(r.read_tag().expect("read").is_none());
+        // Subsequent calls keep returning `None` without re-entering
+        // the reader.
+        assert!(r.read_tag().expect("read again").is_none());
+    }
+
+    #[test]
+    fn reader_rejects_bad_signature() {
+        let buf = vec![b'X', b'L', b'V', 1, 0x05, 0, 0, 0, 9, 0, 0, 0, 0];
+        let err = FlvReader::new(Cursor::new(buf)).unwrap_err();
+        assert!(
+            matches!(err, Error::Other(ref m) if m.contains("bad signature")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reader_rejects_wrong_version() {
+        let buf = vec![b'F', b'L', b'V', 9, 0x05, 0, 0, 0, 9, 0, 0, 0, 0];
+        let err = FlvReader::new(Cursor::new(buf)).unwrap_err();
+        assert!(
+            matches!(err, Error::Other(ref m) if m.contains("unsupported version")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reader_rejects_nonzero_previous_tag_size_0() {
+        // §E.3 — PreviousTagSize0 MUST be 0.
+        let buf = vec![b'F', b'L', b'V', 1, 0x05, 0, 0, 0, 9, 0, 0, 0, 0x42];
+        let err = FlvReader::new(Cursor::new(buf)).unwrap_err();
+        assert!(
+            matches!(err, Error::Other(ref m) if m.contains("PreviousTagSize0")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reader_rejects_data_offset_below_header_size() {
+        // DataOffset = 8 < 9 is impossible for a well-formed header.
+        let buf = vec![b'F', b'L', b'V', 1, 0x05, 0, 0, 0, 8, 0, 0, 0, 0];
+        let err = FlvReader::new(Cursor::new(buf)).unwrap_err();
+        assert!(
+            matches!(err, Error::Other(ref m) if m.contains("DataOffset")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reader_skips_forward_compatible_header_padding() {
+        // DataOffset = 11 → 2 extra padding bytes after the standard
+        // 9-byte header. A future spec revision could add fields; we
+        // must not refuse such a header just because we don't know
+        // the extra bytes' meaning.
+        let mut buf = vec![b'F', b'L', b'V', 1, 0x01, 0, 0, 0, 11];
+        buf.extend_from_slice(&[0xAA, 0xBB]); // padding
+        buf.extend_from_slice(&0u32.to_be_bytes()); // PreviousTagSize0
+        let r = FlvReader::new(Cursor::new(buf)).expect("new");
+        assert_eq!(r.bytes_read(), 11 + 4);
+        assert_eq!(
+            r.flags(),
+            FlvHeaderFlags {
+                audio: false,
+                video: true
+            }
+        );
+    }
+
+    #[test]
+    fn reader_avc_seq_header_round_trips_through_writer() {
+        let mut w = FlvWriter::new(
+            Vec::new(),
+            FlvHeaderFlags {
+                audio: false,
+                video: true,
+            },
+        )
+        .expect("new");
+        w.write_video_tag(0, &avc_seq_header_tag()).expect("write");
+        let buf = w.finish().expect("finish");
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let tag = r.read_tag().expect("read").expect("Some");
+        match tag {
+            FlvTag::Video { timestamp_ms, tag } => {
+                assert_eq!(timestamp_ms, 0);
+                assert!(tag.is_avc_sequence_header());
+                assert_eq!(tag.body, vec![0x01, 0x42, 0x80, 0x1E]);
+            }
+            other => panic!("expected Video, got {other:?}"),
+        }
+        assert_eq!(r.last_tag_size(), 20);
+        assert!(r.read_tag().expect("end").is_none());
+    }
+
+    #[test]
+    fn reader_aac_seq_header_round_trips_through_writer() {
+        let mut w = FlvWriter::new(
+            Vec::new(),
+            FlvHeaderFlags {
+                audio: true,
+                video: false,
+            },
+        )
+        .expect("new");
+        w.write_audio_tag(0, &aac_seq_header_tag()).expect("write");
+        let buf = w.finish().expect("finish");
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let tag = r.read_tag().expect("read").expect("Some");
+        match tag {
+            FlvTag::Audio { timestamp_ms, tag } => {
+                assert_eq!(timestamp_ms, 0);
+                assert_eq!(tag.sound_format, AUDIO_FORMAT_AAC);
+                assert_eq!(tag.aac_packet_type, Some(AAC_PACKET_TYPE_SEQUENCE_HEADER));
+                assert_eq!(tag.body, vec![0x12, 0x10]);
+            }
+            other => panic!("expected Audio, got {other:?}"),
+        }
+        assert!(r.read_tag().expect("end").is_none());
+    }
+
+    #[test]
+    fn reader_walks_interleaved_video_audio_video() {
+        // Same triple used by `writer_back_pointer_tracks_each_tag_independently`
+        // — 20 / 16 / 23 byte tags. Reader must surface each in order
+        // with the correct timestamps + types.
+        let mut w = FlvWriter::new(
+            Vec::new(),
+            FlvHeaderFlags {
+                audio: true,
+                video: true,
+            },
+        )
+        .expect("new");
+        w.write_video_tag(0, &avc_seq_header_tag()).expect("v1");
+        w.write_audio_tag(7, &aac_raw_tag(vec![0xAA, 0xBB, 0xCC]))
+            .expect("a1");
+        w.write_video_tag(33, &avc_inter_nalu_tag()).expect("v2");
+        let buf = w.finish().expect("finish");
+
+        let r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let tags = r.read_all().expect("read_all");
+        assert_eq!(tags.len(), 3);
+
+        match &tags[0] {
+            FlvTag::Video { timestamp_ms, tag } => {
+                assert_eq!(*timestamp_ms, 0);
+                assert!(tag.is_avc_sequence_header());
+            }
+            other => panic!("tag 0: {other:?}"),
+        }
+        match &tags[1] {
+            FlvTag::Audio { timestamp_ms, tag } => {
+                assert_eq!(*timestamp_ms, 7);
+                assert_eq!(tag.sound_format, AUDIO_FORMAT_AAC);
+                assert_eq!(tag.aac_packet_type, Some(AAC_PACKET_TYPE_RAW));
+                assert_eq!(tag.body, vec![0xAA, 0xBB, 0xCC]);
+            }
+            other => panic!("tag 1: {other:?}"),
+        }
+        match &tags[2] {
+            FlvTag::Video { timestamp_ms, tag } => {
+                assert_eq!(*timestamp_ms, 33);
+                assert_eq!(tag.frame_type, VIDEO_FRAME_INTER);
+                assert_eq!(tag.composition_time, 7);
+            }
+            other => panic!("tag 2: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reader_script_tag_round_trips_amf0_name_and_value() {
+        let mut w = FlvWriter::new(
+            Vec::new(),
+            FlvHeaderFlags {
+                audio: true,
+                video: true,
+            },
+        )
+        .expect("new");
+        let meta = Amf0Value::EcmaArray(vec![
+            ("width".into(), Amf0Value::Number(1920.0)),
+            ("height".into(), Amf0Value::Number(1080.0)),
+            ("framerate".into(), Amf0Value::Number(30.0)),
+        ]);
+        w.write_script_data(0, "onMetaData", &meta).expect("write");
+        let buf = w.finish().expect("finish");
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let tag = r.read_tag().expect("read").expect("Some");
+        match tag {
+            FlvTag::Script {
+                timestamp_ms,
+                name,
+                value,
+            } => {
+                assert_eq!(timestamp_ms, 0);
+                assert_eq!(name, "onMetaData");
+                assert_eq!(value, meta);
+            }
+            other => panic!("expected Script, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reader_timestamp_extended_high_byte_round_trips() {
+        // The writer encodes the high byte into TimestampExtended;
+        // the reader must re-join it back into the full 32-bit value.
+        let mut w = FlvWriter::new(
+            Vec::new(),
+            FlvHeaderFlags {
+                audio: true,
+                video: false,
+            },
+        )
+        .expect("new");
+        let ts: u32 = 0x0A_BBCCDD;
+        w.write_audio_tag(ts, &aac_raw_tag(vec![0x11, 0x22]))
+            .expect("write");
+        let buf = w.finish().expect("finish");
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let tag = r.read_tag().expect("read").expect("Some");
+        assert_eq!(tag.timestamp_ms(), ts);
+        assert_eq!(tag.tag_type(), FLV_TAG_TYPE_AUDIO);
+    }
+
+    #[test]
+    fn reader_enhanced_rtmp_v2_video_round_trips() {
+        // Exercise the ExHeader path: HEVC CodedFrames with a
+        // non-zero composition_time. Reader must surface the FourCC
+        // + ex_packet_type intact.
+        let tag = VideoTag {
+            mod_ex: Vec::new(),
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 42,
+            body: b"NALU-payload".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+            fourcc: Some(FOURCC_HEVC),
+            multitrack: None,
+        };
+        let mut w = FlvWriter::new(
+            Vec::new(),
+            FlvHeaderFlags {
+                audio: false,
+                video: true,
+            },
+        )
+        .expect("new");
+        w.write_video_tag(123, &tag).expect("write");
+        let buf = w.finish().expect("finish");
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let read = r.read_tag().expect("read").expect("Some");
+        match read {
+            FlvTag::Video { timestamp_ms, tag } => {
+                assert_eq!(timestamp_ms, 123);
+                assert_eq!(tag.fourcc, Some(FOURCC_HEVC));
+                assert_eq!(tag.ex_packet_type, Some(EX_PACKET_TYPE_CODED_FRAMES));
+                assert_eq!(tag.composition_time, 42);
+                assert_eq!(tag.body, b"NALU-payload".to_vec());
+            }
+            other => panic!("expected Video, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reader_rejects_corrupt_previous_tag_size() {
+        // Hand-craft a stream where the trailing back-pointer doesn't
+        // equal `11 + DataSize` — the §E.3 invariant. Reader must
+        // refuse rather than re-sync mid-stream.
+        let header = build_flv_header(FlvHeaderFlags {
+            audio: false,
+            video: true,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&0u32.to_be_bytes()); // PrevTagSize0
+                                                    // 11-byte FLVTAG header + 3-byte body → tag size 14.
+        buf.extend_from_slice(&[
+            9, // TagType = video
+            0, 0, 3, // DataSize = 3
+            0, 0, 0, // ts UI24
+            0, // ts ext
+            0, 0, 0, // StreamID
+        ]);
+        buf.extend_from_slice(&[0x17, 0x01, 0x00]);
+        // Wrong PreviousTagSize: should be 14, write 99.
+        buf.extend_from_slice(&99u32.to_be_bytes());
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let err = r.read_tag().unwrap_err();
+        assert!(
+            matches!(err, Error::Other(ref m) if m.contains("PreviousTagSize")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reader_rejects_data_size_above_cap() {
+        let header = build_flv_header(FlvHeaderFlags {
+            audio: true,
+            video: false,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        // FLVTAG claiming a 1 KiB body when the cap is 100 bytes.
+        buf.extend_from_slice(&[
+            8, // audio
+            0, 4, 0, // DataSize = 1024
+            0, 0, 0, 0, 0, 0, 0,
+        ]);
+        // (No body bytes needed — reader checks DataSize before
+        // attempting the body read.)
+
+        let mut r = FlvReader::with_max_tag_size(Cursor::new(buf), 100).expect("reader new");
+        assert_eq!(r.max_tag_size(), 100);
+        let err = r.read_tag().unwrap_err();
+        assert!(
+            matches!(err, Error::Other(ref m) if m.contains("exceeds max_tag_size")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reader_rejects_nonzero_stream_id() {
+        let header = build_flv_header(FlvHeaderFlags {
+            audio: true,
+            video: false,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        // FLVTAG with StreamID = 0x000001 (must be zero per §E.4.1).
+        buf.extend_from_slice(&[
+            8, 0, 0, 0, // DataSize = 0
+            0, 0, 0, 0, // ts
+            0, 0, 1, // StreamID = 1
+        ]);
+        buf.extend_from_slice(&11u32.to_be_bytes());
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let err = r.read_tag().unwrap_err();
+        assert!(
+            matches!(err, Error::Other(ref m) if m.contains("StreamID")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reader_rejects_encrypted_filter_bit() {
+        // Filter bit set (Annex F) — we don't implement decrypt.
+        let header = build_flv_header(FlvHeaderFlags {
+            audio: false,
+            video: true,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        // TagType byte = 0x29 = 0b0010_1001 → filter bit (1 << 5) +
+        // tag_type 9.
+        buf.extend_from_slice(&[
+            0x29, 0, 0, 0, // DataSize = 0
+            0, 0, 0, 0, // ts
+            0, 0, 0, // StreamID
+        ]);
+        buf.extend_from_slice(&11u32.to_be_bytes());
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let err = r.read_tag().unwrap_err();
+        assert!(
+            matches!(err, Error::Other(ref m) if m.contains("encrypted")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reader_truncated_tag_header_surfaces_unexpected_eof() {
+        // 9-byte header + PrevTagSize0 + half of an FLVTAG header.
+        let header = build_flv_header(FlvHeaderFlags {
+            audio: true,
+            video: true,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&[8, 0, 0, 5]); // 4 of 11 header bytes only
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let err = r.read_tag().unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEof), "got {err:?}");
+    }
+
+    #[test]
+    fn reader_truncated_payload_surfaces_unexpected_eof() {
+        // Full FLVTAG header + partial body.
+        let header = build_flv_header(FlvHeaderFlags {
+            audio: true,
+            video: false,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&[
+            8, 0, 0, 10, // DataSize = 10
+            0, 0, 0, 0, 0, 0, 0,
+        ]);
+        buf.extend_from_slice(&[0xAA, 0xBB]); // 2 of 10 body bytes only
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let err = r.read_tag().unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEof), "got {err:?}");
+    }
+
+    #[test]
+    fn reader_unknown_tag_type_preserved_verbatim() {
+        // TagType = 5 is not in §E.4 — surface as `Unknown` rather
+        // than failing the whole stream so a forwarding consumer can
+        // route the bytes elsewhere.
+        let header = build_flv_header(FlvHeaderFlags {
+            audio: false,
+            video: false,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&[
+            5, // unknown tag type
+            0, 0, 3, // DataSize = 3
+            0, 0, 0, 0, // ts
+            0, 0, 0, // StreamID
+        ]);
+        buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+        buf.extend_from_slice(&14u32.to_be_bytes());
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let tag = r.read_tag().expect("read").expect("Some");
+        match tag {
+            FlvTag::Unknown {
+                tag_type,
+                timestamp_ms,
+                body,
+            } => {
+                assert_eq!(tag_type, 5);
+                assert_eq!(timestamp_ms, 0);
+                assert_eq!(body, vec![0xDE, 0xAD, 0xBE]);
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reader_full_writer_round_trip_byte_for_byte() {
+        // Write a 4-tag stream (script + video sh + audio sh + video
+        // inter), read it back, then re-write through the writer and
+        // confirm the bytes match.
+        let meta = Amf0Value::EcmaArray(vec![
+            ("encoder".into(), Amf0Value::String("oxideav-rtmp".into())),
+            ("hasAudio".into(), Amf0Value::Boolean(true)),
+        ]);
+        let mut w = FlvWriter::new(
+            Vec::new(),
+            FlvHeaderFlags {
+                audio: true,
+                video: true,
+            },
+        )
+        .expect("new");
+        w.write_script_data(0, "onMetaData", &meta).expect("meta");
+        w.write_video_tag(0, &avc_seq_header_tag()).expect("v0");
+        w.write_audio_tag(0, &aac_seq_header_tag()).expect("a0");
+        w.write_video_tag(100, &avc_inter_nalu_tag()).expect("v1");
+        let original = w.finish().expect("finish");
+
+        let r = FlvReader::new(Cursor::new(original.clone())).expect("reader");
+        let tags = r.read_all().expect("read_all");
+        assert_eq!(tags.len(), 4);
+
+        let mut w2 = FlvWriter::new(
+            Vec::new(),
+            FlvHeaderFlags {
+                audio: true,
+                video: true,
+            },
+        )
+        .expect("new2");
+        for t in &tags {
+            match t {
+                FlvTag::Script {
+                    timestamp_ms,
+                    name,
+                    value,
+                } => w2.write_script_data(*timestamp_ms, name, value).unwrap(),
+                FlvTag::Video { timestamp_ms, tag } => {
+                    w2.write_video_tag(*timestamp_ms, tag).unwrap()
+                }
+                FlvTag::Audio { timestamp_ms, tag } => {
+                    w2.write_audio_tag(*timestamp_ms, tag).unwrap()
+                }
+                FlvTag::Unknown {
+                    tag_type,
+                    timestamp_ms,
+                    body,
+                } => w2.write_raw_tag(*tag_type, *timestamp_ms, body).unwrap(),
+            }
+        }
+        let re = w2.finish().expect("finish2");
+        assert_eq!(re, original);
     }
 }

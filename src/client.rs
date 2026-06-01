@@ -182,8 +182,8 @@ impl RtmpClient {
         let mut reader = ChunkReader::new(stream.try_clone()?);
         let mut writer = ChunkWriter::new(stream.try_clone()?);
 
-        // We bump chunk size immediately — FFmpeg / OBS all do this
-        // too. Saves a bunch of chunk headers over the A/V path.
+        // We bump chunk size immediately — most commodity publishers
+        // do this too. Saves a bunch of chunk headers over the A/V path.
         writer.write_message(
             CSID_PROTOCOL_CONTROL,
             &build_set_chunk_size(CLIENT_CHUNK_SIZE),

@@ -20,9 +20,8 @@
 //!
 //! The two-way contract — server emits StreamEOF on its side, client
 //! recognises StreamEOF as a clean end on its side — matches the
-//! framing the rest of the streaming ecosystem (ffmpeg's rtmpproto,
-//! OBS, nginx-rtmp) has used in practice for end-of-publish since
-//! 2009-ish.
+//! framing the rest of the commodity streaming ecosystem has used in
+//! practice for end-of-publish since 2009-ish.
 
 use std::sync::mpsc;
 use std::thread;

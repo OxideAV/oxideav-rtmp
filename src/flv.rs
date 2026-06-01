@@ -19,9 +19,8 @@
 //!   `AudioSpecificConfig` (2-byte ASC for LC-AAC 44.1k stereo);
 //!   subsequent messages carry raw AAC frames.
 //!
-//! These shapes are stable across every RTMP implementation — OBS,
-//! Wirecast, ffmpeg's rtmpproto, node-media-server all emit the same
-//! bytes.
+//! These shapes are stable across every commodity RTMP implementation
+//! we have interoperated with.
 
 use crate::error::{Error, Result};
 
