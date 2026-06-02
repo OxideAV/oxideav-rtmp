@@ -5,6 +5,7 @@
 //! [`chunk::ChunkWriter::write_message`].
 
 use crate::amf::{encode_command, Amf0Value};
+use crate::caps::ConnectCapabilities;
 use crate::chunk::Message;
 
 // §6.1 "Message Header" — type ids.
@@ -124,8 +125,42 @@ pub fn build_ack(bytes_received: u32) -> Message {
 /// `connect` — sent by the client right after handshake to open a
 /// NetConnection onto the server's `app`. `tc_url` is the full
 /// `rtmp://host[:port]/app` string; `app` is the last path segment.
+///
+/// Legacy publisher shape: no Enhanced RTMP capabilities advertised.
+/// For an E-RTMP-aware publisher use
+/// [`build_connect_with_caps`] which extends the Command Object with
+/// `fourCcList` / `audio|videoFourCcInfoMap` / `capsEx`.
 pub fn build_connect(transaction_id: f64, app: &str, tc_url: &str, flash_ver: &str) -> Message {
-    let cmd_obj = Amf0Value::Object(vec![
+    build_connect_with_caps(
+        transaction_id,
+        app,
+        tc_url,
+        flash_ver,
+        &ConnectCapabilities::default(),
+    )
+}
+
+/// `connect` with Enhanced RTMP v1+v2 capability advertisements
+/// (`enhanced-rtmp-v2.pdf` §"Enhancing NetConnection connect Command").
+///
+/// The legacy Command Object properties (`app` / `type` / `flashVer` /
+/// `tcUrl` / `fpad` / `capabilities` / `audioCodecs` / `videoCodecs` /
+/// `videoFunction`) are emitted in the historical order every commodity
+/// peer expects, and the non-default `ConnectCapabilities` entries are
+/// appended after them via [`ConnectCapabilities::encode_into`]. The
+/// per-property emission order is the documented one:
+/// `objectEncoding` → `fourCcList` → `videoFourCcInfoMap` →
+/// `audioFourCcInfoMap` → `capsEx`. Empty / default fields are skipped,
+/// so an empty `caps` block produces exactly the byte layout
+/// [`build_connect`] would.
+pub fn build_connect_with_caps(
+    transaction_id: f64,
+    app: &str,
+    tc_url: &str,
+    flash_ver: &str,
+    caps: &ConnectCapabilities,
+) -> Message {
+    let mut pairs: Vec<(String, Amf0Value)> = vec![
         ("app".into(), Amf0Value::String(app.into())),
         ("type".into(), Amf0Value::String("nonprivate".into())),
         ("flashVer".into(), Amf0Value::String(flash_ver.into())),
@@ -135,8 +170,9 @@ pub fn build_connect(transaction_id: f64, app: &str, tc_url: &str, flash_ver: &s
         ("audioCodecs".into(), Amf0Value::Number(0x0FFF as f64)),
         ("videoCodecs".into(), Amf0Value::Number(0x00FF as f64)),
         ("videoFunction".into(), Amf0Value::Number(1.0)),
-    ]);
-    let payload = encode_command("connect", transaction_id, cmd_obj, &[]);
+    ];
+    caps.encode_into(&mut pairs);
+    let payload = encode_command("connect", transaction_id, Amf0Value::Object(pairs), &[]);
     Message {
         msg_type_id: MSG_COMMAND_AMF0,
         msg_stream_id: 0,
@@ -147,13 +183,43 @@ pub fn build_connect(transaction_id: f64, app: &str, tc_url: &str, flash_ver: &s
 
 /// `_result` for the connect transaction. Standard server reply carries
 /// the server's flashVer + a NetConnection.Connect.Success info object.
+///
+/// Legacy server shape: no Enhanced RTMP capability advertisement.
+/// E-RTMP-aware servers should use [`build_connect_result_with_caps`]
+/// to echo `videoFourCcInfoMap` / `capsEx` etc. back at the client per
+/// `enhanced-rtmp-v2.pdf` §"Enhancing NetConnection connect Command".
 pub fn build_connect_result(transaction_id: f64) -> Message {
+    build_connect_result_with_caps(transaction_id, &ConnectCapabilities::default())
+}
+
+/// `_result` for the connect transaction with Enhanced RTMP capability
+/// advertisement.
+///
+/// The Command Object slot (the first AMF0 value after the transaction
+/// id) is the server's properties bag (`fmsVer` / `capabilities` /
+/// `mode`); the trailing single argument is the
+/// `NetConnection.Connect.Success` info object. Any non-default
+/// `ConnectCapabilities` properties are appended to the info object —
+/// `enhanced-rtmp-v2.pdf` is explicit: "the server provides some
+/// properties within an Object as one of the parameters" and gives
+/// `videoFourCcInfoMap` / `capsEx` as the canonical names. The info
+/// object's existing `level` / `code` / `description` /
+/// `objectEncoding` block is preserved, so a pre-2023 client still sees
+/// the success status it expects and a v2-aware client lifts the
+/// capability properties off the same object via
+/// [`crate::caps::ConnectCapabilities::from_amf0`].
+pub fn build_connect_result_with_caps(transaction_id: f64, caps: &ConnectCapabilities) -> Message {
     let props = Amf0Value::Object(vec![
         ("fmsVer".into(), Amf0Value::String("FMS/3,0,1,123".into())),
         ("capabilities".into(), Amf0Value::Number(31.0)),
         ("mode".into(), Amf0Value::Number(1.0)),
     ]);
-    let info = Amf0Value::Object(vec![
+    // Info object carries the success status + the capability block.
+    // `objectEncoding` is encoded twice when the caller sets it — once
+    // in our default `0.0` slot and once via `encode_into`. We pick
+    // whichever the caller asks for: drop the default if they set their
+    // own.
+    let mut info_pairs: Vec<(String, Amf0Value)> = vec![
         ("level".into(), Amf0Value::String("status".into())),
         (
             "code".into(),
@@ -163,9 +229,17 @@ pub fn build_connect_result(transaction_id: f64) -> Message {
             "description".into(),
             Amf0Value::String("Connection accepted.".into()),
         ),
-        ("objectEncoding".into(), Amf0Value::Number(0.0)),
-    ]);
-    let payload = encode_command("_result", transaction_id, props, &[info]);
+    ];
+    if caps.object_encoding.is_none() {
+        info_pairs.push(("objectEncoding".into(), Amf0Value::Number(0.0)));
+    }
+    caps.encode_into(&mut info_pairs);
+    let payload = encode_command(
+        "_result",
+        transaction_id,
+        props,
+        &[Amf0Value::Object(info_pairs)],
+    );
     Message {
         msg_type_id: MSG_COMMAND_AMF0,
         msg_stream_id: 0,
@@ -323,5 +397,103 @@ mod tests {
         assert_eq!(m.timestamp, 0);
         // Event type 1 (StreamEOF) | stream id 7.
         assert_eq!(m.payload, vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x07]);
+    }
+
+    /// `build_connect_with_caps` with a default capability block emits
+    /// byte-identical output to the legacy `build_connect` builder.
+    #[test]
+    fn connect_with_empty_caps_matches_legacy() {
+        let legacy = build_connect(1.0, "live", "rtmp://srv/live", "FMLE/3.0");
+        let caps_empty = build_connect_with_caps(
+            1.0,
+            "live",
+            "rtmp://srv/live",
+            "FMLE/3.0",
+            &ConnectCapabilities::default(),
+        );
+        assert_eq!(legacy.payload, caps_empty.payload);
+    }
+
+    /// `build_connect_with_caps` appends the Enhanced RTMP properties
+    /// onto the Command Object in the documented v1+v2 order, after the
+    /// legacy `videoFunction` field.
+    #[test]
+    fn connect_with_caps_appends_in_documented_order() {
+        let mut video = crate::caps::FourCcInfoMap::new();
+        video.insert("*", crate::caps::FOURCC_INFO_CAN_FORWARD);
+        let mut audio = crate::caps::FourCcInfoMap::new();
+        audio.insert("Opus", crate::caps::FOURCC_INFO_CAN_DECODE);
+        let caps = ConnectCapabilities {
+            object_encoding: Some(crate::caps::OBJECT_ENCODING_AMF3),
+            fourcc_list: vec!["av01".into(), "hvc1".into()],
+            video_fourcc_info_map: video,
+            audio_fourcc_info_map: audio,
+            caps_ex: crate::caps::CAPS_EX_RECONNECT | crate::caps::CAPS_EX_MULTITRACK,
+        };
+
+        let msg = build_connect_with_caps(1.0, "live", "rtmp://srv/live", "FMLE/3.0", &caps);
+        // Walk the AMF0 payload and pull the Command Object's property
+        // names. The third value is the Command Object (post-name,
+        // post-tx-id).
+        let vals = crate::amf::decode_all(&msg.payload).unwrap();
+        assert_eq!(vals[0].as_str(), Some("connect"));
+        let cmd_obj = match &vals[2] {
+            Amf0Value::Object(p) => p,
+            other => panic!("expected Object for command object, got {other:?}"),
+        };
+        let names: Vec<&str> = cmd_obj.iter().map(|(k, _)| k.as_str()).collect();
+        let legacy_count = names
+            .iter()
+            .position(|n| *n == "videoFunction")
+            .expect("legacy block must end with videoFunction")
+            + 1;
+        let extras = &names[legacy_count..];
+        assert_eq!(
+            extras,
+            &[
+                "objectEncoding",
+                "fourCcList",
+                "videoFourCcInfoMap",
+                "audioFourCcInfoMap",
+                "capsEx",
+            ],
+        );
+    }
+
+    /// `build_connect_result_with_caps` echoes the capability block back
+    /// inside the trailing info object alongside the
+    /// `NetConnection.Connect.Success` status.
+    #[test]
+    fn connect_result_with_caps_emits_info_block() {
+        let mut video = crate::caps::FourCcInfoMap::new();
+        video.insert("hvc1", crate::caps::FOURCC_INFO_CAN_DECODE);
+        let caps = ConnectCapabilities {
+            video_fourcc_info_map: video,
+            caps_ex: crate::caps::CAPS_EX_MULTITRACK | crate::caps::CAPS_EX_MOD_EX,
+            ..Default::default()
+        };
+        let msg = build_connect_result_with_caps(1.0, &caps);
+
+        let vals = crate::amf::decode_all(&msg.payload).unwrap();
+        assert_eq!(vals[0].as_str(), Some("_result"));
+        // Info object is the fourth AMF0 value.
+        let info = &vals[3];
+        assert_eq!(
+            info.get("code").and_then(Amf0Value::as_str),
+            Some("NetConnection.Connect.Success"),
+        );
+        let parsed = ConnectCapabilities::from_amf0(info);
+        assert_eq!(parsed.caps_ex, caps.caps_ex);
+        assert_eq!(parsed.video_fourcc_info_map.get("hvc1"), Some(1));
+    }
+
+    /// `build_connect_result_with_caps` with an empty capability block
+    /// emits the legacy bytes verbatim — pre-2023 clients keep parsing
+    /// the same status info object they've always seen.
+    #[test]
+    fn connect_result_with_empty_caps_matches_legacy() {
+        let legacy = build_connect_result(7.0);
+        let empty = build_connect_result_with_caps(7.0, &ConnectCapabilities::default());
+        assert_eq!(legacy.payload, empty.payload);
     }
 }

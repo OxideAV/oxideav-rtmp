@@ -157,6 +157,27 @@ client.close()?;
   the call stack runs out, so a forged onMetaData with 2_000 nested
   Objects surfaces a clean error rather than crashing.
 
+- **Enhanced RTMP v1+v2 NetConnection `connect` capability
+  negotiation** (Veovera 2023+2026). `RtmpClient::connect_with_capabilities`
+  advertises a [`ConnectCapabilities`] block in the publisher's `connect`
+  Command Object per `enhanced-rtmp-v2.pdf` §"Enhancing NetConnection
+  connect Command": the v1 `fourCcList` strict-array, the v2 object
+  maps `videoFourCcInfoMap` / `audioFourCcInfoMap` with per-codec
+  bitmask values (`FourCcInfoMask.CanDecode = 0x01` /
+  `CanEncode = 0x02` / `CanForward = 0x04`, with the `"*"` wildcard
+  honoured), and the v2 `capsEx` u32 bitfield (`Reconnect = 0x01` /
+  `Multitrack = 0x02` / `ModEx = 0x04` / `TimestampNanoOffset = 0x08`).
+  The block is appended *after* the historical `videoFunction` field so
+  legacy peers keep parsing the message correctly. `RtmpServer::set_capabilities`
+  symmetrically lets a server stamp its OWN capability block into the
+  `_result(connect)` info object alongside the
+  `NetConnection.Connect.Success` status; the publisher's advertised
+  block surfaces on `PublishRequest::capabilities` and the server's
+  advertised block surfaces on `RtmpClient::server_capabilities()`. The
+  empty / default block produces byte-identical output to the legacy
+  pre-2023 connect command. Resolves the previous "high-level publish
+  helper opts in once the configurable codec-list follow-up lands" note
+  for both audio and video FourCC advertisements.
 - **Enhanced RTMP v2 `ModEx` prelude** (Veovera 2026). The `ModEx`
   packet-type signal (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" /
   §"ExAudioTagHeader") is decoded for both audio and video: a chain
@@ -210,6 +231,15 @@ non-standard:
 - `amf::{encode, decode, encode_command, Amf0Value}`
 - `amf3::{encode, decode, decode_all, decode_data_message, encode_all, Amf3Value, Decoder}`
   plus `Amf3Value::to_amf0()` and `amf3::AVMPLUS_OBJECT_MARKER`
+- `caps::{ConnectCapabilities, FourCcInfoMap}` plus the spec-mirroring
+  `FOURCC_INFO_CAN_DECODE` / `CAPS_EX_*` / `OBJECT_ENCODING_*` /
+  `FOURCC_WILDCARD` constants — Enhanced RTMP v1+v2 NetConnection
+  `connect` capability negotiation per `enhanced-rtmp-v2.pdf`
+  §"Enhancing NetConnection connect Command". Compose with
+  `RtmpClient::connect_with_capabilities` (publisher) and
+  `RtmpServer::set_capabilities` (ingest) for high-level use, or call
+  `ConnectCapabilities::encode_into` / `from_amf0` directly to bridge
+  to a custom command pipeline.
 - `chunk::{ChunkReader, ChunkWriter, Message}`
 - `handshake::{client_handshake, server_handshake}`
 - `flv::{parse_video, build_video, parse_audio, build_audio, ModEx}`

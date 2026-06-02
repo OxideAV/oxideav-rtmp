@@ -45,6 +45,7 @@
 pub mod adapter;
 pub mod amf;
 pub mod amf3;
+pub mod caps;
 pub mod chunk;
 pub mod client;
 pub mod error;
@@ -61,6 +62,11 @@ pub use adapter::{
 };
 pub use amf::Amf0Value;
 pub use amf3::Amf3Value;
+pub use caps::{
+    ConnectCapabilities, FourCcInfoMap, CAPS_EX_MOD_EX, CAPS_EX_MULTITRACK, CAPS_EX_RECONNECT,
+    CAPS_EX_TIMESTAMP_NANO_OFFSET, FOURCC_INFO_CAN_DECODE, FOURCC_INFO_CAN_ENCODE,
+    FOURCC_INFO_CAN_FORWARD, FOURCC_WILDCARD, OBJECT_ENCODING_AMF0, OBJECT_ENCODING_AMF3,
+};
 pub use client::{ClientEvent, RtmpClient, RtmpUrl};
 pub use error::{Error, Result};
 pub use flv::{

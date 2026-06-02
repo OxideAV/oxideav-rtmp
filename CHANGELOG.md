@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enhanced RTMP v1+v2 NetConnection `connect` capability negotiation**
+  (`src/caps.rs`, `src/message.rs`, `src/client.rs`, `src/server.rs`,
+  `tests/connect_capabilities.rs`). The `fourCcList` /
+  `videoFourCcInfoMap` / `audioFourCcInfoMap` / `capsEx` properties
+  defined in `enhanced-rtmp-v2.pdf` §"Enhancing NetConnection connect
+  Command" are now exchanged end-to-end between
+  `RtmpClient::connect_with_capabilities` and `RtmpServer::set_capabilities`.
+  New `ConnectCapabilities` struct exposes all four entries plus the
+  legacy `objectEncoding` byte; new `FourCcInfoMap` keeps the per-codec
+  `(FourCC, mask)` entries in insertion order and implements the spec's
+  wildcard-OR rule via `effective_mask`. New constants mirror the spec
+  enums verbatim: `FourCcInfoMask` (`FOURCC_INFO_CAN_DECODE = 0x01` /
+  `_CAN_ENCODE = 0x02` / `_CAN_FORWARD = 0x04`) and `CapsExMask`
+  (`CAPS_EX_RECONNECT = 0x01` / `_MULTITRACK = 0x02` / `_MOD_EX = 0x04`
+  / `_TIMESTAMP_NANO_OFFSET = 0x08`); the `"*"` catch-all key is the new
+  `FOURCC_WILDCARD` constant. The Command Object properties are appended
+  to the historical `app` / `tcUrl` / `flashVer` / `fpad` /
+  `capabilities` / `audioCodecs` / `videoCodecs` / `videoFunction`
+  block in the documented spec order (`objectEncoding` → `fourCcList` →
+  `videoFourCcInfoMap` → `audioFourCcInfoMap` → `capsEx`); empty /
+  default fields are skipped so an empty capability block produces
+  byte-identical output to the pre-2023 [`build_connect`]. The server's
+  `_result(connect)` info object echoes its own capabilities through the
+  matching `build_connect_result_with_caps` builder. Surfaced to callers
+  as `PublishRequest::capabilities` (client-advertised) and
+  `RtmpClient::server_capabilities()` (server-advertised); the
+  `ConnectCapabilities::from_amf0` parser silently drops malformed
+  values (non-numeric mask bytes, non-finite numbers, negative masks,
+  `String` for `capsEx`, etc.) and saturates out-of-u32 numbers to
+  `u32::MAX`, matching the spec's "fail gracefully" rule. Resolves the
+  r0.0.4 README note "The `connect` command's `fourCcList`
+  advertisement (Enhanced RTMP v1 Table 5) is not populated by the
+  client yet" and the symmetric r0.0.4 audio-/v2-video notes about
+  `audioFourCcInfoMap` / `videoFourCcInfoMap` / `capsEx` not being
+  populated by `RtmpClient::connect`. 18 new unit tests in
+  `src/caps.rs` cover: `FourCcInfoMask` / `CapsExMask` constants match
+  the spec table; FourCC wildcard is the single-byte `"*"`;
+  `FourCcInfoMap::insert` preserves insertion order across duplicate
+  keys; `effective_mask` ORs in the wildcard entry; AMF0 round-trip;
+  malformed mask entries dropped; oversize mask saturates; default
+  capabilities emit nothing; documented v1+v2 order; full round-trip
+  through encode→AMF0 wire→decode for a fully-populated block;
+  `has_fourcc` wildcard + explicit; `supports_caps_ex` bit-test;
+  malformed `capsEx` falls back to default; non-object inputs return
+  empty; `objectEncoding` round-trips 0 / 3; ECMA-array parses the same
+  as Object. Plus 4 unit tests in `src/message.rs`:
+  `build_connect_with_caps` with empty caps matches legacy bytes
+  exactly; non-empty caps append the properties in documented order
+  after `videoFunction`; `build_connect_result_with_caps` echoes the
+  block inside the info object alongside
+  `NetConnection.Connect.Success`; empty caps match legacy
+  `build_connect_result` byte-for-byte. Plus 4 integration tests in
+  `tests/connect_capabilities.rs`: full loopback round-trips both
+  directions through a real TCP socket; legacy client against a v2
+  server still receives the server's advertisement; v2 client against a
+  legacy server observes empty server caps; `capsEx` bit-test surfaces
+  Reconnect / Multitrack / ModEx / TimestampNanoOffset after a real
+  loopback. Total lib tests: 177 → 198 (+21 — 18 caps + 4 message tests
+  hosted in the existing `message::tests` module). Total integration
+  tests: 65 → 69 (+4).
+
 - **FLV file / byte-stream reader** (`src/flv_file.rs`,
   `tests/flv_file_record.rs`). Inverse of the round-204 `FlvWriter`:
   new `FlvReader<R: Read>` wraps a `Read` source and walks the §E.2

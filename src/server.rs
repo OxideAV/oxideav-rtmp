@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use crate::amf::{self, Amf0Value};
 use crate::amf3;
+use crate::caps::ConnectCapabilities;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
 use crate::error::{Error, Result};
 use crate::flv::{parse_audio, parse_video, AudioTag, VideoTag};
@@ -45,16 +46,43 @@ const PEER_BW_LIMIT_DYNAMIC: u8 = 2;
 /// Listening socket for incoming RTMP publishers.
 pub struct RtmpServer {
     listener: TcpListener,
+    /// Enhanced RTMP capability block this server advertises in the
+    /// `_result(connect)` info object (`videoFourCcInfoMap` / `capsEx`
+    /// etc., per `enhanced-rtmp-v2.pdf` §"Enhancing NetConnection
+    /// connect Command"). Defaults to empty so legacy publishers see
+    /// the pre-2023 byte layout exactly. Mutate with
+    /// [`set_capabilities`](Self::set_capabilities).
+    capabilities: ConnectCapabilities,
 }
 
 impl RtmpServer {
     pub fn bind(addr: impl ToSocketAddrs) -> Result<Self> {
         let listener = TcpListener::bind(addr)?;
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            capabilities: ConnectCapabilities::default(),
+        })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.listener.local_addr()?)
+    }
+
+    /// Advertise the given Enhanced RTMP v1+v2 capabilities to every
+    /// subsequent `accept`-ed publisher. The block is appended to the
+    /// `_result(connect)` info object alongside the standard
+    /// `NetConnection.Connect.Success` status; legacy publishers ignore
+    /// the unknown properties and stay on the pre-2023 path. Pre-2023
+    /// is also what `set_capabilities(ConnectCapabilities::default())`
+    /// (or never calling this method) wires up.
+    pub fn set_capabilities(&mut self, caps: ConnectCapabilities) -> &mut Self {
+        self.capabilities = caps;
+        self
+    }
+
+    /// Capability block this server currently advertises.
+    pub fn capabilities(&self) -> &ConnectCapabilities {
+        &self.capabilities
     }
 
     /// Accept one connection, run the handshake + connect + publish
@@ -67,7 +95,7 @@ impl RtmpServer {
             // server — log via Err(...) once, then keep listening. A
             // caller that wants fine-grained control uses `incoming()`
             // plus their own handshake.
-            match drive_until_publish(stream, peer_addr) {
+            match drive_until_publish(stream, peer_addr, &self.capabilities) {
                 Ok(req) => return Ok(req),
                 Err(e) => {
                     eprintln!("oxideav-rtmp: dropped connection from {peer_addr}: {e}");
@@ -91,6 +119,7 @@ impl RtmpServer {
     {
         use std::sync::Arc;
         let handler = Arc::new(handler);
+        let caps = Arc::new(self.capabilities.clone());
         for conn in self.listener.incoming() {
             let stream = match conn {
                 Ok(s) => s,
@@ -104,9 +133,10 @@ impl RtmpServer {
                 Err(_) => continue,
             };
             let h = handler.clone();
+            let c = caps.clone();
             thread::Builder::new()
                 .name(format!("oxideav-rtmp-session-{peer_addr}"))
-                .spawn(move || match drive_until_publish(stream, peer_addr) {
+                .spawn(move || match drive_until_publish(stream, peer_addr, &c) {
                     Ok(req) => h(req),
                     Err(e) => {
                         eprintln!("oxideav-rtmp: dropped connection from {peer_addr}: {e}");
@@ -130,6 +160,13 @@ pub struct PublishRequest {
     /// The `tcUrl` field from the client's connect command — useful
     /// when consumers want the full url for logging.
     pub tc_url: String,
+    /// Enhanced RTMP v1+v2 capability block lifted from the publisher's
+    /// `connect` Command Object (`fourCcList` /
+    /// `audio|videoFourCcInfoMap` / `capsEx`, per
+    /// `enhanced-rtmp-v2.pdf` §"Enhancing NetConnection connect
+    /// Command"). Empty for legacy publishers that don't advertise any
+    /// E-RTMP capabilities.
+    pub capabilities: ConnectCapabilities,
     pending: PendingSession,
 }
 
@@ -155,6 +192,7 @@ impl PublishRequest {
             publish_type,
             peer_addr,
             tc_url: _,
+            capabilities: _,
             pending,
         } = self;
         let PendingSession {
@@ -407,7 +445,11 @@ impl RtmpSession {
 // Protocol driver: handshake → connect → createStream → publish
 // ---------------------------------------------------------------------------
 
-fn drive_until_publish(stream: TcpStream, peer_addr: SocketAddr) -> Result<PublishRequest> {
+fn drive_until_publish(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    server_caps: &ConnectCapabilities,
+) -> Result<PublishRequest> {
     // TCP-level defaults: nodelay (RTMP is command-heavy during setup),
     // keepalive so idle publishers are detected.
     let _ = stream.set_nodelay(true);
@@ -427,6 +469,7 @@ fn drive_until_publish(stream: TcpStream, peer_addr: SocketAddr) -> Result<Publi
     // `connect` command below.
     let tc_url;
     let app;
+    let client_capabilities;
     loop {
         let msg = reader.read_message()?;
         match msg.msg_type_id {
@@ -459,10 +502,16 @@ fn drive_until_publish(stream: TcpStream, peer_addr: SocketAddr) -> Result<Publi
                     .and_then(Amf0Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                // Lift Enhanced RTMP v1+v2 capability advertisement out
+                // of the Command Object. Legacy publishers leave this
+                // empty.
+                client_capabilities = ConnectCapabilities::from_amf0(cmd_obj);
 
                 // Reply: WindowAckSize + SetPeerBandwidth + StreamBegin
                 // + _result + SetChunkSize. Order matches what most
-                // commodity ingest servers send.
+                // commodity ingest servers send. The server's own
+                // capability advertisement rides inside the _result
+                // info object — see `build_connect_result_with_caps`.
                 writer.write_message(
                     CSID_PROTOCOL_CONTROL,
                     &build_window_ack_size(WINDOW_ACK_SIZE),
@@ -472,7 +521,10 @@ fn drive_until_publish(stream: TcpStream, peer_addr: SocketAddr) -> Result<Publi
                     &build_set_peer_bandwidth(WINDOW_ACK_SIZE, PEER_BW_LIMIT_DYNAMIC),
                 )?;
                 writer.write_message(CSID_PROTOCOL_CONTROL, &build_user_control_stream_begin(0))?;
-                writer.write_message(CSID_COMMAND, &build_connect_result(tx_id))?;
+                writer.write_message(
+                    CSID_COMMAND,
+                    &build_connect_result_with_caps(tx_id, server_caps),
+                )?;
                 writer.write_message(
                     CSID_PROTOCOL_CONTROL,
                     &build_set_chunk_size(SERVER_CHUNK_SIZE),
@@ -556,6 +608,7 @@ fn drive_until_publish(stream: TcpStream, peer_addr: SocketAddr) -> Result<Publi
                             publish_type,
                             peer_addr,
                             tc_url,
+                            capabilities: client_capabilities,
                             pending: PendingSession {
                                 stream,
                                 reader,

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use crate::amf::{self, Amf0Value};
 use crate::amf3;
+use crate::caps::ConnectCapabilities;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
 use crate::error::{Error, Result};
 use crate::flv::{self, AudioTag, VideoTag};
@@ -102,6 +103,11 @@ pub struct RtmpClient {
     /// normally sends `StreamEOF` *first* then a trailing onStatus, so
     /// `poll_event` keeps reading until the kernel reports EOF.
     read_eof: bool,
+    /// Enhanced RTMP capability block lifted from the server's
+    /// `_result(connect)` info object. Empty when the server didn't
+    /// advertise any v1+v2 capabilities (the historical pre-2023
+    /// shape). Inspect via [`server_capabilities`](Self::server_capabilities).
+    server_caps: ConnectCapabilities,
 }
 
 /// Parsed RTMP URL: `rtmp://host[:port]/app/stream_name`.
@@ -154,7 +160,7 @@ impl RtmpClient {
     /// sequence, and return a ready-to-send client.
     pub fn connect(url: &str) -> Result<Self> {
         let parsed = RtmpUrl::parse(url)?;
-        Self::connect_parsed(&parsed, "live")
+        Self::connect_parsed(&parsed, "live", &ConnectCapabilities::default())
     }
 
     /// Same as [`connect`](Self::connect) but lets the caller pick the
@@ -162,10 +168,42 @@ impl RtmpClient {
     /// `"append"`).
     pub fn connect_with_type(url: &str, publish_type: &str) -> Result<Self> {
         let parsed = RtmpUrl::parse(url)?;
-        Self::connect_parsed(&parsed, publish_type)
+        Self::connect_parsed(&parsed, publish_type, &ConnectCapabilities::default())
     }
 
-    fn connect_parsed(u: &RtmpUrl, publish_type: &str) -> Result<Self> {
+    /// Connect and advertise the supplied Enhanced RTMP v1+v2
+    /// capability block in the NetConnection `connect` command
+    /// (`enhanced-rtmp-v2.pdf` §"Enhancing NetConnection connect
+    /// Command"). The block is appended to the legacy Command Object
+    /// in the documented order — peers that don't speak E-RTMP keep
+    /// parsing the message correctly because the extras are tacked on
+    /// after the historical `videoFunction` field.
+    ///
+    /// The server's `_result` properties object is parsed for the same
+    /// set of keys and stashed on the client; retrieve it via
+    /// [`server_capabilities`](Self::server_capabilities) to learn
+    /// which v1+v2 features the peer agreed to support.
+    pub fn connect_with_capabilities(
+        url: &str,
+        publish_type: &str,
+        caps: &ConnectCapabilities,
+    ) -> Result<Self> {
+        let parsed = RtmpUrl::parse(url)?;
+        Self::connect_parsed(&parsed, publish_type, caps)
+    }
+
+    /// Capability block advertised by the server in `_result(connect)`.
+    ///
+    /// Empty when the peer is pre-2023 / unaware of E-RTMP — callers can
+    /// detect that with [`ConnectCapabilities::is_empty`]. Otherwise
+    /// describes which FourCC codecs the server reports it can decode /
+    /// encode / forward, plus the v2 `capsEx` bitfield (Reconnect,
+    /// Multitrack, ModEx, TimestampNanoOffset).
+    pub fn server_capabilities(&self) -> &ConnectCapabilities {
+        &self.server_caps
+    }
+
+    fn connect_parsed(u: &RtmpUrl, publish_type: &str, caps: &ConnectCapabilities) -> Result<Self> {
         let sock_addr = (u.host.as_str(), u.port)
             .to_socket_addrs()
             .map_err(Error::from)?
@@ -194,12 +232,19 @@ impl RtmpClient {
         let tx = 1.0;
         writer.write_message(
             CSID_COMMAND,
-            &build_connect(tx, &u.app, &u.tc_url, FLASH_VER),
+            &build_connect_with_caps(tx, &u.app, &u.tc_url, FLASH_VER, caps),
         )?;
         writer.flush()?;
 
-        // Drain until we see the _result for connect.
-        wait_for_result(&mut reader, &mut writer, tx)?;
+        // Drain until we see the _result for connect; lift the server's
+        // capability advertisement out of the info object.
+        let connect_result = wait_for_result(&mut reader, &mut writer, tx)?;
+        // Info object is the last Object/EcmaArray AMF0 value after the
+        // properties slot; per §"Enhancing NetConnection connect Command"
+        // the server stamps its capabilities into one of the `_result`
+        // parameters. Walk back to the first Object/ECMA-array carrying
+        // any of the documented capability keys.
+        let server_caps = extract_server_caps(&connect_result);
 
         // releaseStream + FCPublish — optional but standard.
         let tx_release = 2.0;
@@ -237,6 +282,7 @@ impl RtmpClient {
             stream_id,
             next_tx: 10.0,
             read_eof: false,
+            server_caps,
         })
     }
 
@@ -649,6 +695,47 @@ fn read_u32_be(buf: &[u8]) -> Result<u32> {
         return Err(Error::ProtocolViolation("need 4 bytes for u32be".into()));
     }
     Ok(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]))
+}
+
+/// Locate the Enhanced RTMP capability block in a server's
+/// `_result(connect, ...)` AMF0 value list.
+///
+/// Per `enhanced-rtmp-v2.pdf` §"Enhancing NetConnection connect Command"
+/// the server stamps `videoFourCcInfoMap` / `audioFourCcInfoMap` /
+/// `capsEx` etc. into one of the `_result` parameters; in practice
+/// every implementation we have seen drops them into the trailing info
+/// object (the slot that carries `NetConnection.Connect.Success`). Some
+/// servers also drop them into the properties slot (the second AMF0
+/// value, right after the transaction id), so we walk every
+/// Object / ECMA-array in the response and return the first one whose
+/// `ConnectCapabilities::from_amf0` carries an Enhanced-RTMP property.
+///
+/// `objectEncoding` alone doesn't count: every pre-2023 server stamps
+/// `objectEncoding = 0` into its info object as part of the legacy
+/// `NetConnection.Connect.Success` shape, so picking that up would make
+/// every legacy server look like a v2 advertisement. A fully-legacy
+/// server therefore returns the empty capability block.
+fn extract_server_caps(values: &[Amf0Value]) -> ConnectCapabilities {
+    for v in values {
+        if matches!(v, Amf0Value::Object(_) | Amf0Value::EcmaArray(_)) {
+            let caps = ConnectCapabilities::from_amf0(v);
+            if has_enhanced_rtmp_property(&caps) {
+                return caps;
+            }
+        }
+    }
+    ConnectCapabilities::default()
+}
+
+/// True if `caps` carries any of the Enhanced RTMP v1+v2 capability
+/// properties (`fourCcList`, `videoFourCcInfoMap`,
+/// `audioFourCcInfoMap`, `capsEx`). `objectEncoding` alone — the
+/// legacy `_result(connect)` field — does not count.
+fn has_enhanced_rtmp_property(caps: &ConnectCapabilities) -> bool {
+    !caps.fourcc_list.is_empty()
+        || !caps.video_fourcc_info_map.is_empty()
+        || !caps.audio_fourcc_info_map.is_empty()
+        || caps.caps_ex != 0
 }
 
 /// Decode the `User Control` payload framing per RTMP 1.0 §6.2 /
