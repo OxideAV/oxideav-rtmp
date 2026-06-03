@@ -19,6 +19,7 @@
 
 use std::io::Cursor;
 
+use oxideav_rtmp::aggregate::parse_aggregate;
 use oxideav_rtmp::amf::{decode as amf0_decode, decode_all as amf0_decode_all, Amf0Value};
 use oxideav_rtmp::amf3::{
     decode as amf3_decode, decode_all as amf3_decode_all, decode_data_message,
@@ -560,6 +561,59 @@ fn server_handshake_truncated_client_reply_errors() {
 /// Build a valid AMF0 `onMetaData` payload, then flip random bytes
 /// inside it. Every mutation must produce either a valid Amf0Value
 /// list or a clean Err — never a panic.
+// ---------------------------------------------------------------------------
+// Aggregate Message (type 22) fuzz — `aggregate::parse_aggregate`
+// ---------------------------------------------------------------------------
+//
+// RTMP 1.0 §7.1.6 — an Aggregate Message body is a sequence of FLV-shaped
+// sub-headers + payloads + `PreviousTagSize` back-pointers. Any adversarial
+// peer that delivers a type-22 message with arbitrary inner bytes must
+// surface a clean Err, never panic. Targeted at the bounds-check arithmetic
+// in `parse_aggregate` (UI24 length field, back-pointer slot, the §7.1.6
+// timestamp re-normalisation subtract).
+#[test]
+fn aggregate_parse_random_bodies_never_panic() {
+    let mut rng = Xs64::new(0xA66E_6A7E_0001);
+    for iter in 0..1024 {
+        let len = (rng.next() as usize) % 257;
+        let mut buf = vec![0u8; len];
+        rng.fill(&mut buf);
+        let outer_ts = rng.next() as u32;
+        let outer_sid = rng.next() as u32;
+        let buf_copy = buf.clone();
+        let result = std::panic::catch_unwind(move || {
+            parse_aggregate(&Message {
+                msg_type_id: 22,
+                msg_stream_id: outer_sid,
+                timestamp: outer_ts,
+                payload: buf_copy,
+            })
+        });
+        assert!(
+            result.is_ok(),
+            "parse_aggregate panicked on iteration {iter}, input bytes: {buf:?}"
+        );
+    }
+}
+
+/// Adversarial sub-header that claims `DataSize = 0xFFFFFF` (UI24 max)
+/// but the body is short. Must surface as a clean `Err`, no
+/// gigabyte-sized allocation, no panic.
+#[test]
+fn aggregate_oversize_sub_data_size_errors_fast() {
+    // tag type = 9 (video), DataSize UI24 = 0xFFFFFF (16 MiB).
+    let mut body = vec![9u8, 0xFF, 0xFF, 0xFF];
+    body.extend_from_slice(&[0; 7]); // ts + sid
+                                     // No payload, no back pointer — far short of what the header claims.
+    let msg = Message {
+        msg_type_id: 22,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload: body,
+    };
+    assert!(parse_aggregate(&msg).is_err());
+}
+
 #[test]
 fn amf0_valid_then_mutated_never_panics() {
     use oxideav_rtmp::amf::encode;

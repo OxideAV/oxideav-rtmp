@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Aggregate Message (type 22) parser + builder** (`src/aggregate.rs`,
+  `tests/aggregate_chunk_round_trip.rs`, `tests/injection_robustness.rs`).
+  RTMP 1.0 §7.1.6 defines the *Aggregate Message* as a single
+  `Message` of type id 22 whose payload carries a sequence of
+  FLV-shaped sub-messages so several audio / video / data frames can
+  travel through the chunk stream as one message. New `aggregate`
+  module exposes `parse_aggregate(&Message) -> Result<Vec<Message>>`
+  and `build_aggregate(stream_id, &[Message]) -> Result<Message>`,
+  both re-exported at the crate root. The sub-header layout mirrors
+  §6.1.1 (1 + 3 + 4 + 3 = 11 bytes) which the spec explicitly says
+  "matches the format of FLV file" — the FLV §E.4.1 split-timestamp
+  (`UI24 ts_low | UI8 ts_high`) and the §E.3 `PreviousTagSize ==
+  11 + DataSize` back-pointer invariant are both honoured. The
+  §7.1.6 timestamp re-normalisation rule ("the difference between
+  the timestamps of the aggregate message and the first sub-message
+  is the offset used to renormalize the timestamps of the
+  sub-messages") is applied transparently by the parser, lifting
+  each sub's wire timestamp `t_i` onto the stream clock as
+  `t_i + (aggregate.timestamp - t_0)`; the builder sets
+  `aggregate.timestamp == subs[0].timestamp` so the SHOULD-be-zero
+  offset holds. Sub `Stream ID` fields are written as 0 on the wire
+  (per §7.1.6 / §E.4.1) and the parser overrides every decoded sub's
+  `msg_stream_id` with the aggregate's, matching the spec ("the
+  message stream ID of the aggregate message overrides the message
+  stream IDs of the sub-messages"). Adversarial inputs all surface
+  as typed `Result::Err`: truncated headers / payloads / back
+  pointers → `UnexpectedEof`; mismatched back pointer or
+  non-type-22 outer message → `InvalidChunk`; UI24-cap overflow on
+  the build side → `InvalidChunk`. 14 new lib unit tests in
+  `src/aggregate.rs` cover: three-sub round-trip with zero offset;
+  the §7.1.6 offset shift applied to two subs with a deliberately
+  non-zero outer timestamp; empty aggregate symmetry; wrong outer
+  type rejection; truncated sub-header / sub-payload / back-pointer
+  fail-fast; mismatched back pointer; sub-header `StreamID = 0`
+  invariant on build; outer `timestamp = subs[0].timestamp`
+  invariant on build; 100-sub round-trip (proves bookkeeping
+  scales); UI24-cap rejection on a 16-MiB+1-byte sub payload; a
+  forged UI24-max DataSize → clean `UnexpectedEof`; and a
+  1024-iteration deterministic-xorshift fuzz pass guaranteeing
+  `parse_aggregate` is panic-free on arbitrary bytes. 2 new
+  integration tests in `tests/aggregate_chunk_round_trip.rs` drive
+  `build_aggregate → ChunkWriter::write_message →
+  ChunkReader::read_message → parse_aggregate` on a realistic
+  video+audio+script bundle and assert the byte-exact §6.1.1
+  sub-header layout (offsets [1..4] DataSize UI24 BE, [4..7] +
+  [7] FLV split-timestamp, [8..11] StreamID UI24 = 0, trailing UI32
+  back-pointer = `11 + DataSize`). 2 new entries in
+  `tests/injection_robustness.rs` extend the property-test sweep
+  with 1024 random-byte aggregate payloads (no panics) plus an
+  oversize-DataSize fail-fast assertion. Total lib tests: 198 → 212
+  (+14). Total integration tests: 69 → 73 (+4). Resolves the RTMP
+  1.0 §7.1.6 portion of the README's "Aggregate Message body is
+  not yet decomposed" gap.
+
 - **Enhanced RTMP v1+v2 NetConnection `connect` capability negotiation**
   (`src/caps.rs`, `src/message.rs`, `src/client.rs`, `src/server.rs`,
   `tests/connect_capabilities.rs`). The `fourCcList` /

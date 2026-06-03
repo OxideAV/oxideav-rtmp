@@ -43,6 +43,7 @@
 //!   digest-verified handshake variant.
 
 pub mod adapter;
+pub mod aggregate;
 pub mod amf;
 pub mod amf3;
 pub mod caps;
@@ -60,6 +61,7 @@ pub use adapter::{
     register, video_codec_id, video_codec_id_for_tag, video_fourcc_codec_id, video_to_packet,
     RtmpPacketSource, AUDIO_STREAM_INDEX, RTMP_TIME_BASE, VIDEO_STREAM_INDEX,
 };
+pub use aggregate::{build_aggregate, parse_aggregate};
 pub use amf::Amf0Value;
 pub use amf3::Amf3Value;
 pub use caps::{

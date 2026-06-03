@@ -241,6 +241,17 @@ non-standard:
   `ConnectCapabilities::encode_into` / `from_amf0` directly to bridge
   to a custom command pipeline.
 - `chunk::{ChunkReader, ChunkWriter, Message}`
+- `aggregate::{parse_aggregate, build_aggregate}` — Aggregate Message
+  (RTMP 1.0 §7.1.6 type 22) parser + builder. Splits a single
+  `Message` of type id 22 into its component FLV-shaped sub-messages
+  (audio / video / data / command), applying the §7.1.6 timestamp
+  re-normalisation rule (`t_i + (aggregate.timestamp - t_0)`) and
+  honouring the spec's "stream id of the aggregate overrides the
+  stream ids of the sub-messages" override. Symmetrically packs a
+  `&[Message]` slice into an aggregate carrying the correct §E.3
+  `PreviousTagSize` back-pointers — useful when a publisher wants to
+  cut chunk-header overhead by bundling several frames into one
+  message before they hit `ChunkWriter::write_message`.
 - `handshake::{client_handshake, server_handshake}`
 - `flv::{parse_video, build_video, parse_audio, build_audio, ModEx}`
 - `flv_file::{FlvWriter, FlvReader, FlvTag, FlvHeaderFlags,
