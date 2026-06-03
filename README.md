@@ -190,8 +190,20 @@ client.close()?;
   packet adapters route a ModEx-prefixed tag transparently. The only
   subtype defined today, `TimestampOffsetNano` (a `bytesToUI24`
   sub-millisecond presentation offset, 0..=999_999 ns), is exposed via
-  `{Video,Audio}Tag::timestamp_offset_nano`; folding that nanosecond
-  offset into the millisecond `Packet` timeline is a follow-up.
+  `{Video,Audio}Tag::timestamp_offset_nano`. The
+  [`SourceRegistry`]/[`audio_to_packet`]/[`video_to_packet`] adapter
+  now **folds that nanosecond offset onto the `Packet` timeline** at
+  source: the timeline switched to `RTMP_TIME_BASE = 1/1_000_000_000`
+  (nanoseconds), so `pts` and `dts` are emitted as
+  `ms * RTMP_MS_TO_NS` and the per-message `TimestampOffsetNano` sum
+  is added to the *presentation* time per spec — for audio both
+  `pts == dts` receive the offset; for video only `pts` (decode
+  timestamp stays unmodified, matching the §"ExVideoTagHeader"
+  contract "without altering the core RTMP timestamp"). The exposed
+  `RTMP_MS_TO_NS` (= 1_000_000) constant lets a consumer recover the
+  wire ms value when needed. Multi-entry chains and out-of-band
+  ModEx subtypes are summed via the typed accessor so future
+  subtypes never feed the timestamp sum by accident.
 
 ## Pipeline integration (`SourceRegistry`)
 
@@ -206,7 +218,9 @@ oxideav_rtmp::register(&mut reg);
 // `rtmp://host:port/app/stream-name` opens a one-shot listener
 // that accepts a single publisher and surfaces it as a
 // `PacketSource` (audio = stream 0, video = stream 1, both with
-// time_base 1/1000). Codec ids are auto-detected from the
+// time_base 1/1_000_000_000 — nanoseconds, so Enhanced-RTMP-v2
+// `TimestampOffsetNano` ModEx entries fold onto the same uniform
+// `Packet` timeline). Codec ids are auto-detected from the
 // publisher's first audio + video tags (h264, hevc, av1, vp9 in
 // Enhanced-RTMP-v1 FourCC mode; vp8, h264 (avc1), vvc added in
 // Enhanced-RTMP-v2 FourCC mode; h264, h263, vp6f / vp6a, flashsv /

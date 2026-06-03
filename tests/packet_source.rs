@@ -9,8 +9,8 @@
 //!     * the resulting `SourceOutput::Packets` carries audio +
 //!       video stream descriptors with the right codec ids;
 //!     * `next_packet()` produces the expected packets in order
-//!       with millisecond pts/dts and the keyframe + header flags
-//!       set on the right ones;
+//!       with nanosecond pts/dts (`ms * RTMP_MS_TO_NS`) and the
+//!       keyframe + header flags set on the right ones;
 //!     * the iterator terminates with [`oxideav_core::Error::Eof`]
 //!       once the publisher disconnects cleanly.
 //!
@@ -24,7 +24,9 @@ use std::thread;
 use std::time::Duration;
 
 use oxideav_core::{Error as CoreError, SourceOutput, SourceRegistry};
-use oxideav_rtmp::{register, RtmpClient, AUDIO_STREAM_INDEX, RTMP_TIME_BASE, VIDEO_STREAM_INDEX};
+use oxideav_rtmp::{
+    register, RtmpClient, AUDIO_STREAM_INDEX, RTMP_MS_TO_NS, RTMP_TIME_BASE, VIDEO_STREAM_INDEX,
+};
 
 /// Reserve an ephemeral port by binding a TcpListener and then
 /// dropping it. Race-prone in theory; in practice modern kernels
@@ -181,18 +183,20 @@ fn registry_open_rtmp_url_yields_packet_source_with_expected_packets() {
         video.len()
     );
 
+    // pts/dts are emitted on the nanosecond RTMP_TIME_BASE timeline;
+    // ms * RTMP_MS_TO_NS recovers the wire ms value.
     // Audio[0] = AAC sequence header (header flag set, pts/dts 0).
     assert_eq!(audio[0].pts, Some(0));
     assert_eq!(audio[0].dts, Some(0));
     assert!(audio[0].flags.header);
     // 1 byte AAC packet-type marker (0 = seq header) + 2 byte ASC.
     assert_eq!(audio[0].data, vec![0x00, 0x12, 0x10]);
-    // Audio[1] = raw AAC at pts 20.
-    assert_eq!(audio[1].pts, Some(20));
+    // Audio[1] = raw AAC at pts 20 ms.
+    assert_eq!(audio[1].pts, Some(20 * RTMP_MS_TO_NS));
     assert!(!audio[1].flags.header);
     assert_eq!(audio[1].data[0], 0x01); // raw marker
-                                        // Audio[2] = raw AAC at pts 43.
-    assert_eq!(audio[2].pts, Some(43));
+                                        // Audio[2] = raw AAC at pts 43 ms.
+    assert_eq!(audio[2].pts, Some(43 * RTMP_MS_TO_NS));
 
     // Video[0] = AVC sequence header (keyframe + header flags, pts/dts 0).
     assert_eq!(video[0].pts, Some(0));
@@ -206,13 +210,13 @@ fn registry_open_rtmp_url_yields_packet_source_with_expected_packets() {
     assert!(!video[1].flags.header);
     let nalu_k: Vec<u8> = (0..200).map(|i| i as u8).collect();
     assert_eq!(video[1].data, nalu_k);
-    // Video[2] = inter at pts 33.
-    assert_eq!(video[2].pts, Some(33));
+    // Video[2] = inter at pts 33 ms.
+    assert_eq!(video[2].pts, Some(33 * RTMP_MS_TO_NS));
     assert!(!video[2].flags.keyframe);
     let nalu_p: Vec<u8> = (0u32..120).map(|i| (i.wrapping_mul(3)) as u8).collect();
     assert_eq!(video[2].data, nalu_p);
-    // Video[3] = inter at pts 66.
-    assert_eq!(video[3].pts, Some(66));
+    // Video[3] = inter at pts 66 ms.
+    assert_eq!(video[3].pts, Some(66 * RTMP_MS_TO_NS));
     let nalu_q: Vec<u8> = (0u32..80)
         .map(|i| (i.wrapping_mul(7).wrapping_add(1)) as u8)
         .collect();

@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`RTMP_TIME_BASE` switched from 1/1000 (ms) to 1/1_000_000_000 (ns)
+  to fold `TimestampOffsetNano` onto the `Packet` timeline**
+  (`src/adapter.rs`, `tests/packet_source.rs`,
+  `tests/enhanced_rtmp_audio.rs`, `tests/enhanced_rtmp_video.rs`,
+  README, `src/lib.rs`). Resolves the r0.0.5 README follow-up
+  "folding that nanosecond offset into the millisecond `Packet`
+  timeline is a follow-up." `enhanced-rtmp-v2.pdf` §"ExVideoTagHeader"
+  / §"ExAudioTagHeader" assigns the `TimestampOffsetNano` ModEx
+  subtype (the only `ModExType` defined today) the duty of adjusting
+  the *presentation* time of the current media message without
+  altering the core RTMP timestamp; the spec explicitly carries a
+  `TODO: Integrate this nanosecond offset into timestamp management`
+  marker, which is what this commit closes on the consumer side.
+  `audio_to_packet(timestamp_ms, &AudioTag)` now emits
+  `pts == dts == timestamp_ms * RTMP_MS_TO_NS +
+  AudioTag::timestamp_offset_nano()` (audio has no separate decode
+  time, so both PTS and DTS receive the offset);
+  `video_to_packet(timestamp_ms, &VideoTag)` emits
+  `dts = timestamp_ms * RTMP_MS_TO_NS` (decode timestamp,
+  unmodified per spec) and
+  `pts = (timestamp_ms + composition_time) * RTMP_MS_TO_NS +
+  VideoTag::timestamp_offset_nano()` so legacy AVC composition-time
+  offsets in milliseconds and Enhanced-RTMP nanosecond presentation
+  offsets compose without precision loss. New public
+  `RTMP_MS_TO_NS = 1_000_000` constant exported alongside
+  `RTMP_TIME_BASE` so a consumer can recover the wire ms value
+  (`pts / RTMP_MS_TO_NS`) when it needs the legacy unit.
+  Multiple `TimestampOffsetNano` ModEx entries are summed via the
+  existing `VideoTag::timestamp_offset_nano` /
+  `AudioTag::timestamp_offset_nano` accessors (one
+  `bytesToUI24` per entry); ModEx entries of other subtypes do not
+  feed the sum, matching the typed accessor contract. The
+  `StreamInfo::time_base` exposed by `RtmpPacketSource` follows
+  `RTMP_TIME_BASE` so a downstream `PacketSource` consumer (e.g.
+  `oxideav-cli`'s pipeline executor) reads a single uniform
+  nanosecond clock from the registry. 5 new lib unit tests in
+  `src/adapter.rs::tests` (`audio_timestamp_offset_nano_folds_into_
+  presentation_time`, `video_timestamp_offset_nano_folds_into_
+  pts_only`, `video_timestamp_offset_nano_stacks_on_cts_and_
+  dts_unchanged`, `video_timestamp_offset_nano_sums_multiple_
+  modex_entries`, `time_base_is_nanoseconds`) cover: a single
+  750_000-ns audio offset stacking on both PTS and DTS; a
+  123_456-ns video offset reaching PTS only; a HEVC × CodedFrames
+  CTS (17 ms) + 500_000-ns offset composing on PTS without
+  perturbing DTS; a multi-entry ModEx chain with an interleaved
+  unknown ModExType correctly summing only the
+  `TimestampOffsetNano` contributions (200_000 + 300_000); and the
+  `RTMP_TIME_BASE == 1/1_000_000_000` + `RTMP_MS_TO_NS == 1_000_000`
+  invariants. Existing tests that previously asserted ms-valued
+  PTS/DTS were rewritten to multiply by `RTMP_MS_TO_NS`; the ModEx
+  integration test in `tests/enhanced_rtmp_video.rs` now asserts the
+  nano fold reaches PTS only on the recovered HEVC CodedFrames.
+  Total lib tests: 212 → 217 (+5).
+
 ### Added
 
 - **Aggregate Message (type 22) parser + builder** (`src/aggregate.rs`,

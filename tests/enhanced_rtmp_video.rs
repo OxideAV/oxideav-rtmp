@@ -14,7 +14,7 @@ use oxideav_rtmp::flv::{
     EX_PACKET_TYPE_METADATA, EX_PACKET_TYPE_SEQUENCE_START, FOURCC_AV1, FOURCC_AVC, FOURCC_HEVC,
     FOURCC_VP8, FOURCC_VP9, FOURCC_VVC, VIDEO_FRAME_INTER, VIDEO_FRAME_KEYFRAME,
 };
-use oxideav_rtmp::{video_codec_id_for_tag, video_fourcc_codec_id, video_to_packet};
+use oxideav_rtmp::{video_codec_id_for_tag, video_fourcc_codec_id, video_to_packet, RTMP_MS_TO_NS};
 
 /// The exact byte sequence Enhanced RTMP §"Defining Additional
 /// Video Codecs" Table 4 specifies for a HEVC keyframe with a CTS
@@ -37,8 +37,9 @@ fn hevc_keyframe_wire_bytes_round_trip_to_packet() {
     assert_eq!(tag.body, b"\x00\x00\x00\x05hello".to_vec());
 
     let pkt = video_to_packet(1000, &tag);
-    assert_eq!(pkt.dts, Some(1000));
-    assert_eq!(pkt.pts, Some(1000));
+    // RTMP_TIME_BASE is 1/1_000_000_000 — wire ms times RTMP_MS_TO_NS.
+    assert_eq!(pkt.dts, Some(1000 * RTMP_MS_TO_NS));
+    assert_eq!(pkt.pts, Some(1000 * RTMP_MS_TO_NS));
     assert!(pkt.flags.keyframe);
     assert!(!pkt.flags.header);
     assert_eq!(video_codec_id_for_tag(&tag).as_str(), "hevc");
@@ -60,8 +61,8 @@ fn hevc_negative_cts_wire_value_recovers_signed_offset() {
     assert_eq!(tag.composition_time, -48);
 
     let pkt = video_to_packet(500, &tag);
-    assert_eq!(pkt.dts, Some(500));
-    assert_eq!(pkt.pts, Some(452));
+    assert_eq!(pkt.dts, Some(500 * RTMP_MS_TO_NS));
+    assert_eq!(pkt.pts, Some(452 * RTMP_MS_TO_NS));
     assert!(!pkt.flags.keyframe);
 }
 
@@ -286,8 +287,8 @@ fn avc_fourcc_keyframe_wire_bytes_round_trip_to_packet() {
     assert_eq!(tag.body, b"\x00\x00\x00\x05hello".to_vec());
 
     let pkt = video_to_packet(2000, &tag);
-    assert_eq!(pkt.dts, Some(2000));
-    assert_eq!(pkt.pts, Some(2016));
+    assert_eq!(pkt.dts, Some(2000 * RTMP_MS_TO_NS));
+    assert_eq!(pkt.pts, Some(2016 * RTMP_MS_TO_NS));
     assert!(pkt.flags.keyframe);
     assert!(!pkt.flags.header);
     assert_eq!(video_codec_id_for_tag(&tag).as_str(), "h264");
@@ -328,8 +329,8 @@ fn vvc_negative_cts_wire_value_recovers_signed_offset() {
     let tag = parse_video(&payload).expect("parse");
     assert_eq!(tag.composition_time, -48);
     let pkt = video_to_packet(500, &tag);
-    assert_eq!(pkt.dts, Some(500));
-    assert_eq!(pkt.pts, Some(452));
+    assert_eq!(pkt.dts, Some(500 * RTMP_MS_TO_NS));
+    assert_eq!(pkt.pts, Some(452 * RTMP_MS_TO_NS));
     assert!(!pkt.flags.keyframe);
 }
 
@@ -379,11 +380,15 @@ fn video_fourcc_codec_id_maps_v1_and_v2_set_and_falls_back() {
 
 /// A ModEx-prefixed wire payload (Enhanced RTMP v2 §"ExVideoTagHeader")
 /// must decode the prelude chain, recover the real PacketType from the
-/// chain's terminating nibble, and resolve to the correct CodecId plus
-/// packet timing — i.e. the ModEx signal is transparent to the
-/// downstream consumer. Before ModEx support the header's low nibble of
-/// 7 would have been mis-read as an unknown PacketType and the four
-/// chain bytes mistaken for the FourCC.
+/// chain's terminating nibble, and resolve to the correct CodecId. The
+/// ModEx signal is transparent at the FourCC / PacketType layer, and
+/// the `TimestampOffsetNano` payload folds onto the packet's *presentation*
+/// time (PTS) without altering the core RTMP decode timestamp (DTS), per
+/// `enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" (nanosecond offset adjusts
+/// presentation time without altering the core RTMP timestamp).
+/// Before ModEx support the header's low nibble of 7 would have been
+/// mis-read as an unknown PacketType and the four chain bytes mistaken
+/// for the FourCC.
 #[test]
 fn mod_ex_prefixed_hevc_coded_frames_resolves_through_adapter() {
     // byte0 = IsExHeader|FrameType=2(inter)|PacketType=7(ModEx) = 0xA7
@@ -402,12 +407,12 @@ fn mod_ex_prefixed_hevc_coded_frames_resolves_through_adapter() {
     assert_eq!(tag.mod_ex.len(), 1);
     assert_eq!(tag.timestamp_offset_nano(), 750_000);
 
-    // The adapter routes by the recovered real PacketType, so the
-    // ModEx signal is transparent: same CodecId + flags as a plain
-    // HEVC CodedFrames tag.
+    // The adapter routes by the recovered real PacketType (same
+    // CodecId + flags as a plain HEVC CodedFrames tag), and folds the
+    // 750_000 ns offset onto PTS only — DTS stays on the raw ms grid.
     let pkt = video_to_packet(2000, &tag);
-    assert_eq!(pkt.dts, Some(2000));
-    assert_eq!(pkt.pts, Some(2000));
+    assert_eq!(pkt.dts, Some(2000 * RTMP_MS_TO_NS));
+    assert_eq!(pkt.pts, Some(2000 * RTMP_MS_TO_NS + 750_000));
     assert!(!pkt.flags.keyframe);
     assert_eq!(video_codec_id_for_tag(&tag).as_str(), "hevc");
 

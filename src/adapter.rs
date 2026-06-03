@@ -25,8 +25,12 @@
 //!
 //! # Stream layout
 //!
-//! Always exactly two streams, both opened with TimeBase 1/1000
-//! (RTMP timestamps are millisecond-relative):
+//! Always exactly two streams, both opened with TimeBase
+//! 1/1_000_000_000 (nanoseconds). RTMP chunks carry a millisecond
+//! `timestamp` and Enhanced-RTMP-v2 ModEx `TimestampOffsetNano`
+//! entries add sub-millisecond precision; the adapter folds both
+//! into the same nanosecond-resolution timeline so a downstream
+//! consumer reads a single uniform clock:
 //!
 //! * **Stream 0 — audio.** Codec id derived lazily from the first
 //!   audio tag the publisher sends (`aac` for AAC, `mp3` for MP3,
@@ -46,12 +50,27 @@
 //! # Timestamps
 //!
 //! RTMP carries a single 32-bit `timestamp` per chunk, expressed
-//! in milliseconds. For audio it maps directly to `pts == dts ==
-//! timestamp`. For AVC video it represents the *decode* timestamp;
-//! the FLV `composition_time` (signed 24-bit ms) is the CTS
-//! offset, so we emit `dts = timestamp` and `pts = timestamp +
-//! composition_time`. For other video codecs `composition_time`
-//! is always 0 and `pts == dts`.
+//! in milliseconds. Enhanced RTMP v2 lets a sender prepend a
+//! `TimestampOffsetNano` ModEx entry (`enhanced-rtmp-v2.pdf`
+//! §"ExVideoTagHeader" / §"ExAudioTagHeader") carrying a 0..=999_999
+//! ns offset to be added to the *presentation* time of the current
+//! media message **without altering the core RTMP timestamp**. The
+//! adapter folds these per-message offsets into the nanosecond
+//! [`Packet`] timeline:
+//!
+//! * Audio — `pts = dts = timestamp_ms * 1_000_000 + nano_offset`.
+//! * Video AVC / NALU-FourCC — `dts = timestamp_ms * 1_000_000`
+//!   (decode time, unmodified per spec); `pts = (timestamp_ms +
+//!   composition_time_ms) * 1_000_000 + nano_offset`. The
+//!   composition-time offset stays in milliseconds because that is
+//!   the wire field; the nanosecond modifier rides on top.
+//! * Non-NALU video without CTS — `pts == dts == timestamp_ms *
+//!   1_000_000 + nano_offset`.
+//!
+//! Multiple `TimestampOffsetNano` entries on the same tag are
+//! summed via [`VideoTag::timestamp_offset_nano`] /
+//! [`AudioTag::timestamp_offset_nano`] before folding, matching
+//! the per-tag accessor on those types.
 //!
 //! # Metadata variants
 //!
@@ -85,9 +104,20 @@ use crate::server::{RtmpServer, RtmpSession, StreamPacket};
 pub const AUDIO_STREAM_INDEX: u32 = 0;
 /// Stream index for the video output of an [`RtmpPacketSource`].
 pub const VIDEO_STREAM_INDEX: u32 = 1;
-/// Time base used for both streams: 1/1000 (milliseconds), the
-/// native unit of RTMP chunk timestamps.
-pub const RTMP_TIME_BASE: TimeBase = TimeBase::new(1, 1000);
+/// Time base used for both streams: 1/1_000_000_000 (nanoseconds).
+///
+/// RTMP chunks carry a 32-bit millisecond `timestamp` while
+/// Enhanced RTMP v2 ModEx `TimestampOffsetNano` entries add
+/// 0..=999_999 ns of sub-millisecond precision. A nanosecond
+/// timeline lets [`audio_to_packet`] / [`video_to_packet`] fold
+/// both into a single uniform `Packet::pts` / `Packet::dts`
+/// without losing precision (per `enhanced-rtmp-v2.pdf`
+/// §"ExVideoTagHeader" / §"ExAudioTagHeader").
+pub const RTMP_TIME_BASE: TimeBase = TimeBase::new(1, 1_000_000_000);
+
+/// Multiplier converting an RTMP millisecond timestamp into the
+/// nanosecond [`RTMP_TIME_BASE`] timeline.
+pub const RTMP_MS_TO_NS: i64 = 1_000_000;
 
 /// Maximum number of packets to buffer during stream-codec probing
 /// before giving up and returning whatever we have.
@@ -343,8 +373,17 @@ impl PacketSource for RtmpPacketSource {
 /// tags carry `flags.header = true`; `PacketTypeSequenceEnd`
 /// surfaces as an empty `data` with the `header` flag set so a
 /// consumer can route it to an end-of-stream signal.
+///
+/// `pts` and `dts` are emitted on the nanosecond [`RTMP_TIME_BASE`]
+/// timeline: `timestamp_ms * 1_000_000`, plus any
+/// `TimestampOffsetNano` ModEx contributions reported by
+/// [`AudioTag::timestamp_offset_nano`] folded onto the presentation
+/// time (audio has no separate decode time, so both `pts` and `dts`
+/// receive the offset).
 pub fn audio_to_packet(timestamp_ms: u32, tag: &AudioTag) -> Packet {
-    let ts = timestamp_ms as i64;
+    let ts_ns = (timestamp_ms as i64) * RTMP_MS_TO_NS;
+    let nano_offset = tag.timestamp_offset_nano() as i64;
+    let presentation_ns = ts_ns + nano_offset;
     let (data, is_header) = if tag.audio_fourcc.is_some() {
         // Enhanced RTMP v2: body is the codec's data verbatim
         // (per `ExAudioTagBody`). No AAC marker — that's a legacy
@@ -373,8 +412,8 @@ pub fn audio_to_packet(timestamp_ms: u32, tag: &AudioTag) -> Packet {
     Packet {
         stream_index: AUDIO_STREAM_INDEX,
         time_base: RTMP_TIME_BASE,
-        pts: Some(ts),
-        dts: Some(ts),
+        pts: Some(presentation_ns),
+        dts: Some(presentation_ns),
         duration: None,
         flags,
         data,
@@ -389,8 +428,18 @@ pub fn audio_to_packet(timestamp_ms: u32, tag: &AudioTag) -> Packet {
 /// stripped from `data`. Non-AVC video keeps its body as-is.
 /// The keyframe flag is propagated from the FLV frame-type
 /// nibble; sequence-header packets are flagged `header`.
+///
+/// `pts` and `dts` are emitted on the nanosecond
+/// [`RTMP_TIME_BASE`] timeline. The core RTMP millisecond
+/// `timestamp` is preserved verbatim as `dts =
+/// timestamp_ms * 1_000_000`; the per-message
+/// `TimestampOffsetNano` ModEx sum reported by
+/// [`VideoTag::timestamp_offset_nano`] is added to `pts` only —
+/// per `enhanced-rtmp-v2.pdf` the nanosecond offset adjusts the
+/// *presentation* time of the current media message without
+/// altering the core (decode) timestamp.
 pub fn video_to_packet(timestamp_ms: u32, tag: &VideoTag) -> Packet {
-    let dts = timestamp_ms as i64;
+    let dts_ns = (timestamp_ms as i64) * RTMP_MS_TO_NS;
     // CTS lives in two places on the wire — AVC's 3-byte
     // SI24 (legacy), and the three NALU-based Enhanced-RTMP
     // FourCC variants paired with `CodedFrames`: HEVC (v1),
@@ -402,11 +451,17 @@ pub fn video_to_packet(timestamp_ms: u32, tag: &VideoTag) -> Packet {
     // implied to equal zero" — equivalent to "no offset").
     let has_cts =
         tag.codec_id == VIDEO_CODEC_AVC || (tag.fourcc.is_some() && tag.composition_time != 0);
-    let pts = if has_cts {
-        dts + tag.composition_time as i64
+    let cts_ns = if has_cts {
+        (tag.composition_time as i64) * RTMP_MS_TO_NS
     } else {
-        dts
+        0
     };
+    // ModEx `TimestampOffsetNano` (sub-millisecond, 0..=999_999 ns
+    // per spec but the typed accessor returns up to ~16 M as the
+    // raw bytesToUI24 sum across multiple entries) folds onto the
+    // presentation time only.
+    let nano_offset = tag.timestamp_offset_nano() as i64;
+    let pts_ns = dts_ns + cts_ns + nano_offset;
     // `header` is set for *both* legacy AVC sequence headers and
     // Enhanced-RTMP `PacketTypeSequenceStart` tags — downstream
     // consumers can stash the body as `CodecParameters.extradata`
@@ -427,8 +482,8 @@ pub fn video_to_packet(timestamp_ms: u32, tag: &VideoTag) -> Packet {
     Packet {
         stream_index: VIDEO_STREAM_INDEX,
         time_base: RTMP_TIME_BASE,
-        pts: Some(pts),
-        dts: Some(dts),
+        pts: Some(pts_ns),
+        dts: Some(dts_ns),
         duration: None,
         flags,
         data: tag.body.clone(),
@@ -822,8 +877,9 @@ mod tests {
             multitrack: None,
         };
         let pkt = audio_to_packet(123, &tag);
-        assert_eq!(pkt.pts, Some(123));
-        assert_eq!(pkt.dts, Some(123));
+        // 123 ms → 123_000_000 ns on the RTMP_TIME_BASE timeline.
+        assert_eq!(pkt.pts, Some(123 * RTMP_MS_TO_NS));
+        assert_eq!(pkt.dts, Some(123 * RTMP_MS_TO_NS));
         assert!(!pkt.flags.header);
         assert_eq!(pkt.data, vec![0x01, 0xAB, 0xCD, 0xEF]);
     }
@@ -846,7 +902,7 @@ mod tests {
         let pkt = audio_to_packet(40, &tag);
         // No AAC marker prepended for non-AAC.
         assert_eq!(pkt.data, vec![0xFF, 0xFB, 0x90, 0x00]);
-        assert_eq!(pkt.pts, Some(40));
+        assert_eq!(pkt.pts, Some(40 * RTMP_MS_TO_NS));
     }
 
     // ------- Enhanced RTMP v2 audio dispatch into Packet -------
@@ -943,8 +999,8 @@ mod tests {
         };
         let pkt = audio_to_packet(200, &tag);
         assert!(!pkt.flags.header);
-        assert_eq!(pkt.dts, Some(200));
-        assert_eq!(pkt.pts, Some(200));
+        assert_eq!(pkt.dts, Some(200 * RTMP_MS_TO_NS));
+        assert_eq!(pkt.pts, Some(200 * RTMP_MS_TO_NS));
         // Raw AC-3 frame bytes — no marker, no header.
         assert_eq!(pkt.data, vec![0x0B, 0x77, 0xAB, 0xCD, 0xEF]);
     }
@@ -970,7 +1026,7 @@ mod tests {
         // frame.
         assert!(pkt.flags.header);
         assert!(pkt.data.is_empty());
-        assert_eq!(pkt.dts, Some(999));
+        assert_eq!(pkt.dts, Some(999 * RTMP_MS_TO_NS));
     }
 
     #[test]
@@ -1040,8 +1096,8 @@ mod tests {
         assert_eq!(pkt.stream_index, VIDEO_STREAM_INDEX);
         assert!(pkt.flags.keyframe);
         assert!(!pkt.flags.header);
-        assert_eq!(pkt.pts, Some(33));
-        assert_eq!(pkt.dts, Some(33));
+        assert_eq!(pkt.pts, Some(33 * RTMP_MS_TO_NS));
+        assert_eq!(pkt.dts, Some(33 * RTMP_MS_TO_NS));
         assert_eq!(pkt.data, b"\x00\x00\x00\x05hello".to_vec());
     }
 
@@ -1061,8 +1117,8 @@ mod tests {
         };
         let pkt = video_to_packet(100, &tag);
         assert!(!pkt.flags.keyframe);
-        assert_eq!(pkt.dts, Some(100));
-        assert_eq!(pkt.pts, Some(90));
+        assert_eq!(pkt.dts, Some(100 * RTMP_MS_TO_NS));
+        assert_eq!(pkt.pts, Some(90 * RTMP_MS_TO_NS));
     }
 
     #[test]
@@ -1165,6 +1221,7 @@ mod tests {
         assert!(pkt.flags.keyframe);
         assert_eq!(pkt.dts, Some(0));
         assert_eq!(pkt.pts, Some(0));
+        assert_eq!(pkt.time_base, RTMP_TIME_BASE);
         assert_eq!(pkt.data, b"\x01hvcc-stub".to_vec());
     }
 
@@ -1187,8 +1244,8 @@ mod tests {
         let pkt = video_to_packet(200, &tag);
         assert!(!pkt.flags.keyframe);
         assert!(!pkt.flags.header);
-        assert_eq!(pkt.dts, Some(200));
-        assert_eq!(pkt.pts, Some(217));
+        assert_eq!(pkt.dts, Some(200 * RTMP_MS_TO_NS));
+        assert_eq!(pkt.pts, Some(217 * RTMP_MS_TO_NS));
     }
 
     #[test]
@@ -1210,7 +1267,7 @@ mod tests {
         assert!(pkt.flags.keyframe);
         assert!(!pkt.flags.header);
         assert_eq!(pkt.dts, pkt.pts);
-        assert_eq!(pkt.dts, Some(500));
+        assert_eq!(pkt.dts, Some(500 * RTMP_MS_TO_NS));
     }
 
     #[test]
@@ -1235,6 +1292,123 @@ mod tests {
         assert!(!pkt.flags.keyframe);
         assert!(pkt.flags.header);
         assert_eq!(pkt.data, b"amf-payload".to_vec());
+    }
+
+    // ------- TimestampOffsetNano fold into the ns Packet timeline -------
+
+    #[test]
+    fn audio_timestamp_offset_nano_folds_into_presentation_time() {
+        // `enhanced-rtmp-v2.pdf` §"ExAudioTagHeader" defines a
+        // `TimestampOffsetNano` ModEx subtype carrying a 0..=999_999
+        // ns offset added to the *presentation* time of the current
+        // media message without altering the core RTMP timestamp.
+        // For audio pts == dts (no separate decode time) so the
+        // offset rides on both.
+        let tag = AudioTag {
+            mod_ex: vec![crate::flv::ModEx::timestamp_offset_nano_entry(750_000)],
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(flv::AUDIO_PACKET_TYPE_CODED_FRAMES),
+            audio_fourcc: Some(flv::FOURCC_OPUS),
+            body: vec![0x12, 0x34, 0x56],
+
+            multitrack: None,
+        };
+        let pkt = audio_to_packet(40, &tag);
+        // 40 ms * 1e6 ns/ms + 750_000 ns = 40_750_000 ns.
+        assert_eq!(pkt.pts, Some(40_750_000));
+        assert_eq!(pkt.dts, Some(40_750_000));
+        assert_eq!(pkt.time_base, RTMP_TIME_BASE);
+    }
+
+    #[test]
+    fn video_timestamp_offset_nano_folds_into_pts_only() {
+        // Per spec the nanosecond offset adjusts the presentation
+        // time; for video that's PTS. DTS (core decode timestamp)
+        // is preserved as the raw ms value scaled to ns.
+        let tag = VideoTag {
+            mod_ex: vec![crate::flv::ModEx::timestamp_offset_nano_entry(123_456)],
+            frame_type: VIDEO_FRAME_INTER,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: b"\x00\x00\x00\x04NALU".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+            fourcc: Some(FOURCC_AV1),
+
+            multitrack: None,
+        };
+        let pkt = video_to_packet(60, &tag);
+        // DTS stays on the raw ms grid (in ns units) — 60 ms = 60_000_000 ns.
+        assert_eq!(pkt.dts, Some(60_000_000));
+        // PTS = DTS + nano_offset (AV1 carries no CTS).
+        assert_eq!(pkt.pts, Some(60_123_456));
+        assert_eq!(pkt.time_base, RTMP_TIME_BASE);
+    }
+
+    #[test]
+    fn video_timestamp_offset_nano_stacks_on_cts_and_dts_unchanged() {
+        // HEVC × CodedFrames pair carries CTS on the wire — make
+        // sure the ns offset stacks on top of (CTS * 1e6) without
+        // perturbing DTS.
+        let tag = VideoTag {
+            mod_ex: vec![crate::flv::ModEx::timestamp_offset_nano_entry(500_000)],
+            frame_type: VIDEO_FRAME_INTER,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 17,
+            body: b"\x00\x00\x00\x04NALU".to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+            fourcc: Some(FOURCC_HEVC),
+
+            multitrack: None,
+        };
+        let pkt = video_to_packet(200, &tag);
+        // DTS = 200 ms * 1e6 ns/ms — no offset.
+        assert_eq!(pkt.dts, Some(200_000_000));
+        // PTS = (200 + 17) ms * 1e6 + 500_000 ns = 217_500_000 ns.
+        assert_eq!(pkt.pts, Some(217_500_000));
+    }
+
+    #[test]
+    fn video_timestamp_offset_nano_sums_multiple_modex_entries() {
+        // The accessor sums every `TimestampOffsetNano` entry in
+        // the chain. A non-`TimestampOffsetNano` entry in the middle
+        // does not perturb the sum.
+        let tag = VideoTag {
+            mod_ex: vec![
+                crate::flv::ModEx::timestamp_offset_nano_entry(200_000),
+                // Unknown / reserved ModEx type — must not feed the sum.
+                crate::flv::ModEx {
+                    mod_ex_type: 0x0F,
+                    data: vec![0xAA, 0xBB, 0xCC],
+                },
+                crate::flv::ModEx::timestamp_offset_nano_entry(300_000),
+            ],
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: vec![0x0A],
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+            fourcc: Some(FOURCC_VP9),
+
+            multitrack: None,
+        };
+        let pkt = video_to_packet(10, &tag);
+        // 10 ms * 1e6 + (200_000 + 300_000) ns = 10_500_000 ns.
+        assert_eq!(pkt.pts, Some(10_500_000));
+        assert_eq!(pkt.dts, Some(10_000_000));
+    }
+
+    #[test]
+    fn time_base_is_nanoseconds() {
+        // The whole RTMP adapter timeline is 1/1_000_000_000.
+        assert_eq!(RTMP_TIME_BASE, TimeBase::new(1, 1_000_000_000));
+        assert_eq!(RTMP_MS_TO_NS, 1_000_000);
     }
 
     #[test]

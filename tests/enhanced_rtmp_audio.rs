@@ -11,7 +11,7 @@ use oxideav_rtmp::flv::{
     AUDIO_PACKET_TYPE_SEQUENCE_END, AUDIO_PACKET_TYPE_SEQUENCE_START, FOURCC_AC3, FOURCC_EAC3,
     FOURCC_FLAC, FOURCC_MP3, FOURCC_OPUS,
 };
-use oxideav_rtmp::{audio_codec_id_for_tag, audio_to_packet};
+use oxideav_rtmp::{audio_codec_id_for_tag, audio_to_packet, RTMP_MS_TO_NS};
 
 /// Exact wire bytes for an Opus `SequenceStart` per
 /// `enhanced-rtmp-v2.pdf` §"ExAudioTagBody":
@@ -70,8 +70,9 @@ fn ac3_coded_frames_wire_bytes_recover_raw_frame_body() {
     assert_eq!(tag.body, vec![0x0B, 0x77, 0x12, 0x34, 0x56, 0x78]);
 
     let pkt = audio_to_packet(42, &tag);
-    assert_eq!(pkt.dts, Some(42));
-    assert_eq!(pkt.pts, Some(42));
+    // RTMP_TIME_BASE is 1/1_000_000_000 — wire ms times RTMP_MS_TO_NS.
+    assert_eq!(pkt.dts, Some(42 * RTMP_MS_TO_NS));
+    assert_eq!(pkt.pts, Some(42 * RTMP_MS_TO_NS));
     assert!(!pkt.flags.header);
     assert_eq!(pkt.data, tag.body);
     assert_eq!(audio_codec_id_for_tag(&tag).as_str(), "ac3");
@@ -156,7 +157,7 @@ fn mp3_fourcc_coded_frames_dispatches_to_mp3_codec_id() {
     assert_eq!(audio_codec_id_for_tag(&tag).as_str(), "mp3");
 
     let pkt = audio_to_packet(33, &tag);
-    assert_eq!(pkt.dts, Some(33));
+    assert_eq!(pkt.dts, Some(33 * RTMP_MS_TO_NS));
     assert_eq!(
         pkt.data,
         vec![0xFF, 0xFB, 0x90, 0x00, 0xAA, 0xBB, 0xCC, 0xDD]
@@ -183,7 +184,7 @@ fn sequence_end_wire_bytes_round_trip_with_empty_body() {
     let pkt = audio_to_packet(60_000, &tag);
     assert!(pkt.flags.header);
     assert!(pkt.data.is_empty());
-    assert_eq!(pkt.dts, Some(60_000));
+    assert_eq!(pkt.dts, Some(60_000 * RTMP_MS_TO_NS));
 }
 
 /// Build → parse idempotence across every (FourCC, PacketType) pair the
