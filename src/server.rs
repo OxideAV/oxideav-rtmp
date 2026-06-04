@@ -313,8 +313,20 @@ impl RtmpSession {
     /// when you want `next_packet` to return periodically so an outer
     /// shutdown signal can be observed. Passes through to
     /// [`TcpStream::set_read_timeout`].
-    pub fn set_read_timeout(&self, d: Option<Duration>) -> Result<()> {
-        self.stream.set_read_timeout(d)?;
+    ///
+    /// The timeout is applied to the chunk reader's actual socket
+    /// clone (the one [`next_packet`](Self::next_packet) reads
+    /// through) rather than the session's bookkeeping clone. On
+    /// Linux a sockopt set through one `try_clone` descriptor carries
+    /// to its sibling clones because they share one file description;
+    /// Windows assigns each clone its own kernel handle with
+    /// independent socket options, so the timeout must be installed
+    /// on the exact socket that will issue the `recv` call.
+    pub fn set_read_timeout(&mut self, d: Option<Duration>) -> Result<()> {
+        self.reader.inner_mut().set_read_timeout(d)?;
+        // Also apply to the bookkeeping clone for any future direct
+        // reads through `self.stream` (none today, but defensive).
+        let _ = self.stream.set_read_timeout(d);
         Ok(())
     }
 

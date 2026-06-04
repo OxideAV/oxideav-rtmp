@@ -698,6 +698,24 @@ impl RtmpClient {
     pub fn inner_mut(&mut self) -> &mut TcpStream {
         &mut self.stream
     }
+
+    /// Apply a `recv` timeout to the chunk reader's actual socket
+    /// clone (the one [`poll_event`](Self::poll_event) blocks on)
+    /// rather than the session's bookkeeping clone.
+    ///
+    /// On Linux a sockopt set through one `try_clone` descriptor
+    /// carries to its sibling clones because they share one file
+    /// description; on Windows each clone has its own kernel handle
+    /// with independent socket options, so the timeout has to be
+    /// installed on the exact socket the `recv` call will issue
+    /// against. Use this rather than
+    /// [`inner_mut`](Self::inner_mut)`.set_read_timeout(...)` when the
+    /// goal is to bound `poll_event`'s block time.
+    pub fn set_read_timeout(&mut self, d: Option<Duration>) -> Result<()> {
+        self.reader.inner_mut().set_read_timeout(d)?;
+        let _ = self.stream.set_read_timeout(d);
+        Ok(())
+    }
 }
 
 /// Consume messages from `reader` until we see a command named
