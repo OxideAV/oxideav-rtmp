@@ -21,11 +21,13 @@
 //! Single-client use — the typical oxideav case — just calls
 //! [`RtmpServer::accept`] directly.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::thread;
 use std::time::Duration;
 
+use crate::aggregate::parse_aggregate;
 use crate::amf::{self, Amf0Value};
 use crate::amf3;
 use crate::caps::ConnectCapabilities;
@@ -228,6 +230,7 @@ impl PublishRequest {
             peer_addr,
             stream_id,
             ended: false,
+            pending_subs: VecDeque::new(),
         })
     }
 
@@ -262,6 +265,17 @@ pub struct RtmpSession {
     peer_addr: SocketAddr,
     stream_id: u32,
     ended: bool,
+    /// Sub-messages decomposed out of an Aggregate Message (type 22)
+    /// per RTMP 1.0 §7.1.6 but not yet surfaced as a [`StreamPacket`].
+    /// When [`next_packet`](Self::next_packet) sees a `MSG_AGGREGATE`
+    /// on the wire, [`parse_aggregate`] splits the body into
+    /// FLV-shaped sub-messages (audio / video / data / command) with
+    /// the §7.1.6 timestamp re-normalisation already applied and the
+    /// `msg_stream_id` override resolved to the aggregate's; those
+    /// subs land here and the dispatch loop drains the queue ahead of
+    /// every subsequent wire read so the caller observes the
+    /// per-sub packets in the order the publisher packed them.
+    pending_subs: VecDeque<Message>,
 }
 
 /// One media-layer event reported to the caller.
@@ -347,8 +361,24 @@ impl RtmpSession {
     /// Read the next audio / video / metadata packet from the
     /// publisher. Returns `Ok(None)` when the peer cleanly closed the
     /// stream (via `closeStream` / `deleteStream` / `FCUnpublish`).
+    ///
+    /// Aggregate Messages (RTMP 1.0 §7.1.6, message type id `22`) are
+    /// decomposed transparently: the sub-messages enter an internal
+    /// queue and the dispatch loop drains them in publish order ahead
+    /// of any further wire read, so a publisher that bundles several
+    /// frames into one aggregate (fewer chunk headers on the wire)
+    /// surfaces the same per-frame `StreamPacket` sequence as a
+    /// publisher that sends them individually.
     pub fn next_packet(&mut self) -> Result<Option<StreamPacket>> {
         while !self.ended {
+            // Drain queued aggregate sub-messages ahead of any further
+            // wire read so the publisher's pack order is preserved.
+            if let Some(sub) = self.pending_subs.pop_front() {
+                if let Some(pkt) = self.handle_message(sub)? {
+                    return Ok(Some(pkt));
+                }
+                continue;
+            }
             let msg = match self.reader.read_message() {
                 Ok(m) => m,
                 Err(Error::Io(e))
@@ -361,83 +391,109 @@ impl RtmpSession {
                 }
                 Err(e) => return Err(e),
             };
-            match msg.msg_type_id {
-                MSG_AUDIO => {
-                    let tag = parse_audio(&msg.payload)?;
-                    return Ok(Some(StreamPacket::Audio {
-                        timestamp: msg.timestamp,
-                        tag,
-                    }));
-                }
-                MSG_VIDEO => {
-                    let tag = parse_video(&msg.payload)?;
-                    return Ok(Some(StreamPacket::Video {
-                        timestamp: msg.timestamp,
-                        tag,
-                    }));
-                }
-                MSG_DATA_AMF0 => {
-                    // @setDataFrame + onMetaData + <object>
-                    let values = amf::decode_all(&msg.payload)?;
-                    // Common shape: ["@setDataFrame", "onMetaData",
-                    // <meta>]. Some clients omit "@setDataFrame" and
-                    // just send ["onMetaData", <meta>]. Accept both.
-                    if let Some(m) = metadata_object(&values) {
-                        return Ok(Some(StreamPacket::Metadata(m)));
-                    }
-                }
-                MSG_DATA_AMF3 => {
-                    // AMF3-encoded data message (type 15). Per AMF3 §4.1
-                    // the body is an AMF0 frame switching to AMF3 via the
-                    // avmplus marker; decode it and bridge each value onto
-                    // the AMF0 shape so metadata flows through the same
-                    // path as MSG_DATA_AMF0.
-                    let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
-                        .iter()
-                        .map(amf3::Amf3Value::to_amf0)
-                        .collect();
-                    if let Some(m) = metadata_object(&values) {
-                        return Ok(Some(StreamPacket::Metadata(m)));
-                    }
-                }
-                MSG_COMMAND_AMF0 => {
-                    // Likely closeStream / deleteStream /
-                    // FCUnpublish — peer is shutting down.
-                    let values = amf::decode_all(&msg.payload)?;
-                    if let Some(name) = values.first().and_then(Amf0Value::as_str) {
-                        if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
-                            self.ended = true;
-                            return Ok(None);
-                        }
-                    }
-                }
-                MSG_COMMAND_AMF3 => {
-                    // AMF3-encoded command (type 17). Same teardown
-                    // detection as the AMF0 command path.
-                    let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
-                        .iter()
-                        .map(amf3::Amf3Value::to_amf0)
-                        .collect();
-                    if let Some(name) = values.first().and_then(Amf0Value::as_str) {
-                        if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
-                            self.ended = true;
-                            return Ok(None);
-                        }
-                    }
-                }
-                MSG_SET_CHUNK_SIZE => {
-                    let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
-                    self.reader.set_chunk_size(size as usize);
-                }
-                MSG_ACK | MSG_USER_CONTROL | MSG_WINDOW_ACK_SIZE | MSG_SET_PEER_BANDWIDTH => {
-                    // Informational — silently accept.
-                }
-                _ => {
-                    // Unknown / unhandled — swallow and keep going.
-                }
+            if let Some(pkt) = self.handle_message(msg)? {
+                return Ok(Some(pkt));
             }
         }
         Ok(None)
+    }
+
+    /// Per-message dispatch shared between the wire path and the
+    /// aggregate-sub-drain path. Returns `Ok(Some(packet))` if the
+    /// message produced a user-visible event, `Ok(None)` if it was
+    /// consumed silently (protocol control, command teardown setting
+    /// `self.ended`, etc.) and the loop should keep reading.
+    fn handle_message(&mut self, msg: Message) -> Result<Option<StreamPacket>> {
+        match msg.msg_type_id {
+            MSG_AUDIO => {
+                let tag = parse_audio(&msg.payload)?;
+                Ok(Some(StreamPacket::Audio {
+                    timestamp: msg.timestamp,
+                    tag,
+                }))
+            }
+            MSG_VIDEO => {
+                let tag = parse_video(&msg.payload)?;
+                Ok(Some(StreamPacket::Video {
+                    timestamp: msg.timestamp,
+                    tag,
+                }))
+            }
+            MSG_DATA_AMF0 => {
+                // @setDataFrame + onMetaData + <object>
+                let values = amf::decode_all(&msg.payload)?;
+                // Common shape: ["@setDataFrame", "onMetaData",
+                // <meta>]. Some clients omit "@setDataFrame" and
+                // just send ["onMetaData", <meta>]. Accept both.
+                Ok(metadata_object(&values).map(StreamPacket::Metadata))
+            }
+            MSG_DATA_AMF3 => {
+                // AMF3-encoded data message (type 15). Per AMF3 §4.1
+                // the body is an AMF0 frame switching to AMF3 via the
+                // avmplus marker; decode it and bridge each value onto
+                // the AMF0 shape so metadata flows through the same
+                // path as MSG_DATA_AMF0.
+                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
+                    .iter()
+                    .map(amf3::Amf3Value::to_amf0)
+                    .collect();
+                Ok(metadata_object(&values).map(StreamPacket::Metadata))
+            }
+            MSG_COMMAND_AMF0 => {
+                // Likely closeStream / deleteStream /
+                // FCUnpublish — peer is shutting down.
+                let values = amf::decode_all(&msg.payload)?;
+                if let Some(name) = values.first().and_then(Amf0Value::as_str) {
+                    if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
+                        self.ended = true;
+                    }
+                }
+                Ok(None)
+            }
+            MSG_COMMAND_AMF3 => {
+                // AMF3-encoded command (type 17). Same teardown
+                // detection as the AMF0 command path.
+                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
+                    .iter()
+                    .map(amf3::Amf3Value::to_amf0)
+                    .collect();
+                if let Some(name) = values.first().and_then(Amf0Value::as_str) {
+                    if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
+                        self.ended = true;
+                    }
+                }
+                Ok(None)
+            }
+            MSG_AGGREGATE => {
+                // RTMP 1.0 §7.1.6 Aggregate Message. Split into
+                // FLV-shaped sub-messages with the §7.1.6 timestamp
+                // re-normalisation applied and the message-stream-id
+                // override resolved; queue them so subsequent calls
+                // surface the per-sub packets in publish order. Sub
+                // ordering is preserved verbatim. A nested aggregate
+                // (sub `msg_type_id == 22`) is forwarded to the queue
+                // and the next dispatch tick recurses through the same
+                // `MSG_AGGREGATE` arm so a bounded depth of nesting
+                // resolves transparently; an unbounded chain would
+                // surface as repeated parser work, not stack growth.
+                let subs = parse_aggregate(&msg)?;
+                self.pending_subs.extend(subs);
+                Ok(None)
+            }
+            MSG_SET_CHUNK_SIZE => {
+                let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
+                self.reader.set_chunk_size(size as usize);
+                Ok(None)
+            }
+            MSG_ACK | MSG_USER_CONTROL | MSG_WINDOW_ACK_SIZE | MSG_SET_PEER_BANDWIDTH => {
+                // Informational — silently accept.
+                Ok(None)
+            }
+            _ => {
+                // Unknown / unhandled — swallow and keep going.
+                Ok(None)
+            }
+        }
     }
 }
 

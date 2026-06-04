@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Aggregate Message (type 22) dispatch through `RtmpSession::next_packet`
+  and `RtmpClient::poll_event`, plus `RtmpClient::send_aggregate`
+  outbound** (`src/server.rs`, `src/client.rs`,
+  `tests/aggregate_routing.rs`). Round 230 closes the matching consumer
+  side of the round-229 `aggregate` parser + builder. Previously a
+  publisher that bundled several frames into one Aggregate Message
+  (RTMP 1.0 §7.1.6, message type id `22` — fewer chunk headers per A/V
+  burst) had its body silently swallowed by the dispatch loop's `_ =>
+  swallow` fallback arm: the `parse_aggregate` entry point was reachable
+  only via a hand-written caller pulling raw `Message` values out of
+  [`chunk::ChunkReader`]. Server-side: `next_packet` now drains a new
+  per-session `pending_subs: VecDeque<Message>` queue ahead of every
+  wire read, and a fresh `MSG_AGGREGATE` arm decomposes incoming
+  aggregates into that queue using the same `aggregate::parse_aggregate`
+  the round-229 commit ships — the §7.1.6 timestamp re-normalisation
+  (`t_i + (aggregate.timestamp - t_0)`) and the spec's
+  "aggregate.msg_stream_id overrides sub.msg_stream_id" rule are both
+  applied transparently. Per-message dispatch logic factored out of the
+  giant `next_packet` body into a `handle_message(&mut self, Message) ->
+  Result<Option<StreamPacket>>` helper so wire-read subs and queued
+  subs share one code path. The five real-world sub-message types
+  (audio / video / data AMF0 / data AMF3 / command AMF0 / command
+  AMF3 — including the existing `closeStream` / `deleteStream` /
+  `FCUnpublish` teardown detection) all flow through the same arms as
+  individually-sent messages. A sub whose `msg_type_id` is itself `22`
+  (a forged or speculative nested aggregate; the spec doesn't model
+  this but a defensive parser must survive it) is forwarded back to
+  the queue and decomposed on the next dispatch tick, so a bounded
+  nesting depth resolves to bounded parser work rather than stack
+  growth. Client-side: `RtmpClient` carries the same
+  `pending_subs` queue and a refactored `poll_event` loops over both
+  the queue and the wire read so a server that ever bundled its
+  `onStatus` / `_result` / `UserControl` replies into an aggregate
+  surfaces the per-sub `ClientEvent`s in publish order. Queued subs
+  classified as `ClientEvent::Other` are dropped from the surface so a
+  caller pumping `poll_event` doesn't observe N back-to-back `Other`s.
+  New outbound helper `RtmpClient::send_aggregate(&[Message]) ->
+  Result<()>` is the symmetric publisher API on top of
+  `aggregate::build_aggregate`: every sub's `msg_stream_id` is
+  overridden to the active publish stream id per §7.1.6, the
+  aggregate is framed on `CSID_DATA` (6), and a zero-length slice is
+  a no-op. 4 new integration tests in `tests/aggregate_routing.rs`:
+  (1) a video + audio + onMetaData aggregate round-trips through real
+  loopback `RtmpClient::send_aggregate` →
+  `ChunkReader::read_message` → `parse_aggregate` →
+  `RtmpSession::next_packet` and surfaces three discrete
+  `StreamPacket`s in publish order; (2) a two-sub aggregate with a
+  23-ms gap confirms the §7.1.6 offset reaches the per-sub
+  `StreamPacket.timestamp` exactly (1000 → 1000, 1023 → 1023, no
+  drift); (3) an aggregate carrying a `closeStream` AMF0 command sub
+  drives the same teardown path the standalone command takes — the
+  server reports `Ok(None)` after the prior media sub instead of
+  spinning on the post-FIN socket; (4) the client-side `poll_event`
+  contract is exercised via a smoke check holding the dispatch
+  contract live as a tested public-API surface (the full server →
+  client aggregate flow is covered by `client_stream_eof.rs`
+  unchanged). Total lib tests: 217 (unchanged — the new work is
+  end-to-end via the integration harness, where queue draining
+  through real `TcpStream` state is the load-bearing surface).
+  Total integration tests: 73 → 77 (+4). Resolves the
+  `next_packet` / `poll_event` half of the RTMP 1.0 §7.1.6
+  "Aggregate Message body is not yet decomposed" gap (round 229 closed
+  the parser / builder half).
+
 ### Changed
 
 - **`RTMP_TIME_BASE` switched from 1/1000 (ms) to 1/1_000_000_000 (ns)

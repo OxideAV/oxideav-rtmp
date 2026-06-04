@@ -265,7 +265,18 @@ non-standard:
   `&[Message]` slice into an aggregate carrying the correct §E.3
   `PreviousTagSize` back-pointers — useful when a publisher wants to
   cut chunk-header overhead by bundling several frames into one
-  message before they hit `ChunkWriter::write_message`.
+  message before they hit `ChunkWriter::write_message`. **Routed
+  end-to-end:** `RtmpSession::next_packet` decomposes incoming
+  aggregates into a per-session queue and surfaces each sub as the
+  same `StreamPacket::{Audio,Video,Metadata}` the publisher would
+  have produced individually, including the spec's teardown-command
+  detection on aggregated `closeStream` / `deleteStream` /
+  `FCUnpublish` subs. `RtmpClient::poll_event` does the symmetric
+  decomposition for server-pushed aggregates, and
+  `RtmpClient::send_aggregate(&[Message])` is the outbound helper —
+  every sub's `msg_stream_id` is overridden to the active publish
+  stream id per §7.1.6, the aggregate is framed on `CSID_DATA`, and
+  an empty slice is a no-op.
 - `handshake::{client_handshake, server_handshake}`
 - `flv::{parse_video, build_video, parse_audio, build_audio, ModEx}`
 - `flv_file::{FlvWriter, FlvReader, FlvTag, FlvHeaderFlags,

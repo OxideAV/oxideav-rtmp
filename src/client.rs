@@ -15,10 +15,12 @@
 //! Callers with multiple NALUs per sample can concatenate them into
 //! one body — RTMP just forwards bytes on the video channel.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::aggregate::parse_aggregate;
 use crate::amf::{self, Amf0Value};
 use crate::amf3;
 use crate::caps::ConnectCapabilities;
@@ -108,6 +110,16 @@ pub struct RtmpClient {
     /// advertise any v1+v2 capabilities (the historical pre-2023
     /// shape). Inspect via [`server_capabilities`](Self::server_capabilities).
     server_caps: ConnectCapabilities,
+    /// Sub-messages decomposed out of a server-originated Aggregate
+    /// Message (type 22) per RTMP 1.0 §7.1.6 but not yet routed
+    /// through the [`poll_event`](Self::poll_event) classify path.
+    /// In publish mode a remote server rarely batches its replies
+    /// this way, but `poll_event` decomposes the aggregate
+    /// transparently so a publisher that opted into a server-side
+    /// aggregate digest (`@enableEnhancedRTMP`-style negotiation, or
+    /// a peer reflecting its own ack stream as an aggregate) still
+    /// sees the per-event classification.
+    pending_subs: VecDeque<Message>,
 }
 
 /// Parsed RTMP URL: `rtmp://host[:port]/app/stream_name`.
@@ -283,6 +295,7 @@ impl RtmpClient {
             next_tx: 10.0,
             read_eof: false,
             server_caps,
+            pending_subs: VecDeque::new(),
         })
     }
 
@@ -433,6 +446,53 @@ impl RtmpClient {
         Ok(())
     }
 
+    /// Send a batch of audio / video / data sub-messages as one
+    /// Aggregate Message (RTMP 1.0 §7.1.6, message type id 22).
+    ///
+    /// An aggregate trades one extra 11-byte sub-header per sub-message
+    /// (plus a 4-byte back-pointer) for the chunk-header overhead the
+    /// chunk writer would emit on each sub if it sent them
+    /// individually. For an active publish with several A/V messages
+    /// queued at the same timestamp this can cut the chunk-header
+    /// surface in half.
+    ///
+    /// `subs` carries pre-built FLV-shaped messages — typically AVC
+    /// video (type 9) and AAC audio (type 8) bodies the caller has
+    /// already framed via [`flv::build_video`] / [`flv::build_audio`].
+    /// Caller-supplied `msg_stream_id` fields are overridden to this
+    /// client's publish stream id per §7.1.6 ("the message stream ID
+    /// of the aggregate message overrides the message stream IDs of
+    /// the sub-messages"). The aggregate's own wire timestamp is set
+    /// to the first sub's timestamp so the §7.1.6 re-normalisation
+    /// offset is zero on the wire.
+    ///
+    /// Returns the same errors as
+    /// [`build_aggregate`](crate::aggregate::build_aggregate) plus any
+    /// I/O error from the underlying chunk writer. An empty `subs`
+    /// slice is a no-op.
+    pub fn send_aggregate(&mut self, subs: &[Message]) -> Result<()> {
+        if subs.is_empty() {
+            return Ok(());
+        }
+        // Override every sub's msg_stream_id to ours so the §7.1.6
+        // override invariant holds without surprising the caller.
+        let normalized: Vec<Message> = subs
+            .iter()
+            .map(|s| Message {
+                msg_type_id: s.msg_type_id,
+                msg_stream_id: self.stream_id,
+                timestamp: s.timestamp,
+                payload: s.payload.clone(),
+            })
+            .collect();
+        let agg = crate::aggregate::build_aggregate(self.stream_id, &normalized)?;
+        // CSID_DATA (6) is the natural data-channel id — aggregates
+        // aren't a protocol-control event.
+        self.writer.write_message(CSID_DATA, &agg)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Poll for one server-originated event.
     ///
     /// Reads up to one inbound RTMP message from the server, applies
@@ -463,31 +523,65 @@ impl RtmpClient {
     /// other work between polls — the underlying TCP read deadline is
     /// the timeout granularity, not a poll interval.
     pub fn poll_event(&mut self) -> Result<Option<ClientEvent>> {
-        if self.read_eof {
-            return Ok(None);
+        loop {
+            if self.read_eof {
+                return Ok(None);
+            }
+            // Drain any sub-messages decomposed from a prior
+            // server-originated Aggregate Message (RTMP 1.0 §7.1.6)
+            // ahead of any further wire read so the publish order is
+            // preserved.
+            if let Some(sub) = self.pending_subs.pop_front() {
+                let ev = self.classify_message(sub)?;
+                if matches!(ev, ClientEvent::Other) {
+                    // Don't return `Other` for a queued sub — the caller
+                    // typically pumps `poll_event` to observe semantic
+                    // events; an aggregate full of `Other` would
+                    // otherwise return N `Other`s in a row.
+                    continue;
+                }
+                return Ok(Some(ev));
+            }
+            let msg = match self.reader.read_message() {
+                Ok(m) => m,
+                Err(Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    self.read_eof = true;
+                    return Ok(None);
+                }
+                Err(Error::UnexpectedEof) => {
+                    self.read_eof = true;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+            if msg.msg_type_id == MSG_AGGREGATE {
+                // RTMP 1.0 §7.1.6 Aggregate Message. Decompose into
+                // FLV-shaped sub-messages with the §7.1.6 timestamp
+                // re-normalisation applied and the message-stream-id
+                // override resolved; queue them so subsequent calls
+                // surface the per-sub events in publish order. Don't
+                // return on the aggregate itself — drain the queue.
+                let subs = parse_aggregate(&msg)?;
+                self.pending_subs.extend(subs);
+                continue;
+            }
+            return Ok(Some(self.classify_message(msg)?));
         }
-        let msg = match self.reader.read_message() {
-            Ok(m) => m,
-            Err(Error::Io(e))
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                self.read_eof = true;
-                return Ok(None);
-            }
-            Err(Error::UnexpectedEof) => {
-                self.read_eof = true;
-                return Ok(None);
-            }
-            Err(e) => return Err(e),
-        };
+    }
+
+    /// Per-message classification shared between the wire-read path
+    /// and the aggregate-sub-drain path.
+    fn classify_message(&mut self, msg: Message) -> Result<ClientEvent> {
         match msg.msg_type_id {
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 self.reader.set_chunk_size(size as usize);
-                Ok(Some(ClientEvent::Other))
+                Ok(ClientEvent::Other)
             }
             MSG_ACK | MSG_WINDOW_ACK_SIZE | MSG_SET_PEER_BANDWIDTH => {
                 // Informational. Spec mandates an ack reply once we
@@ -495,14 +589,14 @@ impl RtmpClient {
                 // client of typical bitrate we leave that as a future
                 // refinement — the server's own ack window resets per
                 // session.
-                Ok(Some(ClientEvent::Other))
+                Ok(ClientEvent::Other)
             }
             MSG_USER_CONTROL => {
                 let (event_type, event_data) = parse_user_control(&msg.payload)?;
                 match event_type {
                     USR_STREAM_BEGIN => {
                         let sid = ucm_stream_id(event_data)?;
-                        Ok(Some(ClientEvent::StreamBegin { stream_id: sid }))
+                        Ok(ClientEvent::StreamBegin { stream_id: sid })
                     }
                     USR_STREAM_EOF => {
                         let sid = ucm_stream_id(event_data)?;
@@ -511,7 +605,7 @@ impl RtmpClient {
                         // StreamEOF, then half-closes; we let the
                         // subsequent read drain those and report EOF
                         // naturally.
-                        Ok(Some(ClientEvent::StreamEof { stream_id: sid }))
+                        Ok(ClientEvent::StreamEof { stream_id: sid })
                     }
                     USR_PING_REQUEST => {
                         // Server pings — reply with PingResponse echoing
@@ -533,28 +627,37 @@ impl RtmpClient {
                             );
                             let _ = self.writer.flush();
                         }
-                        Ok(Some(ClientEvent::Other))
+                        Ok(ClientEvent::Other)
                     }
                     _ => {
                         // StreamDry / SetBufferLength / StreamIsRecorded /
                         // PingResponse — surface as Other; the publisher
                         // doesn't act on them.
-                        Ok(Some(ClientEvent::Other))
+                        Ok(ClientEvent::Other)
                     }
                 }
             }
             MSG_COMMAND_AMF0 => {
                 let values = amf::decode_all(&msg.payload)?;
-                Ok(Some(classify_command(values)))
+                Ok(classify_command(values))
             }
             MSG_COMMAND_AMF3 => {
                 let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
                     .iter()
                     .map(amf3::Amf3Value::to_amf0)
                     .collect();
-                Ok(Some(classify_command(values)))
+                Ok(classify_command(values))
             }
-            _ => Ok(Some(ClientEvent::Other)),
+            MSG_AGGREGATE => {
+                // A sub-message inside an aggregate is itself an
+                // aggregate. Forward to the same queue so the next
+                // `poll_event` tick decomposes it. The wire path above
+                // already handles top-level aggregates directly.
+                let subs = parse_aggregate(&msg)?;
+                self.pending_subs.extend(subs);
+                Ok(ClientEvent::Other)
+            }
+            _ => Ok(ClientEvent::Other),
         }
     }
 
