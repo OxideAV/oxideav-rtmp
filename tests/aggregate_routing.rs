@@ -292,9 +292,14 @@ fn aggregate_command_subs_drive_teardown() {
     };
 
     client.send_aggregate(&[video, close]).expect("send agg");
-    // Don't close() — the aggregated closeStream sub already ended the
-    // session on the server side. We just let the TCP socket drop.
-    drop(client);
+    // The aggregated closeStream sub already ended the session on the
+    // server side — close() here just emits a (redundant) closeStream
+    // command on a server that is already returning Ok(None), and on
+    // Windows it also performs the write-half FIN that guarantees
+    // every aggregate byte reaches the kernel before the socket goes
+    // away (a bare `drop` would race the flush on platforms where
+    // TcpStream::flush is a no-op).
+    client.close().expect("client close");
 
     // First the video sub, then End (closeStream consumed silently).
     let first = rx.recv_timeout(Duration::from_secs(5)).expect("first");
