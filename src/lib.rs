@@ -69,6 +69,7 @@ pub use caps::{
     CAPS_EX_TIMESTAMP_NANO_OFFSET, FOURCC_INFO_CAN_DECODE, FOURCC_INFO_CAN_ENCODE,
     FOURCC_INFO_CAN_FORWARD, FOURCC_WILDCARD, OBJECT_ENCODING_AMF0, OBJECT_ENCODING_AMF3,
 };
+pub use chunk::{Message, MessageStreamKind};
 pub use client::{ClientEvent, RtmpClient, RtmpUrl};
 pub use error::{Error, Result};
 pub use flv::{

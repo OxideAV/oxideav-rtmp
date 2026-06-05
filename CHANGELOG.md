@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `MessageStreamKind` accessor + spec-§5 protocol-control
+  invariant validator on `chunk::Message`** (`src/chunk.rs`,
+  `src/lib.rs`, `tests/message_stream_kind.rs`). The chunk-reassembled
+  `Message`'s raw `msg_stream_id: u32` now lifts into a typed
+  three-way classification — `Control` (`msg_stream_id == 0`, the
+  "control stream" defined in RTMP Message Formats spec §5 carrying
+  every NetConnection command + every protocol-control / user-control
+  message), `NetStream(id)` (the canonical 1..=`0x00FF_FFFF` handle a
+  server returns from `_result(createStream)` per the RTMP Commands
+  Messages spec §4.1.3 and that publishers stamp into every A/V /
+  metadata / aggregate message from then on), and `Reserved(raw)` (any
+  value with bits set in the top byte — the Message Formats spec §4.1
+  message header carries the stream ID as a 3-byte field, so anything
+  above `0x00FF_FFFF` is reserved). `Message::stream_kind()` returns
+  the typed view; `Message::is_control_stream()` is the convenience
+  shorthand; `Message::validate_protocol_control_invariants()` returns
+  `Err(ProtocolViolation)` whenever a protocol-control message
+  (`msg_type_id` 1..=6) carries a non-zero `msg_stream_id` per the
+  Message Formats spec §5 mandate "Protocol control messages MUST
+  have message stream ID 0 (called as control stream)" and whenever
+  the §4.1 reserved high-byte rule is violated. The new types
+  re-export through the crate root (`oxideav_rtmp::Message` /
+  `oxideav_rtmp::MessageStreamKind`). Four-test integration suite in
+  `tests/message_stream_kind.rs` covers the round-trip case (build a
+  SetChunkSize via `build_set_chunk_size`, render through
+  `ChunkWriter`, reassemble through `ChunkReader`, confirm the typed
+  view + validator both pass), the NetStream classification case
+  (`msg_stream_id == 1` → `NetStream(1)`), the forged-msid rejection
+  case (SetChunkSize stamped with `msg_stream_id = 1` refused with a
+  diagnostic naming "protocol-control" + "msg_stream_id"), and the
+  reserved-high-byte rejection case (`msg_stream_id = 0x0100_0001`).
 - **Aggregate Message (type 22) dispatch through `RtmpSession::next_packet`
   and `RtmpClient::poll_event`, plus `RtmpClient::send_aggregate`
   outbound** (`src/server.rs`, `src/client.rs`,

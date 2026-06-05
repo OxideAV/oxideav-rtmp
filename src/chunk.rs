@@ -52,6 +52,84 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 
+/// Typed classification of a message's `msg_stream_id` per Message
+/// Formats spec §5 ("Protocol Control Messages MUST have message
+/// stream ID 0 (called as control stream)") and §4.1 (3-byte stream
+/// ID field).
+///
+/// The numeric NetStream ids 1..=`0x00FF_FFFF` are the values a server
+/// returns from `_result(createStream)`; per the RTMP Commands Messages
+/// spec §4.1.3 a freshly created NetStream receives "a stream ID" that
+/// the publisher then stamps into every subsequent A/V / metadata
+/// message header. The chunk message-stream-id field on the wire is
+/// 32-bit little-endian (RTMP Chunk Stream §6.1.2.1) but the §4.1
+/// message header layout only allocates 3 bytes for it; values whose
+/// top byte is non-zero are reserved and surface here as
+/// [`MessageStreamKind::Reserved`] so a caller can refuse them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageStreamKind {
+    /// `msg_stream_id == 0` — the "control stream" carrying
+    /// NetConnection commands (`connect`, `createStream`, `_result`,
+    /// `_error`, `call`) and the protocol-control / user-control
+    /// messages (types 1..=6).
+    Control,
+    /// A NetStream handle (1..=`0x00FF_FFFF`) — the value returned by
+    /// `_result(createStream)`, stamped into every audio / video /
+    /// data / aggregate message that flows on that NetStream.
+    NetStream(u32),
+    /// `msg_stream_id` has bit(s) set in the top byte, outside the
+    /// §4.1 3-byte field. RTMP Chunk Stream §6.1.2.1 carries the
+    /// field as a 32-bit value so receivers see it on the wire, but
+    /// the Message Formats spec §4.1 reserves the high byte. Surfaced
+    /// so a strict consumer can refuse the message.
+    Reserved(u32),
+}
+
+impl Message {
+    /// Classify [`Self::msg_stream_id`] per Message Formats spec §4.1 /
+    /// §5 — `0` is the "control stream", `1..=0x00FF_FFFF` is a
+    /// NetStream handle, anything with bits set above the §4.1 3-byte
+    /// field is reserved.
+    pub fn stream_kind(&self) -> MessageStreamKind {
+        match self.msg_stream_id {
+            0 => MessageStreamKind::Control,
+            id if id & 0xFF00_0000 == 0 => MessageStreamKind::NetStream(id),
+            other => MessageStreamKind::Reserved(other),
+        }
+    }
+
+    /// True iff this message rides the control stream (`msg_stream_id
+    /// == 0`). All protocol-control / user-control / NetConnection
+    /// command traffic does, per Message Formats spec §5.
+    pub fn is_control_stream(&self) -> bool {
+        matches!(self.stream_kind(), MessageStreamKind::Control)
+    }
+
+    /// Validate the spec §5 mandate that "Protocol control messages
+    /// MUST have message stream ID 0 (called as control stream)". The
+    /// protocol-control range is message type IDs 1..=6 (Set Chunk
+    /// Size / Abort / Acknowledgement / User Control / Window Ack Size
+    /// / Set Peer Bandwidth) — type id 4 (User Control) is grouped
+    /// with the §5 protocol-control set in the same spec section. The
+    /// §6.1.2.1 reserved top-byte rule on `msg_stream_id` is also
+    /// enforced here so a single accessor catches both spec invariants.
+    pub fn validate_protocol_control_invariants(&self) -> Result<()> {
+        if matches!(self.stream_kind(), MessageStreamKind::Reserved(_)) {
+            return Err(Error::ProtocolViolation(format!(
+                "message stream id {:#010x} sets reserved high byte (spec §4.1: 3-byte field)",
+                self.msg_stream_id
+            )));
+        }
+        if matches!(self.msg_type_id, 1..=6) && self.msg_stream_id != 0 {
+            return Err(Error::ProtocolViolation(format!(
+                "protocol-control message type {} carries non-zero msg_stream_id {} (spec §5 requires 0)",
+                self.msg_type_id, self.msg_stream_id
+            )));
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-csid state (reader)
 // ---------------------------------------------------------------------------

@@ -254,7 +254,16 @@ non-standard:
   `RtmpServer::set_capabilities` (ingest) for high-level use, or call
   `ConnectCapabilities::encode_into` / `from_amf0` directly to bridge
   to a custom command pipeline.
-- `chunk::{ChunkReader, ChunkWriter, Message}`
+- `chunk::{ChunkReader, ChunkWriter, Message, MessageStreamKind}` —
+  `Message::stream_kind()` lifts the raw `msg_stream_id: u32` field
+  into a typed `Control` / `NetStream(id)` / `Reserved(raw)` view per
+  RTMP Message Formats spec §4.1 + §5, and
+  `Message::validate_protocol_control_invariants()` returns
+  `Err(ProtocolViolation)` whenever a protocol-control message
+  (`msg_type_id` 1..=6) carries a non-zero `msg_stream_id` — the spec
+  §5 mandate "Protocol control messages MUST have message stream ID 0
+  (called as control stream)" — or whenever the §4.1 reserved
+  high-byte rule is violated.
 - `aggregate::{parse_aggregate, build_aggregate}` — Aggregate Message
   (RTMP 1.0 §7.1.6 type 22) parser + builder. Splits a single
   `Message` of type id 22 into its component FLV-shaped sub-messages
