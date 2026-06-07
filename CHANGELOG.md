@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RTMP 1.0 §3.7 User Control Message events surfaced through
+  `ClientEvent` + matching `RtmpSession` server-side helpers**
+  (`src/message.rs`, `src/client.rs`, `src/server.rs`,
+  `tests/user_control_events.rs`). Round 248 closes the
+  publish-direction User Control Message coverage gap: prior to this
+  commit only `StreamBegin` (UCM 0) and `StreamEOF` (UCM 1) reached
+  the publisher as typed [`ClientEvent`] variants, and the remaining
+  spec-defined events were either swallowed silently into
+  [`ClientEvent::Other`] (`StreamDry` UCM 2, `SetBufferLength` UCM 3,
+  `StreamIsRecorded` UCM 4, `PingResponse` UCM 7) or had no builder
+  available at all (`StreamDry`, `SetBufferLength`, `StreamIsRecorded`,
+  `PingRequest` from the server side, `PingRequest` /
+  `PingResponse` from the client side). Closed end-to-end: new
+  `message::build_user_control_stream_dry` /
+  `_set_buffer_length(stream_id, buffer_ms)` /
+  `_stream_is_recorded` / `_ping_request(timestamp_ms)` /
+  `_ping_response(timestamp_ms)` builders emit the exact §3.7 wire
+  layouts (2-byte BE event type + 4-byte BE stream id for the
+  stream-id-carrying variants; 4-byte BE timestamp for ping; 4-byte
+  stream id + 4-byte buffer length for the only 8-byte UCM event,
+  `SetBufferLength`). `RtmpClient::poll_event` decodes these into
+  three new typed [`ClientEvent`] variants:
+  [`ClientEvent::StreamDry`] (carries `stream_id`, distinct from
+  `StreamEof`: per spec §3.7 `StreamDry` is a transient
+  "no-data-right-now" signal whereas `StreamEof` is "playback
+  finished"), [`ClientEvent::StreamIsRecorded`] (server announces
+  the stream is on-demand / archival), and
+  [`ClientEvent::PingResponse`] (carries the echoed 4-byte
+  `timestamp_ms` for RTT measurement). `SetBufferLength` is
+  publisher-direction inbound; the classify path validates the
+  8-byte event-data length (returning `Error::ProtocolViolation` on
+  truncation per the spec's fixed-size invariant) and otherwise
+  reports it as [`ClientEvent::Other`]. Server-originated
+  `PingRequest` (UCM 6) is auto-replied internally as before —
+  promoting it to a `ClientEvent` would expose a protocol-level
+  liveness probe as an application event, which the spec assigns
+  to the client. New `RtmpClient::send_ping_request(timestamp_ms)`
+  emits a UCM-6 from the publisher direction so an outer event
+  loop can measure round-trip time by stamping a monotonic clock
+  into the request and subtracting from the matching
+  [`ClientEvent::PingResponse`] echoed back; new
+  `RtmpSession::send_stream_dry` / `send_stream_is_recorded` /
+  `send_ping_request` give an ingest the symmetric server-side
+  emitters. The `MessageStreamKind` classifier + protocol-control
+  invariant validator from the round-247 commit keeps these on
+  `msg_stream_id == 0` per RTMP Message Formats §5 — the new
+  builders all stamp `msg_stream_id = 0` directly. Total lib
+  tests: 217 → 222 (+5 — `user_control_stream_dry_wire_bytes`,
+  `user_control_set_buffer_length_wire_bytes`,
+  `user_control_stream_is_recorded_wire_bytes`,
+  `user_control_ping_request_wire_bytes`,
+  `user_control_ping_response_wire_bytes`). Total integration
+  tests: 77 → 82 (+5 — `client_observes_stream_dry_from_server`,
+  `client_observes_stream_is_recorded_from_server`,
+  `client_auto_replies_to_server_ping_request_without_surfacing`,
+  `client_surfaces_server_ping_response_as_typed_event` driving a
+  hand-rolled chunk-stream PingResponse injection,
+  `client_rejects_truncated_set_buffer_length` confirming the
+  8-byte validation refuses a 6-byte payload with a
+  `ProtocolViolation`). Resolves the remaining `Other`-swallow gap
+  identified by reading RTMP Commands Messages spec §3.7 against
+  the round-247 classify-path coverage.
+
 - **Typed `MessageStreamKind` accessor + spec-§5 protocol-control
   invariant validator on `chunk::Message`** (`src/chunk.rs`,
   `src/lib.rs`, `tests/message_stream_kind.rs`). The chunk-reassembled

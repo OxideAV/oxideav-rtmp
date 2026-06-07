@@ -52,6 +52,32 @@ pub enum ClientEvent {
     /// observing this, the caller should stop writing and shut the
     /// client down via [`RtmpClient::close`].
     StreamEof { stream_id: u32 },
+    /// The server emitted `UserControl StreamDry(stream_id)`
+    /// (UCM event type 2). Per RTMP 1.0 §3.7, the server uses this to
+    /// notify the client "that there is no more data on the stream. If
+    /// the server does not detect any message for a time period, it
+    /// can notify the subscribed clients that the stream is dry."
+    /// Distinct from [`StreamEof`](Self::StreamEof): `StreamDry` is a
+    /// "no data right now" signal that may resolve once more data
+    /// arrives; `StreamEof` is "playback finished, no more without
+    /// further commands."
+    StreamDry { stream_id: u32 },
+    /// The server emitted `UserControl StreamIsRecorded(stream_id)`
+    /// (UCM event type 4). Per RTMP 1.0 §3.7, "the server sends this
+    /// event to notify the client that the stream is a recorded
+    /// stream." Servers typically emit this right after `StreamBegin`
+    /// for an on-demand stream; for a publish-only client the event is
+    /// informational and usually ignored.
+    StreamIsRecorded { stream_id: u32 },
+    /// The server emitted `UserControl PingResponse(timestamp_ms)`
+    /// (UCM event type 7). Per RTMP 1.0 §3.7, the client sends a
+    /// `PingResponse` "in response to the ping request. The event
+    /// data is a 4-byte timestamp, which was received with the
+    /// kMsgPingRequest request." A server that emits `PingResponse`
+    /// is typically echoing back our own (publisher-side) `PingRequest`
+    /// — useful for measuring round-trip latency. The variant carries
+    /// the echoed timestamp verbatim.
+    PingResponse { timestamp_ms: u32 },
     /// The server emitted `onStatus(...)` carrying NetStream state.
     /// `level` is typically `"status"` / `"warning"` / `"error"`;
     /// `code` is e.g. `"NetStream.Publish.Start"` /
@@ -493,6 +519,28 @@ impl RtmpClient {
         Ok(())
     }
 
+    /// Send a `UserControl PingRequest` (RTMP 1.0 §3.7, UCM type 6)
+    /// carrying the supplied 4-byte timestamp.
+    ///
+    /// The peer is expected to echo the value back as a `PingResponse`
+    /// (UCM type 7), which surfaces from
+    /// [`poll_event`](Self::poll_event) as
+    /// [`ClientEvent::PingResponse`]. Typical use is round-trip-time
+    /// measurement: stamp the local monotonic clock into the request,
+    /// then subtract from the response timestamp once the matching
+    /// `PingResponse` arrives. The publish direction normally never
+    /// needs this — but a publisher pumping a low-bandwidth feed over
+    /// a flaky link may want to probe liveness explicitly rather than
+    /// wait for TCP keepalive.
+    pub fn send_ping_request(&mut self, timestamp_ms: u32) -> Result<()> {
+        self.writer.write_message(
+            CSID_PROTOCOL_CONTROL,
+            &build_user_control_ping_request(timestamp_ms),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Poll for one server-originated event.
     ///
     /// Reads up to one inbound RTMP message from the server, applies
@@ -607,6 +655,45 @@ impl RtmpClient {
                         // naturally.
                         Ok(ClientEvent::StreamEof { stream_id: sid })
                     }
+                    USR_STREAM_DRY => {
+                        // Per RTMP 1.0 §3.7, StreamDry is a transient
+                        // "no data on the stream right now" signal —
+                        // distinct from StreamEOF, which terminates
+                        // playback. Surface to the caller so an outer
+                        // event loop can react (e.g. warn UI, switch
+                        // to a fallback stream); don't latch read_eof.
+                        let sid = ucm_stream_id(event_data)?;
+                        Ok(ClientEvent::StreamDry { stream_id: sid })
+                    }
+                    USR_SET_BUFFER_LENGTH => {
+                        // Per RTMP 1.0 §3.7, SetBufferLength is the only
+                        // standard UCM event with an 8-byte event-data
+                        // body: 4-byte stream id + 4-byte buffer length
+                        // in milliseconds. It is sent from a *playback*
+                        // client to the server — a publish-direction
+                        // client almost never sees it inbound. We
+                        // validate the payload size so a malformed
+                        // SetBufferLength from a confused peer surfaces
+                        // a clean error instead of silently truncating;
+                        // and we surface it as Other (no action required
+                        // on the publisher side).
+                        if event_data.len() < 8 {
+                            return Err(Error::ProtocolViolation(
+                                "UserControl SetBufferLength: event data < 8 bytes".into(),
+                            ));
+                        }
+                        Ok(ClientEvent::Other)
+                    }
+                    USR_STREAM_IS_RECORDED => {
+                        // Per RTMP 1.0 §3.7, server announces that the
+                        // stream is a recorded (on-demand) stream.
+                        // Surface to the caller — a publish client may
+                        // want to log this if the server marks our own
+                        // publish stream as recorded after we asked for
+                        // "live" (mismatched publish type).
+                        let sid = ucm_stream_id(event_data)?;
+                        Ok(ClientEvent::StreamIsRecorded { stream_id: sid })
+                    }
                     USR_PING_REQUEST => {
                         // Server pings — reply with PingResponse echoing
                         // the same 4-byte timestamp body so the server's
@@ -629,10 +716,29 @@ impl RtmpClient {
                         }
                         Ok(ClientEvent::Other)
                     }
+                    USR_PING_RESPONSE => {
+                        // Per RTMP 1.0 §3.7, this echoes back the 4-byte
+                        // timestamp the publisher carried in a prior
+                        // PingRequest. Surface to the caller so a
+                        // round-trip-time measurement loop can compare
+                        // the echoed value to its own send-time clock.
+                        if event_data.len() < 4 {
+                            return Err(Error::ProtocolViolation(
+                                "UserControl PingResponse: event data < 4 bytes".into(),
+                            ));
+                        }
+                        let ts = u32::from_be_bytes([
+                            event_data[0],
+                            event_data[1],
+                            event_data[2],
+                            event_data[3],
+                        ]);
+                        Ok(ClientEvent::PingResponse { timestamp_ms: ts })
+                    }
                     _ => {
-                        // StreamDry / SetBufferLength / StreamIsRecorded /
-                        // PingResponse — surface as Other; the publisher
-                        // doesn't act on them.
+                        // Unknown / reserved UCM event type — surface as
+                        // Other; forwarding ingest may receive future
+                        // event types we don't model yet.
                         Ok(ClientEvent::Other)
                     }
                 }

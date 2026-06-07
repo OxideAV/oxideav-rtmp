@@ -109,6 +109,104 @@ pub fn build_user_control_stream_eof(stream_id: u32) -> Message {
     }
 }
 
+/// User-control `StreamDry` event (`UCM` type 2).
+///
+/// Per RTMP 1.0 §3.7 ("Commands Messages" — User Control message table),
+/// "the server sends this event to notify the client that there is no
+/// more data on the stream. If the server does not detect any message
+/// for a time period, it can notify the subscribed clients that the
+/// stream is dry." The 4-byte event body is the stream id of the dry
+/// stream. Distinct from `StreamEOF`: `StreamDry` is "no data right
+/// now," `StreamEOF` is "playback finished."
+pub fn build_user_control_stream_dry(stream_id: u32) -> Message {
+    let mut p = Vec::with_capacity(6);
+    p.extend_from_slice(&USR_STREAM_DRY.to_be_bytes());
+    p.extend_from_slice(&stream_id.to_be_bytes());
+    Message {
+        msg_type_id: MSG_USER_CONTROL,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload: p,
+    }
+}
+
+/// User-control `SetBufferLength` event (`UCM` type 3).
+///
+/// Per RTMP 1.0 §3.7, "the client sends this event to inform the server
+/// of the buffer size (in milliseconds) that is used to buffer any data
+/// coming over a stream. This event is sent before the server starts
+/// processing the stream. The first 4 bytes of the event data represent
+/// the stream ID and the next 4 bytes represent the buffer length, in
+/// milliseconds." This is the only standard UCM event with a non-4-byte
+/// event-data body (8 bytes total).
+pub fn build_user_control_set_buffer_length(stream_id: u32, buffer_ms: u32) -> Message {
+    let mut p = Vec::with_capacity(10);
+    p.extend_from_slice(&USR_SET_BUFFER_LENGTH.to_be_bytes());
+    p.extend_from_slice(&stream_id.to_be_bytes());
+    p.extend_from_slice(&buffer_ms.to_be_bytes());
+    Message {
+        msg_type_id: MSG_USER_CONTROL,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload: p,
+    }
+}
+
+/// User-control `StreamIsRecorded` event (`UCM` type 4).
+///
+/// Per RTMP 1.0 §3.7, "the server sends this event to notify the client
+/// that the stream is a recorded stream. The 4 bytes event data
+/// represent the stream ID of the recorded stream." Servers typically
+/// emit this right after `StreamBegin` for an on-demand stream.
+pub fn build_user_control_stream_is_recorded(stream_id: u32) -> Message {
+    let mut p = Vec::with_capacity(6);
+    p.extend_from_slice(&USR_STREAM_IS_RECORDED.to_be_bytes());
+    p.extend_from_slice(&stream_id.to_be_bytes());
+    Message {
+        msg_type_id: MSG_USER_CONTROL,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload: p,
+    }
+}
+
+/// User-control `PingRequest` event (`UCM` type 6).
+///
+/// Per RTMP 1.0 §3.7, "the server sends this event to test whether the
+/// client is reachable. Event data is a 4-byte timestamp, representing
+/// the local server time when the server dispatched the command. The
+/// client responds with kMsgPingResponse on receiving kMsgPingRequest."
+pub fn build_user_control_ping_request(timestamp_ms: u32) -> Message {
+    let mut p = Vec::with_capacity(6);
+    p.extend_from_slice(&USR_PING_REQUEST.to_be_bytes());
+    p.extend_from_slice(&timestamp_ms.to_be_bytes());
+    Message {
+        msg_type_id: MSG_USER_CONTROL,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload: p,
+    }
+}
+
+/// User-control `PingResponse` event (`UCM` type 7).
+///
+/// Per RTMP 1.0 §3.7, "the client sends this event to the server in
+/// response to the ping request. The event data is a 4-byte timestamp,
+/// which was received with the kMsgPingRequest request." The caller is
+/// responsible for echoing back the exact timestamp the peer's
+/// `PingRequest` carried.
+pub fn build_user_control_ping_response(timestamp_ms: u32) -> Message {
+    let mut p = Vec::with_capacity(6);
+    p.extend_from_slice(&USR_PING_RESPONSE.to_be_bytes());
+    p.extend_from_slice(&timestamp_ms.to_be_bytes());
+    Message {
+        msg_type_id: MSG_USER_CONTROL,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload: p,
+    }
+}
+
 pub fn build_ack(bytes_received: u32) -> Message {
     Message {
         msg_type_id: MSG_ACK,
@@ -397,6 +495,63 @@ mod tests {
         assert_eq!(m.timestamp, 0);
         // Event type 1 (StreamEOF) | stream id 7.
         assert_eq!(m.payload, vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x07]);
+    }
+
+    /// Wire bytes for `UserControl StreamDry` (type 2). Same six-byte
+    /// frame as StreamBegin / StreamEOF: 2-byte BE event type, 4-byte BE
+    /// stream id.
+    #[test]
+    fn user_control_stream_dry_wire_bytes() {
+        let m = build_user_control_stream_dry(0x0010_2030);
+        assert_eq!(m.msg_type_id, MSG_USER_CONTROL);
+        assert_eq!(m.msg_stream_id, 0);
+        assert_eq!(m.payload, vec![0x00, 0x02, 0x00, 0x10, 0x20, 0x30]);
+    }
+
+    /// Wire bytes for `UserControl SetBufferLength` (type 3). The only
+    /// UCM event with an 8-byte event-data payload: 4 bytes stream id +
+    /// 4 bytes buffer length in milliseconds.
+    #[test]
+    fn user_control_set_buffer_length_wire_bytes() {
+        let m = build_user_control_set_buffer_length(1, 3000);
+        assert_eq!(m.msg_type_id, MSG_USER_CONTROL);
+        assert_eq!(m.msg_stream_id, 0);
+        // Event type 3 (SetBufferLength) | stream id 1 | buffer 3000 ms.
+        assert_eq!(
+            m.payload,
+            vec![0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0B, 0xB8],
+        );
+    }
+
+    /// Wire bytes for `UserControl StreamIsRecorded` (type 4): 2-byte BE
+    /// event type, 4-byte BE stream id.
+    #[test]
+    fn user_control_stream_is_recorded_wire_bytes() {
+        let m = build_user_control_stream_is_recorded(5);
+        assert_eq!(m.msg_type_id, MSG_USER_CONTROL);
+        assert_eq!(m.msg_stream_id, 0);
+        assert_eq!(m.payload, vec![0x00, 0x04, 0x00, 0x00, 0x00, 0x05]);
+    }
+
+    /// Wire bytes for `UserControl PingRequest` (type 6): 2-byte BE
+    /// event type, 4-byte BE local-server-time timestamp.
+    #[test]
+    fn user_control_ping_request_wire_bytes() {
+        let m = build_user_control_ping_request(0xDEAD_BEEF);
+        assert_eq!(m.msg_type_id, MSG_USER_CONTROL);
+        assert_eq!(m.msg_stream_id, 0);
+        assert_eq!(m.payload, vec![0x00, 0x06, 0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    /// Wire bytes for `UserControl PingResponse` (type 7): the same
+    /// 4-byte timestamp the matching PingRequest carried, prefixed with
+    /// the type-7 event header.
+    #[test]
+    fn user_control_ping_response_wire_bytes() {
+        let m = build_user_control_ping_response(0xDEAD_BEEF);
+        assert_eq!(m.msg_type_id, MSG_USER_CONTROL);
+        assert_eq!(m.msg_stream_id, 0);
+        assert_eq!(m.payload, vec![0x00, 0x07, 0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     /// `build_connect_with_caps` with a default capability block emits

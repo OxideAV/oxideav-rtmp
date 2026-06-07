@@ -330,6 +330,61 @@ impl RtmpSession {
         Ok(())
     }
 
+    /// Emit a `UserControl StreamDry(stream_id)` event on the publish
+    /// stream (RTMP 1.0 §3.7, UCM type 2).
+    ///
+    /// Per spec: "the server sends this event to notify the client
+    /// that there is no more data on the stream. If the server does
+    /// not detect any message for a time period, it can notify the
+    /// subscribed clients that the stream is dry." Distinct from
+    /// [`close`](Self::close)'s `StreamEOF`: `StreamDry` is a
+    /// transient "we have nothing right now" signal that may resolve
+    /// when more data arrives, not a teardown.
+    pub fn send_stream_dry(&mut self) -> Result<()> {
+        self.writer.write_message(
+            CSID_PROTOCOL_CONTROL,
+            &build_user_control_stream_dry(self.stream_id),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Emit a `UserControl StreamIsRecorded(stream_id)` event on the
+    /// publish stream (RTMP 1.0 §3.7, UCM type 4).
+    ///
+    /// Per spec: "the server sends this event to notify the client
+    /// that the stream is a recorded stream." A server fronting an
+    /// archival recorder may want to advertise this after the publish
+    /// handshake settles so a forwarding peer knows the captured
+    /// stream is replayable rather than ephemeral.
+    pub fn send_stream_is_recorded(&mut self) -> Result<()> {
+        self.writer.write_message(
+            CSID_PROTOCOL_CONTROL,
+            &build_user_control_stream_is_recorded(self.stream_id),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Emit a `UserControl PingRequest(timestamp_ms)` event (RTMP 1.0
+    /// §3.7, UCM type 6).
+    ///
+    /// Per spec, "the server sends this event to test whether the
+    /// client is reachable. Event data is a 4-byte timestamp,
+    /// representing the local server time when the server dispatched
+    /// the command." The client (our [`RtmpClient`]) replies with the
+    /// matching `PingResponse` carrying the same 4 bytes —
+    /// `RtmpClient::poll_event` answers the ping internally without
+    /// surfacing the request to the publisher caller.
+    pub fn send_ping_request(&mut self, timestamp_ms: u32) -> Result<()> {
+        self.writer.write_message(
+            CSID_PROTOCOL_CONTROL,
+            &build_user_control_ping_request(timestamp_ms),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Close the session politely.
     ///
     /// On the wire we emit, in order:

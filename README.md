@@ -135,13 +135,22 @@ client.close()?;
   and half-closes the write side. The peer drains every buffered
   frame plus the EOF + status reply before observing FIN, matching the
   client-side teardown behaviour. Symmetrically, `RtmpClient::poll_event`
-  surfaces server-originated `UserControl StreamEOF`,
-  `UserControl StreamBegin`, `onStatus(...)`, and `_result` / `_error`
-  replies as a `ClientEvent` enum so a publisher can distinguish a
-  clean server-initiated end-of-stream from an unexpected TCP FIN.
-  Protocol-control plumbing (Set Chunk Size, Window Ack Size, Set Peer
-  Bandwidth, Ping Request → Ping Response) is handled transparently
-  inside `poll_event`.
+  surfaces every server-originated User Control Message defined in
+  RTMP 1.0 §3.7 — `StreamBegin`, `StreamEOF`, `StreamDry`,
+  `StreamIsRecorded`, `PingResponse` — as typed `ClientEvent` variants
+  alongside `onStatus(...)`, `_result`, and `_error` replies, so a
+  publisher can distinguish a clean server-initiated end-of-stream from
+  a transient "no data" probe, an on-demand-recorded advertisement, or
+  the round-trip echo of its own `RtmpClient::send_ping_request`.
+  Server-originated `PingRequest` is auto-replied internally (per spec
+  §3.7 — it's a liveness probe, not an application event), and the
+  matching `RtmpSession::send_stream_dry` / `send_stream_is_recorded` /
+  `send_ping_request` helpers let an ingest broadcast the same UCM
+  events to its publishers. `SetBufferLength` (the only 8-byte UCM
+  payload — 4-byte stream id + 4-byte buffer length in ms) is validated
+  on the wire and surfaces a `ProtocolViolation` if truncated. The rest
+  of the protocol-control plumbing (Set Chunk Size, Window Ack Size,
+  Set Peer Bandwidth) is handled transparently inside `poll_event`.
 - **Injection-robust parser surface**. Every public decode entry
   point — AMF0 (`decode` / `decode_all`), AMF3 (`decode` / `decode_all`
   / `decode_data_message`), FLV (`parse_video` / `parse_audio`), the

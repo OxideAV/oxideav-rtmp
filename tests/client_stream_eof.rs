@@ -107,6 +107,14 @@ fn client_observes_stream_eof_from_server_clean_close() {
                 // unexpected from our own server but harmless.
                 continue;
             }
+            Ok(Some(ClientEvent::StreamDry { .. }))
+            | Ok(Some(ClientEvent::StreamIsRecorded { .. }))
+            | Ok(Some(ClientEvent::PingResponse { .. })) => {
+                // The session_close path doesn't emit these UCM events
+                // — but a defensive `match` keeps the test forward-
+                // compatible if the server's teardown adds one later.
+                continue;
+            }
             Ok(None) => {
                 // Read half drained. We expect to have already seen
                 // StreamEof before this point — server.close() emits it
