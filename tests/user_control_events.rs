@@ -271,7 +271,7 @@ fn client_surfaces_server_ping_response_as_typed_event() {
             Err(_) => break,
         }
     }
-    drop(client);
+    let _ = client.close();
 
     server_thread.join().expect("server thread");
 
@@ -345,7 +345,7 @@ fn client_rejects_truncated_set_buffer_length() {
             }
         }
     }
-    drop(client);
+    let _ = client.close();
     server_thread.join().expect("server thread");
 
     assert!(

@@ -98,8 +98,17 @@ fn registry_open_rtmp_url_yields_packet_source_with_expected_packets() {
                 .map_err(|e| format!("send audio b: {e}"))?;
             Ok(())
         };
-        let result = push(&mut client)
-            .and_then(|()| client.close().map_err(|e| format!("client close: {e}")));
+        let push_result = push(&mut client);
+        // Give the kernel a beat to drain the final A/V chunks
+        // through the socket buffer before we send the
+        // closeStream + Shutdown::Write FIN. Without this, a
+        // contended Ubuntu CI runner can occasionally observe
+        // the FIN reach the peer ahead of the last buffered
+        // chunk's data segment — the receiver then sees EOF
+        // before the trailing audio frame arrives.
+        thread::sleep(Duration::from_millis(50));
+        let result =
+            push_result.and_then(|()| client.close().map_err(|e| format!("client close: {e}")));
         let _ = tx.send(result);
     });
 

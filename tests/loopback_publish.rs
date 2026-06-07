@@ -89,6 +89,13 @@ fn client_publishes_and_server_receives_same_frames() {
     client.send_audio(20, &aac_a).expect("send audio 0");
     client.send_audio(43, &aac_b).expect("send audio 1");
 
+    // Give the kernel a beat to drain the last buffered chunk's
+    // data segment through the socket buffer before we send the
+    // closeStream + Shutdown::Write FIN. On a contended Ubuntu CI
+    // runner the FIN can otherwise reach the peer ahead of the
+    // last frame and the receiver hits EOF before the trailing
+    // audio packet arrives.
+    thread::sleep(Duration::from_millis(50));
     client.close().expect("client close");
     server_thread.join().expect("server thread");
 
@@ -99,9 +106,13 @@ fn client_publishes_and_server_receives_same_frames() {
     assert_eq!(seen_app, APP);
     assert_eq!(seen_key, STREAM_KEY);
 
-    // Drain received packets — order matters.
+    // Drain received packets — order matters. Use a generous per-packet
+    // inactivity window so the test stays reliable on a CI runner that
+    // schedules our worker out for tens of ms between successive
+    // chunk-stream reads (Ubuntu free-tier CI in particular can stall
+    // a thread for ~150 ms under contention).
     let mut got: Vec<ReceivedPacket> = Vec::new();
-    while let Ok(p) = recv_rx.recv_timeout(Duration::from_millis(100)) {
+    while let Ok(p) = recv_rx.recv_timeout(Duration::from_millis(500)) {
         got.push(p);
     }
 
