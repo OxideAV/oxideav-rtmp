@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`message::UserControlEvent` — public typed view of a User Control
+  Message body per RTMP 1.0 §3.7 / §7.1.7** (`src/message.rs`,
+  `src/lib.rs`). Round 264 promotes the previously-private
+  classify-and-extract logic in `client.rs` into a reusable building
+  block on the `message` module. `UserControlEvent::parse(payload)`
+  classifies the 2-byte BE event type + variable event data into one
+  of the seven spec-defined variants —
+  [`UserControlEvent::StreamBegin { stream_id }`] (UCM 0),
+  [`UserControlEvent::StreamEof { stream_id }`] (UCM 1),
+  [`UserControlEvent::StreamDry { stream_id }`] (UCM 2),
+  [`UserControlEvent::SetBufferLength { stream_id, buffer_ms }`]
+  (UCM 3, the only 8-byte event-data variant),
+  [`UserControlEvent::StreamIsRecorded { stream_id }`] (UCM 4),
+  [`UserControlEvent::PingRequest { timestamp_ms }`] (UCM 6),
+  [`UserControlEvent::PingResponse { timestamp_ms }`] (UCM 7) — or
+  the catch-all [`UserControlEvent::Unknown { event_type, data }`]
+  for the spec-reserved type 5 and any future event type ≥ 8. The
+  reverse direction is [`UserControlEvent::to_message`]: each
+  spec-defined variant rebuilds byte-for-byte the same protocol
+  control [`Message`] (`msg_type_id = MSG_USER_CONTROL`,
+  `msg_stream_id = 0`, `timestamp = 0`) the matching
+  `build_user_control_*` builder emits, and `Unknown` concatenates
+  `event_type:U16BE | data` verbatim so a forwarding ingest preserves
+  forward-compatible UCMs without re-encoding. Spec-defined variants
+  validate their fixed event-data size on parse (4 bytes for the
+  stream-id-carrying variants and ping, 8 bytes for
+  `SetBufferLength`) and surface
+  [`Error::ProtocolViolation`] on truncation;
+  [`UserControlEvent::Unknown`] accepts any tail length (including
+  zero) so a forwarding ingest never rejects forward-compatible
+  messages. [`UserControlEvent::event_type`] /
+  [`UserControlEvent::is_spec_defined`] accessors round out the
+  surface, and `UserControlEvent` is re-exported at the crate root.
+  Total lib tests: 222 → 226 (+4 —
+  `user_control_event_parse_recognises_spec_types`,
+  `user_control_event_round_trip_matches_builder_bytes`,
+  `user_control_event_unknown_preserves_event_type_and_tail`,
+  `user_control_event_parse_rejects_truncated_payload`). Sourced
+  entirely from RTMP 1.0 spec §3.7 / §7.1.7 (staged at
+  `docs/streaming/rtmp/rtmp-v1-0-spec-veovera.pdf` /
+  `rtmp.part3.Commands-Messages.pdf`).
 - **RTMP 1.0 §3.7 User Control Message events surfaced through
   `ClientEvent` + matching `RtmpSession` server-side helpers**
   (`src/message.rs`, `src/client.rs`, `src/server.rs`,

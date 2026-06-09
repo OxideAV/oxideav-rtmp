@@ -77,4 +77,5 @@ pub use flv::{
     VideoTag,
 };
 pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
+pub use message::UserControlEvent;
 pub use server::{PublishRequest, RtmpServer, RtmpSession, StreamPacket};

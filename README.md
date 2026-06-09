@@ -321,3 +321,20 @@ non-standard:
   without re-implementing the §E.3 walk.
 - `message::build_*` — builders for every protocol-control /
   command message we emit
+- `message::UserControlEvent` — typed view of a User Control Message
+  body per RTMP 1.0 §3.7 / §7.1.7. `UserControlEvent::parse(payload)`
+  classifies the 2-byte BE event type + variable event data into one
+  of the seven spec-defined variants — `StreamBegin` / `StreamEof` /
+  `StreamDry` / `SetBufferLength { stream_id, buffer_ms }` /
+  `StreamIsRecorded` / `PingRequest { timestamp_ms }` /
+  `PingResponse { timestamp_ms }` — or [`UserControlEvent::Unknown
+  { event_type, data }`] for the spec-reserved type 5 and any future
+  event type ≥ 8. `UserControlEvent::to_message()` is the inverse:
+  every spec-defined variant rebuilds the byte-for-byte payload the
+  matching `build_user_control_*` builder emits, and the `Unknown`
+  variant concatenates `event_type:U16BE | data` verbatim so a
+  forwarding ingest preserves forward-compatible UCMs without
+  re-encoding. Spec-defined variants validate their fixed event-data
+  size (4 bytes for the stream-id-carrying variants and ping,
+  8 bytes for `SetBufferLength`) on parse and surface
+  `Error::ProtocolViolation` on truncation.

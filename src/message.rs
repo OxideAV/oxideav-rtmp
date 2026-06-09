@@ -7,6 +7,7 @@
 use crate::amf::{encode_command, Amf0Value};
 use crate::caps::ConnectCapabilities;
 use crate::chunk::Message;
+use crate::error::{Error, Result};
 
 // §6.1 "Message Header" — type ids.
 pub const MSG_SET_CHUNK_SIZE: u8 = 1;
@@ -205,6 +206,200 @@ pub fn build_user_control_ping_response(timestamp_ms: u32) -> Message {
         timestamp: 0,
         payload: p,
     }
+}
+
+// ---------------------------------------------------------------------------
+// User Control Message typed accessor (round-trip parser)
+// ---------------------------------------------------------------------------
+
+/// Strongly-typed view of a User Control Message body per RTMP 1.0
+/// §3.7 / §7.1.7.
+///
+/// The `build_user_control_*` family above produces a [`Message`]
+/// with `msg_type_id == MSG_USER_CONTROL` and a payload shaped
+/// `event_type:U16BE | event_data:..`. [`UserControlEvent::parse`]
+/// is the inverse: lift such a payload into one of the seven
+/// spec-defined variants (or the catch-all [`Self::Unknown`] for
+/// forward compatibility — the spec leaves event types 5, 8..,
+/// reserved).
+///
+/// `Unknown` carries both the raw `event_type` and the unconsumed
+/// `event_data` bytes so a forwarding ingest can route unrecognised
+/// UCMs without losing information; a strict consumer can refuse
+/// the message by matching on it.
+///
+/// Round-trip helper: [`UserControlEvent::to_message`] produces the
+/// same [`Message`] the matching `build_user_control_*` builder
+/// emits, so `parse(build_x().payload) == Ok(x)` for every variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserControlEvent {
+    /// UCM type 0 — server tells the client that a stream is ready to
+    /// receive messages on the given stream id. Emitted right after
+    /// `_result(createStream)` from the server side; carried as the
+    /// 4-byte BE stream id in the event data.
+    StreamBegin { stream_id: u32 },
+    /// UCM type 1 — playback / publish finished on the given stream
+    /// id. The publisher emits this before tearing down its socket so
+    /// the peer learns "EOF was intentional" rather than guessing
+    /// whether the TCP FIN was a crash. 4-byte BE stream id.
+    StreamEof { stream_id: u32 },
+    /// UCM type 2 — server has not seen any data on the given stream
+    /// for a while. Distinct from [`Self::StreamEof`]: this is a
+    /// transient "no data right now" signal; the stream may resume.
+    /// 4-byte BE stream id.
+    StreamDry { stream_id: u32 },
+    /// UCM type 3 — client tells the server how many milliseconds of
+    /// buffer it is willing to keep filled. The only standard UCM
+    /// event with an 8-byte event-data body: 4 bytes BE stream id
+    /// followed by 4 bytes BE buffer length in ms.
+    SetBufferLength { stream_id: u32, buffer_ms: u32 },
+    /// UCM type 4 — server announces that the stream is recorded
+    /// (on-demand / archival). 4-byte BE stream id. Typically emitted
+    /// right after [`Self::StreamBegin`] on a play request.
+    StreamIsRecorded { stream_id: u32 },
+    /// UCM type 6 — sender's local time in ms; receiver must echo the
+    /// same value back in a [`Self::PingResponse`]. Used for liveness
+    /// probing + RTT measurement. 4-byte BE timestamp.
+    PingRequest { timestamp_ms: u32 },
+    /// UCM type 7 — exact echo of the timestamp from a paired
+    /// [`Self::PingRequest`]. 4-byte BE timestamp.
+    PingResponse { timestamp_ms: u32 },
+    /// Any event type not assigned by RTMP 1.0 §3.7 — UCM 5 is
+    /// reserved, and any UCM type ≥ 8 is forward-compatible space
+    /// the spec leaves unspecified. `data` holds the unconsumed
+    /// event-data bytes verbatim so a forwarding ingest can route
+    /// the message through without re-encoding.
+    Unknown { event_type: u16, data: Vec<u8> },
+}
+
+impl UserControlEvent {
+    /// Decode a UCM payload (the contents of a [`Message`] with
+    /// `msg_type_id == MSG_USER_CONTROL`) into a [`UserControlEvent`]
+    /// per RTMP 1.0 §3.7 / §7.1.7.
+    ///
+    /// Returns [`Error::ProtocolViolation`] if the payload is shorter
+    /// than the 2-byte event-type header, or if one of the
+    /// fixed-shape spec-defined variants is truncated below its
+    /// declared event-data size (4 bytes for the stream-id-carrying
+    /// variants and ping, 8 bytes for `SetBufferLength`). Unknown
+    /// event types accept any tail length, including zero, so a
+    /// forwarding ingest never rejects forward-compatible messages.
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        if payload.len() < 2 {
+            return Err(Error::ProtocolViolation(
+                "UserControl: payload < 2 bytes (need event type)".into(),
+            ));
+        }
+        let event_type = u16::from_be_bytes([payload[0], payload[1]]);
+        let data = &payload[2..];
+        match event_type {
+            USR_STREAM_BEGIN => Ok(Self::StreamBegin {
+                stream_id: read_u32_be(data, "StreamBegin")?,
+            }),
+            USR_STREAM_EOF => Ok(Self::StreamEof {
+                stream_id: read_u32_be(data, "StreamEOF")?,
+            }),
+            USR_STREAM_DRY => Ok(Self::StreamDry {
+                stream_id: read_u32_be(data, "StreamDry")?,
+            }),
+            USR_SET_BUFFER_LENGTH => {
+                if data.len() < 8 {
+                    return Err(Error::ProtocolViolation(format!(
+                        "UserControl SetBufferLength: event data {} < 8 bytes",
+                        data.len()
+                    )));
+                }
+                let stream_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                let buffer_ms = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                Ok(Self::SetBufferLength {
+                    stream_id,
+                    buffer_ms,
+                })
+            }
+            USR_STREAM_IS_RECORDED => Ok(Self::StreamIsRecorded {
+                stream_id: read_u32_be(data, "StreamIsRecorded")?,
+            }),
+            USR_PING_REQUEST => Ok(Self::PingRequest {
+                timestamp_ms: read_u32_be(data, "PingRequest")?,
+            }),
+            USR_PING_RESPONSE => Ok(Self::PingResponse {
+                timestamp_ms: read_u32_be(data, "PingResponse")?,
+            }),
+            other => Ok(Self::Unknown {
+                event_type: other,
+                data: data.to_vec(),
+            }),
+        }
+    }
+
+    /// 2-byte BE event-type identifier per §7.1.7. Matches the value
+    /// the wire form embeds in its first two bytes.
+    pub fn event_type(&self) -> u16 {
+        match self {
+            Self::StreamBegin { .. } => USR_STREAM_BEGIN,
+            Self::StreamEof { .. } => USR_STREAM_EOF,
+            Self::StreamDry { .. } => USR_STREAM_DRY,
+            Self::SetBufferLength { .. } => USR_SET_BUFFER_LENGTH,
+            Self::StreamIsRecorded { .. } => USR_STREAM_IS_RECORDED,
+            Self::PingRequest { .. } => USR_PING_REQUEST,
+            Self::PingResponse { .. } => USR_PING_RESPONSE,
+            Self::Unknown { event_type, .. } => *event_type,
+        }
+    }
+
+    /// True iff this is one of the seven event types §3.7 / §7.1.7
+    /// assigns a fixed shape to. [`Self::Unknown`] returns false.
+    pub fn is_spec_defined(&self) -> bool {
+        !matches!(self, Self::Unknown { .. })
+    }
+
+    /// Inverse of [`Self::parse`]: produce the matching protocol
+    /// control [`Message`] (msg_type_id = 4, msg_stream_id = 0,
+    /// timestamp = 0). For the seven spec-defined variants this
+    /// emits byte-for-byte the same payload the corresponding
+    /// `build_user_control_*` builder would; for [`Self::Unknown`]
+    /// the event-type bytes and the carried `data` are concatenated
+    /// verbatim, so a parse / re-encode cycle is byte-stable.
+    pub fn to_message(&self) -> Message {
+        match self {
+            Self::StreamBegin { stream_id } => build_user_control_stream_begin(*stream_id),
+            Self::StreamEof { stream_id } => build_user_control_stream_eof(*stream_id),
+            Self::StreamDry { stream_id } => build_user_control_stream_dry(*stream_id),
+            Self::SetBufferLength {
+                stream_id,
+                buffer_ms,
+            } => build_user_control_set_buffer_length(*stream_id, *buffer_ms),
+            Self::StreamIsRecorded { stream_id } => {
+                build_user_control_stream_is_recorded(*stream_id)
+            }
+            Self::PingRequest { timestamp_ms } => build_user_control_ping_request(*timestamp_ms),
+            Self::PingResponse { timestamp_ms } => build_user_control_ping_response(*timestamp_ms),
+            Self::Unknown { event_type, data } => {
+                let mut p = Vec::with_capacity(2 + data.len());
+                p.extend_from_slice(&event_type.to_be_bytes());
+                p.extend_from_slice(data);
+                Message {
+                    msg_type_id: MSG_USER_CONTROL,
+                    msg_stream_id: 0,
+                    timestamp: 0,
+                    payload: p,
+                }
+            }
+        }
+    }
+}
+
+/// Helper for [`UserControlEvent::parse`] — read a 4-byte BE field
+/// out of `event_data` or surface [`Error::ProtocolViolation`] with
+/// the variant name in the message.
+fn read_u32_be(data: &[u8], variant: &str) -> Result<u32> {
+    if data.len() < 4 {
+        return Err(Error::ProtocolViolation(format!(
+            "UserControl {variant}: event data {} < 4 bytes",
+            data.len()
+        )));
+    }
+    Ok(u32::from_be_bytes([data[0], data[1], data[2], data[3]]))
 }
 
 pub fn build_ack(bytes_received: u32) -> Message {
@@ -650,5 +845,159 @@ mod tests {
         let legacy = build_connect_result(7.0);
         let empty = build_connect_result_with_caps(7.0, &ConnectCapabilities::default());
         assert_eq!(legacy.payload, empty.payload);
+    }
+
+    // ---- UserControlEvent typed accessor (parse + round-trip) -----------
+
+    /// `UserControlEvent::parse` classifies each spec-defined event
+    /// type into its strongly-typed variant. Spot-check all seven.
+    #[test]
+    fn user_control_event_parse_recognises_spec_types() {
+        let cases: &[(&[u8], UserControlEvent)] = &[
+            (
+                &[0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+                UserControlEvent::StreamBegin { stream_id: 1 },
+            ),
+            (
+                &[0x00, 0x01, 0x00, 0x00, 0x00, 0x07],
+                UserControlEvent::StreamEof { stream_id: 7 },
+            ),
+            (
+                &[0x00, 0x02, 0x00, 0x10, 0x20, 0x30],
+                UserControlEvent::StreamDry {
+                    stream_id: 0x0010_2030,
+                },
+            ),
+            (
+                &[0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0B, 0xB8],
+                UserControlEvent::SetBufferLength {
+                    stream_id: 1,
+                    buffer_ms: 3000,
+                },
+            ),
+            (
+                &[0x00, 0x04, 0x00, 0x00, 0x00, 0x05],
+                UserControlEvent::StreamIsRecorded { stream_id: 5 },
+            ),
+            (
+                &[0x00, 0x06, 0xDE, 0xAD, 0xBE, 0xEF],
+                UserControlEvent::PingRequest {
+                    timestamp_ms: 0xDEAD_BEEF,
+                },
+            ),
+            (
+                &[0x00, 0x07, 0xDE, 0xAD, 0xBE, 0xEF],
+                UserControlEvent::PingResponse {
+                    timestamp_ms: 0xDEAD_BEEF,
+                },
+            ),
+        ];
+        for (wire, expected) in cases {
+            let parsed = UserControlEvent::parse(wire).expect("parse UCM");
+            assert_eq!(&parsed, expected);
+            assert!(parsed.is_spec_defined());
+            assert_eq!(
+                parsed.event_type() as usize,
+                ((wire[0] as usize) << 8) | wire[1] as usize
+            );
+        }
+    }
+
+    /// Parse → re-encode of each spec-defined builder output is
+    /// byte-identical to the original. Locks the inverse property
+    /// against accidental wire-format drift.
+    #[test]
+    fn user_control_event_round_trip_matches_builder_bytes() {
+        let originals = [
+            build_user_control_stream_begin(1),
+            build_user_control_stream_eof(7),
+            build_user_control_stream_dry(0x0010_2030),
+            build_user_control_set_buffer_length(1, 3000),
+            build_user_control_stream_is_recorded(5),
+            build_user_control_ping_request(0xDEAD_BEEF),
+            build_user_control_ping_response(0xDEAD_BEEF),
+        ];
+        for m in &originals {
+            let parsed = UserControlEvent::parse(&m.payload).expect("parse UCM");
+            let rebuilt = parsed.to_message();
+            assert_eq!(rebuilt.msg_type_id, MSG_USER_CONTROL);
+            assert_eq!(rebuilt.msg_stream_id, 0);
+            assert_eq!(rebuilt.timestamp, 0);
+            assert_eq!(rebuilt.payload, m.payload);
+        }
+    }
+
+    /// UCM event type 5 (spec-reserved) and any value ≥ 8 surface as
+    /// [`UserControlEvent::Unknown`] with the unconsumed tail bytes
+    /// preserved verbatim. Round-tripping an `Unknown` rebuilds the
+    /// exact same payload — forwarding ingests stay format-neutral.
+    #[test]
+    fn user_control_event_unknown_preserves_event_type_and_tail() {
+        // §7.1.7 leaves event type 5 reserved.
+        let wire: &[u8] = &[0x00, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let parsed = UserControlEvent::parse(wire).expect("parse reserved UCM");
+        assert_eq!(
+            parsed,
+            UserControlEvent::Unknown {
+                event_type: 5,
+                data: vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+            },
+        );
+        assert!(!parsed.is_spec_defined());
+        assert_eq!(parsed.event_type(), 5);
+        // Round-trip: the rebuilt payload is byte-identical.
+        let rebuilt = parsed.to_message();
+        assert_eq!(rebuilt.payload, wire);
+
+        // Forward-compat: any event type ≥ 8 also lands in Unknown,
+        // even with an empty event-data tail (no truncation refusal).
+        let future: &[u8] = &[0xFF, 0xFE];
+        let parsed_future = UserControlEvent::parse(future).expect("parse future UCM");
+        assert_eq!(
+            parsed_future,
+            UserControlEvent::Unknown {
+                event_type: 0xFFFE,
+                data: Vec::new(),
+            },
+        );
+        assert_eq!(parsed_future.to_message().payload, future);
+    }
+
+    /// `parse` refuses payloads truncated below the 2-byte event-type
+    /// header AND below the fixed event-data size of each spec-defined
+    /// variant (`SetBufferLength` needs 8 bytes, every other
+    /// spec-defined variant needs 4 bytes).
+    #[test]
+    fn user_control_event_parse_rejects_truncated_payload() {
+        // < 2 bytes — can't even read the event type.
+        assert!(matches!(
+            UserControlEvent::parse(&[]),
+            Err(Error::ProtocolViolation(_))
+        ));
+        assert!(matches!(
+            UserControlEvent::parse(&[0x00]),
+            Err(Error::ProtocolViolation(_))
+        ));
+        // event type present but spec-defined variant body truncated.
+        for type_byte in [
+            USR_STREAM_BEGIN,
+            USR_STREAM_EOF,
+            USR_STREAM_DRY,
+            USR_STREAM_IS_RECORDED,
+            USR_PING_REQUEST,
+            USR_PING_RESPONSE,
+        ] {
+            let wire = [(type_byte >> 8) as u8, type_byte as u8, 0x00, 0x00, 0x00];
+            assert!(matches!(
+                UserControlEvent::parse(&wire),
+                Err(Error::ProtocolViolation(_))
+            ));
+        }
+        // SetBufferLength's 8-byte rule: 7 bytes refused, 8 accepted.
+        let too_short = [0x00, 0x03, 0, 0, 0, 1, 0, 0, 11];
+        assert!(matches!(
+            UserControlEvent::parse(&too_short),
+            Err(Error::ProtocolViolation(_))
+        ));
     }
 }
