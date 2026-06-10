@@ -70,12 +70,12 @@ pub use caps::{
     FOURCC_INFO_CAN_FORWARD, FOURCC_WILDCARD, OBJECT_ENCODING_AMF0, OBJECT_ENCODING_AMF3,
 };
 pub use chunk::{Message, MessageStreamKind};
-pub use client::{ClientEvent, RtmpClient, RtmpUrl};
+pub use client::{resolve_tc_url, ClientEvent, RtmpClient, RtmpUrl};
 pub use error::{Error, Result};
 pub use flv::{
     AudioTag, ModEx, MultichannelConfig, MultichannelConfigOrder, Multitrack, MultitrackTrack,
     VideoTag,
 };
 pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
-pub use message::UserControlEvent;
+pub use message::{UserControlEvent, RECONNECT_REQUEST_CODE};
 pub use server::{PublishRequest, RtmpServer, RtmpSession, StreamPacket};

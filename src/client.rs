@@ -87,6 +87,28 @@ pub enum ClientEvent {
         code: String,
         description: String,
     },
+    /// The server emitted
+    /// `onStatus(NetConnection.Connect.ReconnectRequest)` — Enhanced
+    /// RTMP v2 §"Reconnect Request". The server is asking us to
+    /// reconnect, e.g. ahead of a server update or to remap us to a
+    /// different server instance.
+    ///
+    /// Per the spec's message flow, on receipt the client "persists
+    /// in streaming to/from the current server up to the next
+    /// appropriate media boundary, such as a keyframe. Subsequently,
+    /// it establishes a connection with a new server and disconnects
+    /// from the old server." So: finish the current GOP, then dial
+    /// [`RtmpClient::resolve_reconnect_url`]`(tc_url.as_deref())` with
+    /// a fresh [`RtmpClient::connect`] and drop this client.
+    ///
+    /// `tc_url` is the optional Info-Object property naming where to
+    /// reconnect — an absolute (`rtmp://host/app`) or relative
+    /// (`//host/app`, `/app`) URI reference. `None` means "use the
+    /// tcUrl for the current connection" per spec.
+    ReconnectRequest {
+        tc_url: Option<String>,
+        description: String,
+    },
     /// The server emitted `_result(transaction_id, ...)` for a command
     /// the client issued. The publish-time `connect` / `createStream`
     /// transactions are consumed internally by [`RtmpClient::connect`];
@@ -136,6 +158,13 @@ pub struct RtmpClient {
     /// advertise any v1+v2 capabilities (the historical pre-2023
     /// shape). Inspect via [`server_capabilities`](Self::server_capabilities).
     server_caps: ConnectCapabilities,
+    /// The `tcUrl` this client dialled, kept so an Enhanced RTMP v2
+    /// `NetConnection.Connect.ReconnectRequest` whose Info Object
+    /// omits `tcUrl` — or names a *relative* URI reference — can be
+    /// resolved per spec ("if not specified, use the tcUrl for the
+    /// current connection. A relative URI reference should be
+    /// resolved relative to the tcUrl for the current connection").
+    tc_url: String,
     /// Sub-messages decomposed out of a server-originated Aggregate
     /// Message (type 22) per RTMP 1.0 §7.1.6 but not yet routed
     /// through the [`poll_event`](Self::poll_event) classify path.
@@ -241,6 +270,36 @@ impl RtmpClient {
         &self.server_caps
     }
 
+    /// The `tcUrl` this client dialled (e.g.
+    /// `rtmp://host:1935/app`) — the base every Enhanced RTMP v2
+    /// reconnect target resolves against.
+    pub fn tc_url(&self) -> &str {
+        &self.tc_url
+    }
+
+    /// Resolve the `tcUrl` carried by an Enhanced RTMP v2
+    /// [`ClientEvent::ReconnectRequest`] into the absolute URL to
+    /// re-dial, per `enhanced-rtmp-v2.pdf` §"Reconnect Request":
+    ///
+    /// * `None` → "use the tcUrl for the current connection".
+    /// * `Some(reference)` → "absolute or relative URI reference of
+    ///   the server to which to reconnect. A relative URI reference
+    ///   should be resolved relative to the tcUrl for the current
+    ///   connection." All four spec example shapes are honoured:
+    ///   `rtmp://foo.mydomain.com:1935/realtimeapp` (absolute),
+    ///   `//192.0.2.0/realtimeapp` (network-path: keep our scheme),
+    ///   `/realtimeapp` (absolute-path: keep scheme + authority), and
+    ///   `realtimeapp` (relative-path: merge onto our tcUrl's path).
+    ///
+    /// Append the stream key (`/{stream_name}`) and feed the result to
+    /// [`RtmpClient::connect`] to complete the spec's reconnect flow.
+    pub fn resolve_reconnect_url(&self, tc_url: Option<&str>) -> String {
+        match tc_url {
+            Some(reference) => resolve_tc_url(&self.tc_url, reference),
+            None => self.tc_url.clone(),
+        }
+    }
+
     fn connect_parsed(u: &RtmpUrl, publish_type: &str, caps: &ConnectCapabilities) -> Result<Self> {
         let sock_addr = (u.host.as_str(), u.port)
             .to_socket_addrs()
@@ -321,6 +380,7 @@ impl RtmpClient {
             next_tx: 10.0,
             read_eof: false,
             server_caps,
+            tc_url: u.tc_url.clone(),
             pending_subs: VecDeque::new(),
         })
     }
@@ -995,6 +1055,55 @@ fn ucm_stream_id(event_data: &[u8]) -> Result<u32> {
     ]))
 }
 
+/// Resolve a reconnect-target URI reference against the current
+/// connection's `tcUrl`, per `enhanced-rtmp-v2.pdf` §"Reconnect
+/// Request" ("a relative URI reference should be resolved relative to
+/// the tcUrl for the current connection"). Handles the four reference
+/// shapes the spec's Info Object table gives as examples:
+///
+/// 1. `rtmp://foo.mydomain.com:1935/realtimeapp` — absolute (has a
+///    scheme): taken verbatim.
+/// 2. `//192.0.2.0/realtimeapp` — network-path reference: inherits
+///    only the base's scheme.
+/// 3. `/realtimeapp` — absolute-path reference: inherits the base's
+///    scheme + authority.
+/// 4. `realtimeapp` — relative-path reference: merged onto the base's
+///    path with the last segment replaced.
+///
+/// An empty reference resolves to the base itself.
+pub fn resolve_tc_url(base: &str, reference: &str) -> String {
+    if reference.is_empty() {
+        return base.to_owned();
+    }
+    if reference.contains("://") {
+        // Absolute URI reference — already carries its own scheme.
+        return reference.to_owned();
+    }
+    let (scheme, after_scheme) = match base.find("://") {
+        Some(i) => (&base[..i], &base[i + 3..]),
+        None => ("rtmp", base),
+    };
+    if let Some(net_path) = reference.strip_prefix("//") {
+        // Network-path reference: keep only our scheme.
+        return format!("{scheme}://{net_path}");
+    }
+    let (authority, base_path) = match after_scheme.find('/') {
+        Some(i) => (&after_scheme[..i], &after_scheme[i..]),
+        None => (after_scheme, ""),
+    };
+    if reference.starts_with('/') {
+        // Absolute-path reference: keep scheme + authority.
+        return format!("{scheme}://{authority}{reference}");
+    }
+    // Relative-path reference: merge — drop the base path's last
+    // segment, keep everything up to (and including) its final '/'.
+    let dir = match base_path.rfind('/') {
+        Some(i) => &base_path[..=i],
+        None => "/",
+    };
+    format!("{scheme}://{authority}{dir}{reference}")
+}
+
 /// Classify a decoded AMF0 command message into a [`ClientEvent`].
 /// Matches `onStatus` / `_result` / `_error` by name and pulls the
 /// transaction id / info object out of the expected slots.
@@ -1019,6 +1128,24 @@ fn classify_command(values: Vec<Amf0Value>) -> ClientEvent {
                     .and_then(Amf0Value::as_str)
                     .unwrap_or("")
                     .to_owned();
+                // Enhanced RTMP v2 §"Reconnect Request": the server
+                // asks us to reconnect via a NetConnection-level
+                // onStatus whose code MUST be
+                // NetConnection.Connect.ReconnectRequest and whose
+                // level MUST be "status". Lift the optional tcUrl so
+                // the caller can re-dial; an event with the right code
+                // but the wrong level is NOT a valid reconnect request
+                // per spec, so it falls through as a plain OnStatus.
+                if code == crate::message::RECONNECT_REQUEST_CODE && level == "status" {
+                    let tc_url = info
+                        .get("tcUrl")
+                        .and_then(Amf0Value::as_str)
+                        .map(str::to_owned);
+                    return ClientEvent::ReconnectRequest {
+                        tc_url,
+                        description,
+                    };
+                }
                 return ClientEvent::OnStatus {
                     level,
                     code,
@@ -1102,6 +1229,104 @@ mod tests {
             }
             other => panic!("expected OnStatus, got {other:?}"),
         }
+    }
+
+    /// Enhanced RTMP v2 §"Reconnect Request": an onStatus whose code
+    /// is `NetConnection.Connect.ReconnectRequest` (level `status`)
+    /// lifts to [`ClientEvent::ReconnectRequest`] with the optional
+    /// `tcUrl` extracted — and the same code under a non-`status`
+    /// level is NOT a valid reconnect request per spec ("to reconnect
+    /// the level MUST be set to status"), so it stays a plain
+    /// OnStatus.
+    #[test]
+    fn classify_command_recognises_reconnect_request() {
+        let msg = crate::message::build_reconnect_request(
+            Some("//192.0.2.0/realtimeapp"),
+            Some("server update"),
+        );
+        let values = amf::decode_all(&msg.payload).unwrap();
+        match classify_command(values) {
+            ClientEvent::ReconnectRequest {
+                tc_url,
+                description,
+            } => {
+                assert_eq!(tc_url.as_deref(), Some("//192.0.2.0/realtimeapp"));
+                assert_eq!(description, "server update");
+            }
+            other => panic!("expected ReconnectRequest, got {other:?}"),
+        }
+
+        // tcUrl omitted → None ("use the tcUrl for the current
+        // connection").
+        let msg = crate::message::build_reconnect_request(None, None);
+        let values = amf::decode_all(&msg.payload).unwrap();
+        match classify_command(values) {
+            ClientEvent::ReconnectRequest { tc_url, .. } => assert_eq!(tc_url, None),
+            other => panic!("expected ReconnectRequest, got {other:?}"),
+        }
+
+        // Wrong level → plain OnStatus passthrough.
+        let info = Amf0Value::Object(vec![
+            ("level".into(), Amf0Value::String("error".into())),
+            (
+                "code".into(),
+                Amf0Value::String(crate::message::RECONNECT_REQUEST_CODE.into()),
+            ),
+        ]);
+        let values = vec![
+            Amf0Value::String("onStatus".into()),
+            Amf0Value::Number(0.0),
+            Amf0Value::Null,
+            info,
+        ];
+        match classify_command(values) {
+            ClientEvent::OnStatus { level, code, .. } => {
+                assert_eq!(level, "error");
+                assert_eq!(code, crate::message::RECONNECT_REQUEST_CODE);
+            }
+            other => panic!("expected OnStatus, got {other:?}"),
+        }
+    }
+
+    /// The four reference shapes from the spec's Info Object table
+    /// (`enhanced-rtmp-v2.pdf` §"Reconnect Request"), resolved against
+    /// a typical publisher tcUrl.
+    #[test]
+    fn resolve_tc_url_spec_example_shapes() {
+        let base = "rtmp://origin.example.com:1935/live";
+        // 1. Absolute URI reference — verbatim.
+        assert_eq!(
+            resolve_tc_url(base, "rtmp://foo.mydomain.com:1935/realtimeapp"),
+            "rtmp://foo.mydomain.com:1935/realtimeapp"
+        );
+        // 2. Network-path reference — inherits only our scheme.
+        assert_eq!(
+            resolve_tc_url(base, "//192.0.2.0/realtimeapp"),
+            "rtmp://192.0.2.0/realtimeapp"
+        );
+        // 3. Absolute-path reference — inherits scheme + authority.
+        assert_eq!(
+            resolve_tc_url(base, "/realtimeapp"),
+            "rtmp://origin.example.com:1935/realtimeapp"
+        );
+        // 4. Relative-path reference — merged onto the base path with
+        //    the last segment replaced.
+        assert_eq!(
+            resolve_tc_url(base, "realtimeapp"),
+            "rtmp://origin.example.com:1935/realtimeapp"
+        );
+        // Deeper base path: only the last segment is replaced.
+        assert_eq!(
+            resolve_tc_url("rtmp://h/app/inst", "other"),
+            "rtmp://h/app/other"
+        );
+        // Empty reference → base itself.
+        assert_eq!(resolve_tc_url(base, ""), base);
+        // Base without any path: relative ref lands at the root.
+        assert_eq!(
+            resolve_tc_url("rtmp://h:1935", "realtimeapp"),
+            "rtmp://h:1935/realtimeapp"
+        );
     }
 
     #[test]

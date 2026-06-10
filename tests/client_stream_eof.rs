@@ -109,7 +109,8 @@ fn client_observes_stream_eof_from_server_clean_close() {
             }
             Ok(Some(ClientEvent::StreamDry { .. }))
             | Ok(Some(ClientEvent::StreamIsRecorded { .. }))
-            | Ok(Some(ClientEvent::PingResponse { .. })) => {
+            | Ok(Some(ClientEvent::PingResponse { .. }))
+            | Ok(Some(ClientEvent::ReconnectRequest { .. })) => {
                 // The session_close path doesn't emit these UCM events
                 // — but a defensive `match` keeps the test forward-
                 // compatible if the server's teardown adds one later.

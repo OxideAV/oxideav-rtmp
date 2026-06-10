@@ -187,6 +187,26 @@ client.close()?;
   pre-2023 connect command. Resolves the previous "high-level publish
   helper opts in once the configurable codec-list follow-up lands" note
   for both audio and video FourCC advertisements.
+- **Enhanced RTMP v2 Reconnect Request** (Veovera 2026). The
+  `NetConnection.Connect.ReconnectRequest` status event
+  (`enhanced-rtmp-v2.pdf` §"Reconnect Request") is wired end-to-end:
+  `RtmpSession::send_reconnect_request(tc_url, description)` emits the
+  spec's NetConnection-level onStatus command (message stream 0,
+  transaction id 0, null Command Object; `code`/`level` mandatory,
+  `tcUrl`/`description` omitted from the wire when `None`) so an
+  ingest can ask its publisher to move ahead of a server update or a
+  load-balancing remap, and `RtmpClient::poll_event` surfaces it as
+  the typed `ClientEvent::ReconnectRequest { tc_url, description }`
+  (the spec's level-MUST-be-`status` rule is enforced — a mismatched
+  level stays a plain `OnStatus`). `RtmpClient::resolve_reconnect_url`
+  / the free `resolve_tc_url(base, reference)` apply the spec's
+  resolution rule for all four documented `tcUrl` shapes (absolute,
+  `//host/app`, `/app`, `app`; `None` falls back to the current
+  connection's tcUrl, exposed via `RtmpClient::tc_url()`). Per spec,
+  neither side tears the session down on the event — the old server
+  keeps processing publisher messages until the client disconnects at
+  its next media boundary (`tests/reconnect_request.rs` proves both
+  directions over loopback).
 - **Enhanced RTMP v2 `ModEx` prelude** (Veovera 2026). The `ModEx`
   packet-type signal (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" /
   §"ExAudioTagHeader") is decoded for both audio and video: a chain

@@ -667,6 +667,65 @@ pub fn build_on_status(stream_id: u32, level: &str, code: &str, description: &st
     }
 }
 
+/// The `code` string a server MUST set in the onStatus Info Object to
+/// request a client reconnect, per `enhanced-rtmp-v2.pdf` §"Reconnect
+/// Request" (table "Info Object parameter for onStatus command when
+/// handling reconnect").
+pub const RECONNECT_REQUEST_CODE: &str = "NetConnection.Connect.ReconnectRequest";
+
+/// `onStatus(NetConnection.Connect.ReconnectRequest)` — Enhanced RTMP
+/// v2 §"Reconnect Request". A server emits this NetConnection-level
+/// onStatus command to ask the client to reconnect — e.g. ahead of a
+/// live-streaming-server update, or to remap the client to a
+/// different server instance for load balancing / geolocation.
+///
+/// Per the spec's Info Object table:
+///
+/// * `code` MUST be `NetConnection.Connect.ReconnectRequest`
+///   ([`RECONNECT_REQUEST_CODE`]).
+/// * `level` MUST be `status`.
+/// * `tcUrl` (optional) — "absolute or relative URI reference of the
+///   server to which to reconnect. If not specified, use the tcUrl
+///   for the current connection." A server that aims to remap the
+///   client MUST set it.
+/// * `description` (optional) — human-readable information about the
+///   message.
+///
+/// The command rides the NetConnection (message stream id 0) with
+/// transaction id 0 ("no response needed") and a null Command Object,
+/// matching the spec's "Server to client, NetConnection onStatus
+/// command" table.
+pub fn build_reconnect_request(tc_url: Option<&str>, description: Option<&str>) -> Message {
+    let mut props = vec![
+        (
+            "code".into(),
+            Amf0Value::String(RECONNECT_REQUEST_CODE.into()),
+        ),
+        ("level".into(), Amf0Value::String("status".into())),
+    ];
+    if let Some(desc) = description {
+        props.push(("description".into(), Amf0Value::String(desc.into())));
+    }
+    if let Some(url) = tc_url {
+        props.push(("tcUrl".into(), Amf0Value::String(url.into())));
+    }
+    let payload = encode_command(
+        "onStatus",
+        0.0,
+        Amf0Value::Null,
+        &[Amf0Value::Object(props)],
+    );
+    Message {
+        msg_type_id: MSG_COMMAND_AMF0,
+        // NetConnection commands live on the control stream (message
+        // stream id 0) — this is a connection-level status event, not
+        // a NetStream one.
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload,
+    }
+}
+
 /// `@setDataFrame("onMetaData", …)` — the standard way to publish
 /// per-stream metadata (width, height, video/audio codec ids,
 /// duration, …) before the first audio/video packet.
@@ -1030,5 +1089,65 @@ mod tests {
             UserControlEvent::parse(&too_short),
             Err(Error::ProtocolViolation(_))
         ));
+    }
+
+    /// `build_reconnect_request` shape per `enhanced-rtmp-v2.pdf`
+    /// §"Reconnect Request": `["onStatus", 0.0, null, info]`, where
+    /// info carries `code = NetConnection.Connect.ReconnectRequest`,
+    /// `level = status`, plus the optional `tcUrl` / `description`
+    /// pairs — and the command rides message stream 0 (NetConnection,
+    /// not NetStream).
+    #[test]
+    fn reconnect_request_full_info_object() {
+        let m = build_reconnect_request(
+            Some("rtmp://foo.mydomain.com:1935/realtimeapp"),
+            Some("The streaming server is undergoing updates."),
+        );
+        assert_eq!(m.msg_type_id, MSG_COMMAND_AMF0);
+        assert_eq!(m.msg_stream_id, 0, "NetConnection command stream");
+        let vals = crate::amf::decode_all(&m.payload).unwrap();
+        assert_eq!(vals[0].as_str(), Some("onStatus"));
+        assert_eq!(vals[1].as_f64(), Some(0.0), "transaction id 0");
+        assert_eq!(vals[2], Amf0Value::Null, "no command object");
+        let info = &vals[3];
+        assert_eq!(
+            info.get("code").and_then(Amf0Value::as_str),
+            Some(RECONNECT_REQUEST_CODE)
+        );
+        assert_eq!(
+            info.get("level").and_then(Amf0Value::as_str),
+            Some("status")
+        );
+        assert_eq!(
+            info.get("tcUrl").and_then(Amf0Value::as_str),
+            Some("rtmp://foo.mydomain.com:1935/realtimeapp")
+        );
+        assert_eq!(
+            info.get("description").and_then(Amf0Value::as_str),
+            Some("The streaming server is undergoing updates.")
+        );
+    }
+
+    /// Both Info Object extras are optional per spec — when neither is
+    /// supplied the info object carries exactly the two mandatory
+    /// pairs (`code`, `level`).
+    #[test]
+    fn reconnect_request_minimal_info_object() {
+        let m = build_reconnect_request(None, None);
+        let vals = crate::amf::decode_all(&m.payload).unwrap();
+        let info = &vals[3];
+        assert_eq!(
+            info.get("code").and_then(Amf0Value::as_str),
+            Some(RECONNECT_REQUEST_CODE)
+        );
+        assert_eq!(
+            info.get("level").and_then(Amf0Value::as_str),
+            Some("status")
+        );
+        assert!(info.get("tcUrl").is_none(), "tcUrl omitted when None");
+        assert!(
+            info.get("description").is_none(),
+            "description omitted when None"
+        );
     }
 }

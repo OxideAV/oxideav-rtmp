@@ -385,6 +385,41 @@ impl RtmpSession {
         Ok(())
     }
 
+    /// Ask the publisher to reconnect — Enhanced RTMP v2 §"Reconnect
+    /// Request".
+    ///
+    /// Emits the `onStatus(NetConnection.Connect.ReconnectRequest)`
+    /// NetConnection command (message stream 0, transaction id 0, null
+    /// Command Object). Per the spec's message flow, a server does
+    /// this "prior to the shutdown of the live streaming server or
+    /// when the server intends to remap the client to another server
+    /// instance" — and when remapping, it MUST pass the target via
+    /// `tc_url` (absolute or relative URI reference; `None` tells the
+    /// client to re-dial the tcUrl of the current connection).
+    ///
+    /// After sending, the spec requires the old server to "continue
+    /// processing messages from the client until the client
+    /// disconnects" — so keep pumping
+    /// [`next_packet`](Self::next_packet) as usual; the publisher
+    /// drains up to its next appropriate media boundary (such as a
+    /// keyframe) before it actually moves.
+    ///
+    /// Note: per §"Enhancing NetConnection connect Command" the peer
+    /// advertises reconnect support via the `capsEx`
+    /// [`CAPS_EX_RECONNECT`](crate::caps::CAPS_EX_RECONNECT) bit —
+    /// check [`PublishRequest::capabilities`] before relying on the
+    /// client honouring this event.
+    pub fn send_reconnect_request(
+        &mut self,
+        tc_url: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<()> {
+        self.writer
+            .write_message(CSID_COMMAND, &build_reconnect_request(tc_url, description))?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Close the session politely.
     ///
     /// On the wire we emit, in order:

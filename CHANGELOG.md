@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enhanced RTMP v2 Reconnect Request — end-to-end**
+  (`src/message.rs`, `src/server.rs`, `src/client.rs`). Round 277 wires
+  the `NetConnection.Connect.ReconnectRequest` status event from
+  `enhanced-rtmp-v2.pdf` §"Reconnect Request" — until now the crate
+  advertised the matching `capsEx` `Reconnect` bit (`CAPS_EX_RECONNECT`)
+  during connect-capability negotiation but had no way to *send* or
+  *react to* the event itself. New
+  `message::build_reconnect_request(tc_url, description)` emits the
+  spec's NetConnection-level onStatus shape — `["onStatus", 0.0, null,
+  info]` on message stream 0, with the Info Object carrying the
+  mandatory `code = NetConnection.Connect.ReconnectRequest`
+  (exported as `RECONNECT_REQUEST_CODE`) + `level = "status"` pairs
+  and the optional `tcUrl` / `description` properties (omitted from
+  the wire when `None`, per their "optional" marking in the spec's
+  Info Object table). `RtmpSession::send_reconnect_request` is the
+  ingest-side helper — used "prior to the shutdown of the live
+  streaming server or when the server intends to remap the client to
+  another server instance," after which the old server keeps
+  processing publisher messages per spec (so `next_packet` pumping
+  continues unchanged). On the publisher side,
+  `RtmpClient::poll_event` now classifies the event into the new typed
+  `ClientEvent::ReconnectRequest { tc_url, description }` variant
+  (code match alone is not enough — the spec says level MUST be
+  `status`, so a mismatched level falls through as a plain
+  `OnStatus`). The new `resolve_tc_url(base, reference)` /
+  `RtmpClient::resolve_reconnect_url(Option<&str>)` helpers apply the
+  spec's target-resolution rule — "if not specified, use the tcUrl for
+  the current connection. A relative URI reference should be resolved
+  relative to the tcUrl for the current connection" — covering all
+  four reference shapes the Info Object table gives as examples
+  (absolute `rtmp://host:port/app`, network-path `//host/app`,
+  absolute-path `/app`, and relative-path `app`); `RtmpClient::tc_url()`
+  exposes the stored base. Tests: wire-shape + optional-property
+  omission in `src/message.rs`, classification + resolution tables in
+  `src/client.rs`, and `tests/reconnect_request.rs` drives both
+  loopback flows end-to-end — including the spec's "old server SHOULD
+  continue processing messages from the client until the client
+  disconnects" behaviour, proven by publishing a post-request keyframe
+  that the requesting server still receives.
+
 - **Abort Message (protocol control type 2) builder + reader-side
   partial-message discard** (`src/message.rs`, `src/chunk.rs`). Round 271
   closes the last protocol-control message that had a type-id constant
