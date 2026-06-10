@@ -181,6 +181,41 @@ impl<R: Read> ChunkReader<R> {
         self.chunk_size
     }
 
+    /// React to an inbound Abort Message (RTMP 1.0 §5.2) by discarding the
+    /// partially-received message on the named chunk stream id.
+    ///
+    /// Per §5.2, the Abort Message tells a receiver that "is waiting for
+    /// chunks to complete a message" to "discard the partially received
+    /// message over a chunk stream and abort processing of that message."
+    /// The sender uses it after transmitting part of a message it has
+    /// decided not to finish, so the receiver must drop the half-filled
+    /// reassembly buffer rather than splice the abandoned bytes onto the
+    /// next message that arrives on the same csid.
+    ///
+    /// This clears only the in-flight payload bytes; the csid's header
+    /// state (last timestamp / type / length / extended-timestamp latch)
+    /// is left intact, because a subsequent fmt-1/2/3 chunk on the csid
+    /// still relies on it per §5.3.2, and a fmt-0 chunk would overwrite
+    /// it anyway. An Abort for a csid that has no in-flight message (or
+    /// one this reader has never seen) is a no-op, matching the spec's
+    /// "if it is waiting for chunks" precondition. Returns `true` when a
+    /// non-empty partial buffer was actually discarded.
+    ///
+    /// The control flow lives at the message layer one level up — like
+    /// [`ChunkReader::set_chunk_size`], the reader does not auto-apply an
+    /// inbound Abort; the caller dispatches a
+    /// [`MSG_ABORT`](crate::message::MSG_ABORT) message's 4-byte
+    /// big-endian chunk stream id here.
+    pub fn abort_partial(&mut self, chunk_stream_id: u32) -> bool {
+        match self.states.get_mut(&chunk_stream_id) {
+            Some(st) if !st.partial.is_empty() => {
+                st.partial.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Borrow the underlying reader (for splitting, timeout config, …).
     pub fn inner_mut(&mut self) -> &mut R {
         &mut self.stream
@@ -621,6 +656,48 @@ mod tests {
         assert_eq!(msg.payload, payload);
         assert_eq!(msg.msg_type_id, 9);
         assert_eq!(msg.timestamp, 7000);
+    }
+
+    /// RTMP 1.0 §5.2 Abort Message: after a publisher sends part of a
+    /// multi-chunk message and then aborts it, the receiver must discard
+    /// the half-filled reassembly buffer for that csid. We build a
+    /// two-chunk message, hand the reader only the first chunk (so it is
+    /// "waiting for chunks to complete a message" and `read_message`
+    /// surfaces `UnexpectedEof`), then assert `abort_partial` reports it
+    /// discarded a non-empty buffer.
+    #[test]
+    fn abort_partial_discards_in_flight_message() {
+        let payload: Vec<u8> = (0..200u16).map(|i| (i & 0xFF) as u8).collect();
+        let mut full = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut full);
+            w.set_chunk_size(128);
+            w.write_message(
+                5,
+                &Message {
+                    msg_type_id: 9,
+                    msg_stream_id: 1,
+                    timestamp: 1000,
+                    payload: payload.clone(),
+                },
+            )
+            .unwrap();
+        }
+        // First chunk = fmt-0 header (12 bytes) + 128 payload bytes. Hand
+        // the reader only that prefix so the second chunk never arrives.
+        let first_chunk = &full[..12 + 128];
+        let mut r = ChunkReader::new(Cursor::new(first_chunk));
+        r.set_chunk_size(128);
+        // Reading blocks for the missing chunk, hitting EOF — the csid-5
+        // partial buffer now holds the first 128 bytes.
+        let err = r.read_message().unwrap_err();
+        assert!(matches!(err, Error::Io(_) | Error::UnexpectedEof));
+        // §5.2 discard: a non-empty partial exists, so abort returns true
+        // and clears it; a second abort on the now-empty csid is a no-op.
+        assert!(r.abort_partial(5), "first abort should discard 128 bytes");
+        assert!(!r.abort_partial(5), "second abort has nothing to discard");
+        // An abort for a csid the reader never saw is also a no-op.
+        assert!(!r.abort_partial(9));
     }
 
     /// Two back-to-back messages on the same csid should use fmt 3 for

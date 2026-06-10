@@ -272,7 +272,12 @@ non-standard:
   (`msg_type_id` 1..=6) carries a non-zero `msg_stream_id` — the spec
   §5 mandate "Protocol control messages MUST have message stream ID 0
   (called as control stream)" — or whenever the §4.1 reserved
-  high-byte rule is violated.
+  high-byte rule is violated. `ChunkReader::abort_partial(csid)` applies
+  an inbound Abort Message (RTMP 1.0 §5.2, protocol-control type 2):
+  it discards the half-filled reassembly buffer for the named chunk
+  stream id so abandoned bytes never splice onto the next message on
+  that csid (no-op when nothing is in flight); `message::build_abort`
+  is the matching outbound 4-byte-BE-csid builder.
 - `aggregate::{parse_aggregate, build_aggregate}` — Aggregate Message
   (RTMP 1.0 §7.1.6 type 22) parser + builder. Splits a single
   `Message` of type id 22 into its component FLV-shaped sub-messages

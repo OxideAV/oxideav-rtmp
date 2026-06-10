@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Abort Message (protocol control type 2) builder + reader-side
+  partial-message discard** (`src/message.rs`, `src/chunk.rs`). Round 271
+  closes the last protocol-control message that had a type-id constant
+  (`MSG_ABORT = 2`) but no builder and no consumer effect. New
+  `message::build_abort(chunk_stream_id)` emits the exact RTMP 1.0 §5.2
+  wire layout — a single 4-byte big-endian chunk stream ID (Figure 3) on
+  the control stream (`msg_type_id = MSG_ABORT`, `msg_stream_id = 0`,
+  `timestamp = 0`). New `ChunkReader::abort_partial(chunk_stream_id) ->
+  bool` gives the message its spec-mandated receiver behaviour: per §5.2
+  the Abort Message tells a peer "waiting for chunks to complete a
+  message" to "discard the partially received message over a chunk
+  stream and abort processing of that message," so `abort_partial`
+  clears the half-filled reassembly buffer for the named csid and
+  returns `true` when a non-empty partial was actually discarded.
+  Only the in-flight payload bytes are cleared; the csid's header state
+  (last timestamp / type / length / extended-timestamp latch) is left
+  intact because a subsequent fmt-1/2/3 chunk still relies on it per
+  §5.3.2. An Abort for a csid with no in-flight message — or one the
+  reader has never seen — is a no-op, matching the spec's "if it is
+  waiting for chunks" precondition. Like `ChunkReader::set_chunk_size`,
+  the reader does not auto-apply an inbound Abort; the message-layer
+  caller dispatches the decoded 4-byte csid here. Total lib tests:
+  226 → 228 (+2 — `message::tests::abort_wire_bytes` asserting the
+  byte-exact §5.2 payload, `chunk::tests::abort_partial_discards_in_
+  flight_message` driving a two-chunk message truncated after its first
+  chunk so the reader holds a partial buffer, then asserting
+  `abort_partial` discards it, is idempotent on the now-empty csid, and
+  is a no-op for an unseen csid). Sourced entirely from RTMP 1.0 §5.2
+  (staged at `docs/streaming/rtmp/rtmp_specification_1.0.pdf` /
+  `rtmp.part2.Message-Formats.pdf`).
 - **`message::UserControlEvent` — public typed view of a User Control
   Message body per RTMP 1.0 §3.7 / §7.1.7** (`src/message.rs`,
   `src/lib.rs`). Round 264 promotes the previously-private

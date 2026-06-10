@@ -58,6 +58,25 @@ pub fn build_set_chunk_size(size: u32) -> Message {
     }
 }
 
+/// Abort Message (protocol control type 2, RTMP 1.0 §5.2).
+///
+/// Per the spec, "Protocol control message 2, Abort Message, is used to
+/// notify the peer if it is waiting for chunks to complete a message,
+/// then to discard the partially received message over a chunk stream
+/// and abort processing of that message. The peer receives the chunk
+/// stream ID of the message to be discarded as payload of this protocol
+/// message." The body is a single 4-byte big-endian chunk stream ID
+/// (Figure 3). Like every protocol-control message it travels on the
+/// control stream (`msg_stream_id == 0`).
+pub fn build_abort(chunk_stream_id: u32) -> Message {
+    Message {
+        msg_type_id: MSG_ABORT,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload: chunk_stream_id.to_be_bytes().to_vec(),
+    }
+}
+
 pub fn build_window_ack_size(size: u32) -> Message {
     Message {
         msg_type_id: MSG_WINDOW_ACK_SIZE,
@@ -747,6 +766,18 @@ mod tests {
         assert_eq!(m.msg_type_id, MSG_USER_CONTROL);
         assert_eq!(m.msg_stream_id, 0);
         assert_eq!(m.payload, vec![0x00, 0x07, 0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    /// Wire bytes for an Abort Message (protocol control type 2, RTMP
+    /// 1.0 §5.2): a bare 4-byte big-endian chunk stream ID on the
+    /// control stream (`msg_stream_id == 0`, `timestamp == 0`).
+    #[test]
+    fn abort_wire_bytes() {
+        let m = build_abort(0x0001_0203);
+        assert_eq!(m.msg_type_id, MSG_ABORT);
+        assert_eq!(m.msg_stream_id, 0);
+        assert_eq!(m.timestamp, 0);
+        assert_eq!(m.payload, vec![0x00, 0x01, 0x02, 0x03]);
     }
 
     /// `build_connect_with_caps` with a default capability block emits
