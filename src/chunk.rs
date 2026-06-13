@@ -157,6 +157,22 @@ pub struct ChunkReader<R: Read> {
     stream: R,
     chunk_size: usize,
     states: HashMap<u32, InState>,
+    /// Cumulative number of bytes consumed off the wire — basic
+    /// headers, message headers, extended timestamps, and payload all
+    /// count. This is the running "sequence number" the §5.3
+    /// Acknowledgement reports. It wraps at `u32::MAX` like the wire
+    /// field; we keep it as `u32` so [`ack_due`](Self::ack_due) emits
+    /// the value verbatim.
+    received_bytes: u32,
+    /// The window size the *peer* asked us to use (its §5.5 Window
+    /// Acknowledgement Size). We owe an Acknowledgement once we have
+    /// received this many bytes since the last one. `0` disables the
+    /// obligation (no window negotiated yet / peer asked for none).
+    window_ack_size: u32,
+    /// Value of [`received_bytes`](Self::received_bytes) at the moment
+    /// we last emitted an Acknowledgement. The next ack is due once
+    /// `received_bytes - last_ack_bytes >= window_ack_size`.
+    last_ack_bytes: u32,
 }
 
 impl<R: Read> ChunkReader<R> {
@@ -165,6 +181,75 @@ impl<R: Read> ChunkReader<R> {
             stream,
             chunk_size: DEFAULT_CHUNK_SIZE,
             states: HashMap::new(),
+            received_bytes: 0,
+            window_ack_size: 0,
+            last_ack_bytes: 0,
+        }
+    }
+
+    /// Read exactly `buf.len()` bytes off the wire, charging them to
+    /// the §5.3 received-byte sequence counter. Every wire read in the
+    /// reader funnels through here so the Acknowledgement sequence
+    /// number stays exact regardless of chunk framing.
+    fn read_exact_counted(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.stream.read_exact(buf)?;
+        self.received_bytes = self.received_bytes.wrapping_add(buf.len() as u32);
+        Ok(())
+    }
+
+    /// Total bytes consumed off the wire so far (the §5.3 sequence
+    /// number). Wraps at `u32::MAX` like the wire field.
+    pub fn received_bytes(&self) -> u32 {
+        self.received_bytes
+    }
+
+    /// The peer's current §5.5 Window Acknowledgement Size, or `0` if
+    /// none has been negotiated.
+    pub fn window_ack_size(&self) -> u32 {
+        self.window_ack_size
+    }
+
+    /// Record the peer's §5.5 Window Acknowledgement Size. Callers
+    /// dispatch the 4-byte big-endian body of an inbound
+    /// [`MSG_WINDOW_ACK_SIZE`](crate::message::MSG_WINDOW_ACK_SIZE)
+    /// message here; per §5.6 a Set Peer Bandwidth also carries an
+    /// output-bandwidth value equal to the window size, so the same
+    /// setter applies. Setting it to `0` disables the ack obligation.
+    ///
+    /// Resetting the window re-bases the "bytes since last ack"
+    /// accounting to the current sequence number so a freshly-shrunk
+    /// window doesn't make a single already-counted byte instantly
+    /// owe an Acknowledgement.
+    pub fn set_window_ack_size(&mut self, size: u32) {
+        self.window_ack_size = size;
+        self.last_ack_bytes = self.received_bytes;
+    }
+
+    /// Return the §5.3 Acknowledgement sequence number to emit if one
+    /// is now due, advancing the internal "last acked" mark so the
+    /// next ack only fires after another full window of bytes.
+    ///
+    /// Per §5.3 a peer "sends the acknowledgment to the peer after
+    /// receiving bytes equal to the window size". Returns `None` when
+    /// no window is negotiated (`window_ack_size == 0`) or fewer than
+    /// `window_ack_size` bytes have arrived since the last ack. The
+    /// caller is expected to call this after each
+    /// [`read_message`](Self::read_message) and, when it yields
+    /// `Some(seq)`, write a [`build_ack(seq)`](crate::message::build_ack)
+    /// back to the peer.
+    pub fn ack_due(&mut self) -> Option<u32> {
+        if self.window_ack_size == 0 {
+            return None;
+        }
+        // Use wrapping subtraction so a `received_bytes` that wrapped
+        // past u32::MAX since the last ack still measures the true
+        // gap (the wire counter is defined modulo 2^32).
+        let since = self.received_bytes.wrapping_sub(self.last_ack_bytes);
+        if since >= self.window_ack_size {
+            self.last_ack_bytes = self.received_bytes;
+            Some(self.received_bytes)
+        } else {
+            None
         }
     }
 
@@ -234,16 +319,26 @@ impl<R: Read> ChunkReader<R> {
                 _ => unreachable!("fmt is 2 bits"),
             }
             // Read up to `chunk_size` bytes of payload (or the
-            // remaining message length, whichever is smaller).
-            let state = self.states.get_mut(&csid).ok_or_else(|| {
-                Error::InvalidChunk(format!(
-                    "fmt {fmt} chunk on csid {csid} without prior fmt-0 state"
-                ))
-            })?;
-            let need = state.msg_length as usize - state.partial.len();
-            let take = need.min(self.chunk_size);
+            // remaining message length, whichever is smaller). Compute
+            // the take size from a short immutable lookup, do the
+            // counted wire read into a scratch buffer (so the
+            // `&mut self` ack-accounting borrow doesn't overlap the
+            // per-csid state borrow), then append to the partial.
+            let take = {
+                let state = self.states.get(&csid).ok_or_else(|| {
+                    Error::InvalidChunk(format!(
+                        "fmt {fmt} chunk on csid {csid} without prior fmt-0 state"
+                    ))
+                })?;
+                let need = state.msg_length as usize - state.partial.len();
+                need.min(self.chunk_size)
+            };
             let mut buf = vec![0u8; take];
-            self.stream.read_exact(&mut buf)?;
+            self.read_exact_counted(&mut buf)?;
+            let state = self
+                .states
+                .get_mut(&csid)
+                .expect("csid state present (checked immediately above)");
             state.partial.extend_from_slice(&buf);
 
             if state.partial.len() as u32 >= state.msg_length {
@@ -261,18 +356,18 @@ impl<R: Read> ChunkReader<R> {
 
     fn read_basic_header(&mut self) -> Result<(u32, u8)> {
         let mut b = [0u8; 1];
-        self.stream.read_exact(&mut b)?;
+        self.read_exact_counted(&mut b)?;
         let fmt = (b[0] >> 6) & 0x03;
         let low = b[0] & 0x3F;
         let csid = match low {
             0 => {
                 let mut b1 = [0u8; 1];
-                self.stream.read_exact(&mut b1)?;
+                self.read_exact_counted(&mut b1)?;
                 b1[0] as u32 + 64
             }
             1 => {
                 let mut b2 = [0u8; 2];
-                self.stream.read_exact(&mut b2)?;
+                self.read_exact_counted(&mut b2)?;
                 // spec: second byte is high order, third byte low — but
                 // commodity peers in the wild interpret it the other way;
                 // the official spec reads "2nd + 3rd byte * 256" which is
@@ -286,13 +381,13 @@ impl<R: Read> ChunkReader<R> {
 
     fn read_u24_be(&mut self) -> Result<u32> {
         let mut b = [0u8; 3];
-        self.stream.read_exact(&mut b)?;
+        self.read_exact_counted(&mut b)?;
         Ok(((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32))
     }
 
     fn read_u32_le_stream_id(&mut self) -> Result<u32> {
         let mut b = [0u8; 4];
-        self.stream.read_exact(&mut b)?;
+        self.read_exact_counted(&mut b)?;
         // msg_stream_id is explicitly little-endian — only field in
         // the RTMP wire format that is.
         Ok(u32::from_le_bytes(b))
@@ -302,7 +397,7 @@ impl<R: Read> ChunkReader<R> {
         let mut ts = self.read_u24_be()?;
         let len = self.read_u24_be()?;
         let mut t = [0u8; 1];
-        self.stream.read_exact(&mut t)?;
+        self.read_exact_counted(&mut t)?;
         let ty = t[0];
         let stream_id = self.read_u32_le_stream_id()?;
         let had_ext_ts = ts == 0x00FF_FFFF;
@@ -325,7 +420,7 @@ impl<R: Read> ChunkReader<R> {
         let mut delta = self.read_u24_be()?;
         let len = self.read_u24_be()?;
         let mut t = [0u8; 1];
-        self.stream.read_exact(&mut t)?;
+        self.read_exact_counted(&mut t)?;
         let ty = t[0];
         let had_ext_ts = delta == 0x00FF_FFFF;
         if had_ext_ts {
@@ -391,7 +486,7 @@ impl<R: Read> ChunkReader<R> {
 
     fn read_u32_be(&mut self) -> Result<u32> {
         let mut b = [0u8; 4];
-        self.stream.read_exact(&mut b)?;
+        self.read_exact_counted(&mut b)?;
         Ok(u32::from_be_bytes(b))
     }
 }
@@ -656,6 +751,127 @@ mod tests {
         assert_eq!(msg.payload, payload);
         assert_eq!(msg.msg_type_id, 9);
         assert_eq!(msg.timestamp, 7000);
+    }
+
+    /// §5.3 Acknowledgement accounting: `received_bytes` counts every
+    /// byte the reader consumes off the wire — basic header, message
+    /// header, extended timestamp, and payload — so the sequence
+    /// number it reports matches the peer's view of "bytes sent".
+    #[test]
+    fn received_bytes_counts_full_wire_size() {
+        let mut buf = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut buf);
+            w.write_message(
+                3,
+                &Message {
+                    msg_type_id: 20,
+                    msg_stream_id: 0,
+                    timestamp: 1000,
+                    payload: b"abcdef".to_vec(),
+                },
+            )
+            .unwrap();
+        }
+        let wire_len = buf.len() as u32;
+        let mut r = ChunkReader::new(Cursor::new(&buf));
+        assert_eq!(r.received_bytes(), 0);
+        let _ = r.read_message().unwrap();
+        // The whole single-chunk frame was consumed; nothing left over.
+        assert_eq!(r.received_bytes(), wire_len);
+    }
+
+    /// With no window negotiated, `ack_due` never fires regardless of
+    /// how many bytes flow.
+    #[test]
+    fn ack_not_due_without_window() {
+        let mut buf = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut buf);
+            w.write_message(
+                3,
+                &Message {
+                    msg_type_id: 20,
+                    msg_stream_id: 0,
+                    timestamp: 0,
+                    payload: vec![0u8; 500],
+                },
+            )
+            .unwrap();
+        }
+        let mut r = ChunkReader::new(Cursor::new(&buf));
+        let _ = r.read_message().unwrap();
+        assert_eq!(r.window_ack_size(), 0);
+        assert_eq!(r.ack_due(), None);
+    }
+
+    /// §5.3 / §5.5: once a window is set, `ack_due` fires the first
+    /// time the received-byte count crosses it, reports the running
+    /// sequence number, and re-arms only after another full window.
+    #[test]
+    fn ack_due_fires_once_per_window() {
+        // Two messages, each ~big enough that the first crosses a
+        // small window and the second crosses the next one.
+        let mut buf = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut buf);
+            for ts in [10u32, 20] {
+                w.write_message(
+                    4,
+                    &Message {
+                        msg_type_id: 8,
+                        msg_stream_id: 1,
+                        timestamp: ts,
+                        payload: vec![0xAB; 200],
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let mut r = ChunkReader::new(Cursor::new(&buf));
+        r.set_window_ack_size(150);
+        assert_eq!(r.window_ack_size(), 150);
+
+        let _ = r.read_message().unwrap();
+        // First message (≈ 211 bytes ≥ 150) owes an ack at the current
+        // sequence number, and it is not due a second time immediately.
+        let first = r.ack_due().expect("first ack due after window crossed");
+        assert_eq!(first, r.received_bytes());
+        assert_eq!(r.ack_due(), None, "ack must not re-fire within a window");
+
+        let _ = r.read_message().unwrap();
+        // Second message pushes another full window past the last ack.
+        let second = r.ack_due().expect("second ack due after second window");
+        assert!(second > first);
+        assert_eq!(second, r.received_bytes());
+    }
+
+    /// §5.5: shrinking / resetting the window re-bases the
+    /// "bytes since last ack" mark to the current sequence so a
+    /// single already-counted byte doesn't instantly owe an ack.
+    #[test]
+    fn set_window_rebases_accounting() {
+        let mut buf = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut buf);
+            w.write_message(
+                4,
+                &Message {
+                    msg_type_id: 8,
+                    msg_stream_id: 1,
+                    timestamp: 0,
+                    payload: vec![0u8; 400],
+                },
+            )
+            .unwrap();
+        }
+        let mut r = ChunkReader::new(Cursor::new(&buf));
+        let _ = r.read_message().unwrap();
+        // Set the window AFTER 400+ bytes already arrived: because the
+        // setter re-bases, no ack is immediately due even though the
+        // total received exceeds the new window.
+        r.set_window_ack_size(100);
+        assert_eq!(r.ack_due(), None);
     }
 
     /// RTMP 1.0 §5.2 Abort Message: after a publisher sends part of a

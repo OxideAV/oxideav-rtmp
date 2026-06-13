@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RTMP 1.0 §5.3 Acknowledgement / §5.5 Window Acknowledgement Size —
+  honoured end-to-end** (`src/chunk.rs`, `src/server.rs`,
+  `src/client.rs`). Until now both peers advertised a Window
+  Acknowledgement Size but neither side ever *sent* the §5.3
+  Acknowledgement the spec mandates ("the client or the server sends
+  the acknowledgment to the peer after receiving bytes equal to the
+  window size") — the client code even carried a `// future
+  refinement` comment in its control-message branch. `ChunkReader` now
+  counts every byte it consumes off the wire (basic header, message
+  header, extended timestamp, payload) as the §5.3 sequence number via
+  a new `read_exact_counted` funnel, stores the peer-negotiated window
+  (`set_window_ack_size`, fed from inbound §5.5 Window Ack Size and the
+  §5.6 Set Peer Bandwidth output-bandwidth value, which the spec
+  defines as equal to the window size), and exposes `ack_due()` —
+  returns `Some(seq)` the first time the received-byte count crosses
+  the window, re-arming only after another full window so a steady
+  stream never spams acks. `RtmpSession::next_packet` (server) and
+  `RtmpClient::poll_event` (client) call it after each wire read and
+  emit `build_ack(seq)` when one is owed; both setup paths
+  (`drive_until_publish` / `wait_for_result`) seed the window so the
+  obligation is live before the first media frame. `received_bytes()`
+  / `window_ack_size()` accessors round out the public surface.
+  Resetting the window re-bases the byte accounting so an
+  already-counted byte never instantly owes an ack, and with no window
+  negotiated the obligation stays dormant (byte-identical to the
+  pre-§5.3 behaviour). New `tests/acknowledgement_window.rs` drives a
+  raw publisher (built from the public `chunk` / `message` /
+  `handshake` modules) that advertises a 256-byte window and confirms
+  the real `RtmpServer` acks back with a plausible sequence number;
+  four `chunk.rs` unit tests cover the byte-count, window-crossing,
+  one-ack-per-window, and re-base behaviours.
 - **Enhanced RTMP v2 Reconnect Request — end-to-end**
   (`src/message.rs`, `src/server.rs`, `src/client.rs`). Round 277 wires
   the `NetConnection.Connect.ReconnectRequest` status event from

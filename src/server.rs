@@ -493,11 +493,29 @@ impl RtmpSession {
                 }
                 Err(e) => return Err(e),
             };
+            // §5.3: once the publisher has sent a full window of bytes,
+            // owe it an Acknowledgement carrying the running sequence
+            // number. Send before dispatching so the ack reflects the
+            // bytes through this message.
+            self.maybe_send_ack()?;
             if let Some(pkt) = self.handle_message(msg)? {
                 return Ok(Some(pkt));
             }
         }
         Ok(None)
+    }
+
+    /// Emit a §5.3 Acknowledgement if the reader's received-byte count
+    /// has crossed the peer-negotiated §5.5 window since the last one.
+    /// No-op until a window has been negotiated (`Window Acknowledgement
+    /// Size` / `Set Peer Bandwidth` from the publisher).
+    fn maybe_send_ack(&mut self) -> Result<()> {
+        if let Some(seq) = self.reader.ack_due() {
+            self.writer
+                .write_message(CSID_PROTOCOL_CONTROL, &build_ack(seq))?;
+            self.writer.flush()?;
+        }
+        Ok(())
     }
 
     /// Per-message dispatch shared between the wire path and the
@@ -587,8 +605,29 @@ impl RtmpSession {
                 self.reader.set_chunk_size(size as usize);
                 Ok(None)
             }
-            MSG_ACK | MSG_USER_CONTROL | MSG_WINDOW_ACK_SIZE | MSG_SET_PEER_BANDWIDTH => {
-                // Informational — silently accept.
+            MSG_WINDOW_ACK_SIZE => {
+                // §5.5: the peer is telling us which window size to use
+                // when sending Acknowledgements. Honour it so our §5.3
+                // ack cadence matches what the publisher expects.
+                let size = read_u32_be(&msg.payload)?;
+                self.reader.set_window_ack_size(size);
+                Ok(None)
+            }
+            MSG_SET_PEER_BANDWIDTH => {
+                // §5.6: "The output bandwidth value is the same as the
+                // window size for the peer." The first 4 bytes carry
+                // that window size; adopt it as our send-side ack
+                // window too. (The trailing Limit type byte is
+                // advisory and doesn't change our framing.)
+                if msg.payload.len() >= 4 {
+                    let size = read_u32_be(&msg.payload[..4])?;
+                    self.reader.set_window_ack_size(size);
+                }
+                Ok(None)
+            }
+            MSG_ACK | MSG_USER_CONTROL => {
+                // Informational — the peer's §5.3 sequence number (ACK)
+                // or a user-control event we don't surface as a packet.
                 Ok(None)
             }
             _ => {
@@ -634,6 +673,14 @@ fn drive_until_publish(
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 reader.set_chunk_size(size as usize);
+            }
+            MSG_WINDOW_ACK_SIZE => {
+                let size = read_u32_be(&msg.payload)?;
+                reader.set_window_ack_size(size);
+            }
+            MSG_SET_PEER_BANDWIDTH if msg.payload.len() >= 4 => {
+                let size = read_u32_be(&msg.payload[..4])?;
+                reader.set_window_ack_size(size);
             }
             MSG_COMMAND_AMF0 => {
                 let values = amf::decode_all(&msg.payload)?;
@@ -707,6 +754,16 @@ fn drive_until_publish(
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 reader.set_chunk_size(size as usize);
+                continue;
+            }
+            MSG_WINDOW_ACK_SIZE => {
+                let size = read_u32_be(&msg.payload)?;
+                reader.set_window_ack_size(size);
+                continue;
+            }
+            MSG_SET_PEER_BANDWIDTH if msg.payload.len() >= 4 => {
+                let size = read_u32_be(&msg.payload[..4])?;
+                reader.set_window_ack_size(size);
                 continue;
             }
             MSG_COMMAND_AMF0 => {

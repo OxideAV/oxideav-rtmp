@@ -151,6 +151,26 @@ client.close()?;
   on the wire and surfaces a `ProtocolViolation` if truncated. The rest
   of the protocol-control plumbing (Set Chunk Size, Window Ack Size,
   Set Peer Bandwidth) is handled transparently inside `poll_event`.
+- **Acknowledgement window (RTMP 1.0 §5.3 / §5.5 / §5.6)**. The chunk
+  reader now counts every byte it consumes off the wire (basic header,
+  message header, extended timestamp, payload) as the §5.3 sequence
+  number, and both peers honour the §5.3 obligation to "send the
+  acknowledgment to the peer after receiving bytes equal to the window
+  size." A peer's §5.5 Window Acknowledgement Size — or the §5.6 Set
+  Peer Bandwidth output-bandwidth value, which the spec defines as
+  equal to the window size — is captured during setup and steady state
+  (`ChunkReader::set_window_ack_size`), and `RtmpSession::next_packet`
+  (server) / `RtmpClient::poll_event` (client) emit a `build_ack(seq)`
+  carrying the running received-byte count the first time the count
+  crosses each window, re-arming only after another full window so a
+  steady stream never spams acks. `ChunkReader::ack_due` is the public
+  hook (returns `Some(seq)` when an Acknowledgement is owed, advancing
+  the internal mark), with `ChunkReader::received_bytes` /
+  `window_ack_size` accessors; resetting the window re-bases the
+  byte accounting so a freshly-shrunk window doesn't make an
+  already-counted byte instantly owe an ack. With no window negotiated
+  (the historical default) the obligation stays dormant, byte-identical
+  to the pre-§5.3 behaviour.
 - **Injection-robust parser surface**. Every public decode entry
   point — AMF0 (`decode` / `decode_all`), AMF3 (`decode` / `decode_all`
   / `decode_data_message`), FLV (`parse_video` / `parse_audio`), the

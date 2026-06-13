@@ -601,6 +601,20 @@ impl RtmpClient {
         Ok(())
     }
 
+    /// Emit a §5.3 Acknowledgement if the reader's received-byte count
+    /// has crossed the server-negotiated §5.5 window since the last
+    /// one. No-op until the server advertises a Window Acknowledgement
+    /// Size / Set Peer Bandwidth (every commodity ingest does so right
+    /// after `connect`).
+    fn maybe_send_ack(&mut self) -> Result<()> {
+        if let Some(seq) = self.reader.ack_due() {
+            self.writer
+                .write_message(CSID_PROTOCOL_CONTROL, &build_ack(seq))?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
     /// Poll for one server-originated event.
     ///
     /// Reads up to one inbound RTMP message from the server, applies
@@ -667,6 +681,11 @@ impl RtmpClient {
                 }
                 Err(e) => return Err(e),
             };
+            // §5.3: acknowledge once the server has sent a full window
+            // of bytes since our last ack (window set by the server's
+            // §5.5 Window Acknowledgement Size / §5.6 Set Peer
+            // Bandwidth).
+            self.maybe_send_ack()?;
             if msg.msg_type_id == MSG_AGGREGATE {
                 // RTMP 1.0 §7.1.6 Aggregate Message. Decompose into
                 // FLV-shaped sub-messages with the §7.1.6 timestamp
@@ -691,12 +710,28 @@ impl RtmpClient {
                 self.reader.set_chunk_size(size as usize);
                 Ok(ClientEvent::Other)
             }
-            MSG_ACK | MSG_WINDOW_ACK_SIZE | MSG_SET_PEER_BANDWIDTH => {
-                // Informational. Spec mandates an ack reply once we
-                // exceed the negotiated window, but for a publish-only
-                // client of typical bitrate we leave that as a future
-                // refinement — the server's own ack window resets per
-                // session.
+            MSG_WINDOW_ACK_SIZE => {
+                // §5.5: the server tells us which window size to use
+                // when sending §5.3 Acknowledgements. Honour it so our
+                // ack cadence matches the server's expectation.
+                let size = read_u32_be(&msg.payload)?;
+                self.reader.set_window_ack_size(size);
+                Ok(ClientEvent::Other)
+            }
+            MSG_SET_PEER_BANDWIDTH => {
+                // §5.6: "The output bandwidth value is the same as the
+                // window size for the peer." Adopt the leading 4-byte
+                // window as our send-side ack window. (Trailing Limit
+                // type byte is advisory.)
+                if msg.payload.len() >= 4 {
+                    let size = read_u32_be(&msg.payload[..4])?;
+                    self.reader.set_window_ack_size(size);
+                }
+                Ok(ClientEvent::Other)
+            }
+            MSG_ACK => {
+                // The server's §5.3 sequence number (bytes it has
+                // received from us). Informational for a publisher.
                 Ok(ClientEvent::Other)
             }
             MSG_USER_CONTROL => {
@@ -898,6 +933,18 @@ fn wait_for_result<R: Read, W: Write>(
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 reader.set_chunk_size(size as usize);
+            }
+            MSG_WINDOW_ACK_SIZE => {
+                // §5.5: capture the server's window during setup so the
+                // §5.3 ack obligation is live before the first media
+                // frame flows.
+                let size = read_u32_be(&msg.payload)?;
+                reader.set_window_ack_size(size);
+            }
+            MSG_SET_PEER_BANDWIDTH if msg.payload.len() >= 4 => {
+                // §5.6: output bandwidth equals the peer's window size.
+                let size = read_u32_be(&msg.payload[..4])?;
+                reader.set_window_ack_size(size);
             }
             MSG_COMMAND_AMF0 => {
                 let values = amf::decode_all(&msg.payload)?;
