@@ -22,8 +22,11 @@
 //!   object / traits).
 //! * Object types — anonymous (no class name), typed (named class name,
 //!   sealed properties), dynamic (sealed + trailing string-keyed
-//!   members), externalizable (caller decides body bytes — surfaced as
-//!   an opaque blob).
+//!   members), externalizable (§3.12 `U29O-traits-ext`: the body is an
+//!   "indeterminable number of bytes as `*(U8)`" whose framing is a
+//!   private class agreement, so the decoder captures it via a per-class
+//!   handler registered through [`Decoder::register_externalizable`] and
+//!   surfaces it as an opaque blob; an unregistered class is refused).
 //! * Three reference tables maintained per `decode_all` / `encode_all`
 //!   invocation (§2.2). Strings, complex-objects and traits each get
 //!   their own table.
@@ -304,6 +307,24 @@ fn amf3_key_to_string(k: &Amf3Value) -> String {
 /// any real `onMetaData` / shared-object payload.
 pub const MAX_DECODE_DEPTH: usize = 64;
 
+/// Body-length resolver for an externalizable AMF3 class (§3.12
+/// `U29O-traits-ext`).
+///
+/// The spec encodes an externalizable object's payload as `*(U8)` — "an
+/// indeterminable number of bytes" whose framing is a private agreement
+/// between the sending and receiving classes ("The client and server have
+/// an agreement as to how to read in this information"). The generic
+/// decoder therefore cannot know where the body ends; a caller that knows
+/// a specific class's `IExternalizable.writeExternal` framing registers a
+/// reader for it via [`Decoder::register_externalizable`].
+///
+/// The reader is handed the **whole** input buffer and the offset of the
+/// first body byte (immediately after the class name). It returns the
+/// number of bytes the body occupies, or an [`Error`] if the bytes are
+/// malformed. Returning a length that runs past the buffer end is
+/// rejected by the decoder.
+pub type ExternalizableReader = Box<dyn Fn(&[u8], usize) -> Result<usize>>;
+
 /// Decoder state — owns the three reference tables that survive across
 /// values inside one packet (§4.1).
 #[derive(Default)]
@@ -311,6 +332,10 @@ pub struct Decoder {
     strings: Vec<String>,
     objects: Vec<Amf3Value>,
     traits: Vec<TraitDef>,
+    /// Class-name → body-length resolver for externalizable types
+    /// (§3.12 `U29O-traits-ext`). Empty by default, so an unregistered
+    /// externalizable class is still refused loudly rather than guessed.
+    externalizable_handlers: HashMap<String, ExternalizableReader>,
     /// Live recursion depth — incremented on entry to [`Decoder::decode`],
     /// decremented on return. Exceeding [`MAX_DECODE_DEPTH`] returns a
     /// controlled error instead of overflowing the stack.
@@ -330,11 +355,39 @@ impl Decoder {
         Self::default()
     }
 
+    /// Register a body-length resolver for an externalizable class
+    /// (§3.12 `U29O-traits-ext`).
+    ///
+    /// `class_name` is the registered ActionScript alias the sender wrote
+    /// in the trait's `class-name` slot (e.g. `flex.messaging.io.ArrayList`).
+    /// `reader` resolves how many `*(U8)` body bytes that class's
+    /// `writeExternal` framing produces; see [`ExternalizableReader`].
+    ///
+    /// With a handler registered, [`Decoder::decode`] captures the body
+    /// into [`Amf3Value::Object::externalizable_body`] and continues
+    /// past it — a faithful round-trip against [`encode`], which already
+    /// re-emits that field verbatim. Without one, the externalizable
+    /// object is refused (the decoder never guesses the body length).
+    ///
+    /// Handlers are decoder configuration, not per-packet state, so they
+    /// survive [`Decoder::reset_tables`].
+    pub fn register_externalizable(
+        &mut self,
+        class_name: impl Into<String>,
+        reader: ExternalizableReader,
+    ) {
+        self.externalizable_handlers
+            .insert(class_name.into(), reader);
+    }
+
     /// Reset all three reference tables. Per §4.1.2 / §4.2, encoders
     /// must reset tables at packet / context-header boundaries; callers
     /// who reuse a `Decoder` across packets must call this at each
     /// boundary. Also resets the live recursion-depth counter (safe
     /// only between decode calls — never invoke mid-decode).
+    ///
+    /// Registered externalizable handlers are configuration, not
+    /// per-packet wire state, so they are preserved across the reset.
     pub fn reset_tables(&mut self) {
         self.strings.clear();
         self.objects.clear();
@@ -538,22 +591,58 @@ impl Decoder {
         self.objects.push(Amf3Value::Null);
 
         if trait_def.externalizable {
-            // The class's IExternalizable.writeExternal output is
-            // an opaque byte stream — the spec leaves length / shape
-            // to the class. We can't decode it generically; surface
-            // the *remaining* buffer as the externalizable body and
-            // expect the caller to know how much to consume by other
-            // means. To keep the decoder's `pos` honest, we treat the
-            // body as "what the caller registers via a class
-            // handler" — for now, refuse so a downstream caller can
-            // implement the hook explicitly rather than silently
-            // produce garbage. This matches `decode`'s policy
-            // elsewhere: unknown shapes are loud, not lossy.
-            return Err(Error::InvalidAmf0(format!(
-                "amf3: externalizable class {:?} requires a registered handler; \
-                 generic decoder cannot determine body length",
-                trait_def.class_name
-            )));
+            // §3.12 `U29O-traits-ext`: after the class name come "an
+            // indeterminable number of bytes as *(U8)" — the class's
+            // private `IExternalizable.writeExternal` framing. The
+            // generic decoder cannot know where that body ends, so it
+            // defers to a per-class handler registered via
+            // [`Decoder::register_externalizable`]. With a handler, we
+            // ask it for the body length, capture exactly that many
+            // bytes, and advance `pos` past them. Without one, we refuse
+            // loudly rather than guess (consistent with the decoder's
+            // policy elsewhere: unknown shapes are loud, not lossy).
+            let body = match self.externalizable_handlers.get(&trait_def.class_name) {
+                Some(reader) => {
+                    let body_start = *pos;
+                    let len = reader(buf, body_start)?;
+                    // The handler reports the body length relative to
+                    // `body_start`; reject a length that overruns the
+                    // buffer so a buggy handler can't read past the end.
+                    let body_end = body_start.checked_add(len).ok_or_else(|| {
+                        Error::InvalidAmf0(format!(
+                            "amf3: externalizable class {:?} body length {len} overflows",
+                            trait_def.class_name
+                        ))
+                    })?;
+                    if body_end > buf.len() {
+                        return Err(Error::InvalidAmf0(format!(
+                            "amf3: externalizable class {:?} body length {len} \
+                             runs past buffer end ({} byte(s) available)",
+                            trait_def.class_name,
+                            buf.len() - body_start
+                        )));
+                    }
+                    let body = buf[body_start..body_end].to_vec();
+                    *pos = body_end;
+                    body
+                }
+                None => {
+                    return Err(Error::InvalidAmf0(format!(
+                        "amf3: externalizable class {:?} requires a registered handler; \
+                         generic decoder cannot determine body length",
+                        trait_def.class_name
+                    )));
+                }
+            };
+            let v = Amf3Value::Object {
+                class_name: trait_def.class_name.clone(),
+                dynamic: false,
+                sealed: Vec::new(),
+                dynamic_members: Vec::new(),
+                externalizable_body: Some(body),
+            };
+            self.objects[slot] = v.clone();
+            return Ok(v);
         }
 
         let mut sealed = Vec::with_capacity(trait_def.sealed_members.len());
@@ -1379,6 +1468,156 @@ mod tests {
         bytes.push(0xAA);
         let mut p = 0;
         assert!(matches!(decode(&bytes, &mut p), Err(Error::InvalidAmf0(_))));
+    }
+
+    #[test]
+    fn externalizable_object_decodes_with_registered_fixed_handler() {
+        // Class with a fixed 4-byte writeExternal payload.
+        let mut bytes = vec![M_OBJECT];
+        write_u29(&mut bytes, 0b0111); // U29O-traits-ext
+        write_u29_string(&mut bytes, "MyFixedClass");
+        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        // A trailing value after the externalizable object to prove `pos`
+        // landed exactly past the 4-byte body.
+        encode(&mut bytes, &Amf3Value::Integer(7));
+
+        let mut dec = Decoder::new();
+        dec.register_externalizable("MyFixedClass", Box::new(|_buf, _start| Ok(4)));
+        let mut p = 0;
+        let v = dec.decode(&bytes, &mut p).unwrap();
+        assert_eq!(
+            v,
+            Amf3Value::Object {
+                class_name: "MyFixedClass".into(),
+                dynamic: false,
+                sealed: Vec::new(),
+                dynamic_members: Vec::new(),
+                externalizable_body: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            }
+        );
+        // The trailing integer decodes from the position the handler left.
+        assert_eq!(dec.decode(&bytes, &mut p).unwrap(), Amf3Value::Integer(7));
+        assert_eq!(p, bytes.len());
+    }
+
+    #[test]
+    fn externalizable_object_decodes_with_length_prefixed_handler() {
+        // Class whose writeExternal payload is a 1-byte length prefix
+        // followed by that many bytes — a common private framing.
+        let mut bytes = vec![M_OBJECT];
+        write_u29(&mut bytes, 0b0111);
+        write_u29_string(&mut bytes, "LenPrefixed");
+        bytes.push(3); // length prefix
+        bytes.extend_from_slice(&[1, 2, 3]);
+
+        let mut dec = Decoder::new();
+        dec.register_externalizable(
+            "LenPrefixed",
+            Box::new(|buf, start| {
+                let n = *buf
+                    .get(start)
+                    .ok_or_else(|| Error::InvalidAmf0("LenPrefixed: missing prefix".into()))?
+                    as usize;
+                Ok(1 + n) // prefix byte + payload
+            }),
+        );
+        let mut p = 0;
+        let v = dec.decode(&bytes, &mut p).unwrap();
+        match v {
+            Amf3Value::Object {
+                externalizable_body: Some(body),
+                ..
+            } => assert_eq!(body, vec![3, 1, 2, 3]),
+            other => panic!("expected externalizable object, got {other:?}"),
+        }
+        assert_eq!(p, bytes.len());
+    }
+
+    #[test]
+    fn externalizable_decode_then_encode_roundtrips() {
+        let mut bytes = vec![M_OBJECT];
+        write_u29(&mut bytes, 0b0111);
+        write_u29_string(&mut bytes, "RoundTrip");
+        bytes.extend_from_slice(&[0x10, 0x20]);
+
+        let mut dec = Decoder::new();
+        dec.register_externalizable("RoundTrip", Box::new(|_b, _s| Ok(2)));
+        let mut p = 0;
+        let v = dec.decode(&bytes, &mut p).unwrap();
+
+        // Re-encoding the decoded value reproduces the original wire bytes.
+        let mut reencoded = Vec::new();
+        encode(&mut reencoded, &v);
+        assert_eq!(reencoded, bytes);
+    }
+
+    #[test]
+    fn externalizable_handler_overrun_is_rejected() {
+        // Handler claims a body longer than what the buffer holds.
+        let mut bytes = vec![M_OBJECT];
+        write_u29(&mut bytes, 0b0111);
+        write_u29_string(&mut bytes, "Greedy");
+        bytes.push(0x01); // only one body byte present
+
+        let mut dec = Decoder::new();
+        dec.register_externalizable("Greedy", Box::new(|_b, _s| Ok(8)));
+        let mut p = 0;
+        assert!(matches!(
+            dec.decode(&bytes, &mut p),
+            Err(Error::InvalidAmf0(_))
+        ));
+    }
+
+    #[test]
+    fn externalizable_handler_survives_reset_tables() {
+        let mut dec = Decoder::new();
+        dec.register_externalizable("Persist", Box::new(|_b, _s| Ok(1)));
+        dec.reset_tables();
+
+        let mut bytes = vec![M_OBJECT];
+        write_u29(&mut bytes, 0b0111);
+        write_u29_string(&mut bytes, "Persist");
+        bytes.push(0x99);
+        let mut p = 0;
+        // Still decodable after the reset — handlers are configuration.
+        assert!(dec.decode(&bytes, &mut p).is_ok());
+    }
+
+    #[test]
+    fn externalizable_object_joins_object_reference_table() {
+        // An externalizable object goes into the object reference table
+        // like any other complex value, so a later U29O-ref resolves to
+        // an equal copy of it.
+        let mut bytes = Vec::new();
+        // First value: an array carrying [externalizable, ref-to-it].
+        bytes.push(M_ARRAY);
+        write_u29(&mut bytes, (2 << 1) | 1); // dense count 2
+        write_u29(&mut bytes, 1); // empty assoc terminator
+                                  // dense[0]: the externalizable object (object index 1 — the
+                                  // array itself reserves index 0).
+        bytes.push(M_OBJECT);
+        write_u29(&mut bytes, 0b0111);
+        write_u29_string(&mut bytes, "Reffed");
+        bytes.push(0x42);
+        // dense[1]: U29O-ref to object index 1.
+        bytes.push(M_OBJECT);
+        write_u29(&mut bytes, 1 << 1); // ref, index 1
+
+        let mut dec = Decoder::new();
+        dec.register_externalizable("Reffed", Box::new(|_b, _s| Ok(1)));
+        let mut p = 0;
+        let v = dec.decode(&bytes, &mut p).unwrap();
+        match v {
+            Amf3Value::Array { dense, .. } => {
+                assert_eq!(dense.len(), 2);
+                assert_eq!(dense[0], dense[1]);
+                assert!(matches!(
+                    &dense[0],
+                    Amf3Value::Object { externalizable_body: Some(b), .. } if b == &vec![0x42]
+                ));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
     }
 
     // ----- Vectors -----

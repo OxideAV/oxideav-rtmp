@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AMF3 §3.12 `U29O-traits-ext` externalizable objects — decodable via
+  registered per-class handlers** (`src/amf3.rs`). The spec encodes an
+  externalizable object's body as "an indeterminable number of bytes as
+  `*(U8)`" whose framing is a private agreement between the sending and
+  receiving classes; the generic decoder cannot know where the body
+  ends and so previously refused every externalizable object outright,
+  even though the encoder already re-emitted the `externalizable_body`
+  field verbatim. `Decoder::register_externalizable(class_name, reader)`
+  closes that asymmetry: a caller that knows a specific class's
+  `IExternalizable.writeExternal` framing registers a body-length
+  resolver (`ExternalizableReader = Box<dyn Fn(&[u8], usize) ->
+  Result<usize>>`), and `decode` then captures exactly that many body
+  bytes into `Amf3Value::Object::externalizable_body`, advances `pos`
+  past them, and inserts the object into the object reference table like
+  any other complex value. An over-long body length is rejected before
+  any out-of-bounds read; an unregistered externalizable class is still
+  refused loudly (the decoder never guesses). Handlers are decoder
+  configuration and survive `reset_tables`. Six tests: fixed-length and
+  length-prefixed handlers, decode→encode wire round-trip, overrun
+  rejection, handler persistence across reset, and object-reference
+  participation.
+
 - **RTMP 1.0 §5.3 Acknowledgement / §5.5 Window Acknowledgement Size —
   honoured end-to-end** (`src/chunk.rs`, `src/server.rs`,
   `src/client.rs`). Until now both peers advertised a Window

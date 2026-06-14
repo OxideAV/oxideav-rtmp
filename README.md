@@ -80,7 +80,12 @@ client.close()?;
   through the same `StreamPacket::Metadata` path as AMF0; type-17
   AMF3 commands feed the same stream-teardown detection.
   `RtmpClient::send_metadata_amf3` emits the AMF3-encoded form for
-  peers on an AMF3 channel. Shared objects, RTMFP, and the Adobe
+  peers on an AMF3 channel. Externalizable objects (§3.12
+  `U29O-traits-ext`, whose `*(U8)` body framing is a private class
+  agreement the spec leaves "indeterminable") are decodable via
+  `Decoder::register_externalizable`, where a caller supplies a
+  body-length resolver for a known class; an unregistered class is
+  refused rather than guessed. Shared objects, RTMFP, and the Adobe
   digest-verified handshake remain unimplemented.
 - **H.264 + AAC** are the canonical legacy payloads, plus
   **Enhanced RTMP v1** (Veovera 2023) FourCC video codecs —
