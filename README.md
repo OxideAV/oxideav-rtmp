@@ -69,7 +69,14 @@ client.close()?;
   publishers; the client pushes to remote servers. RTMP play
   (subscribe / pull) is a follow-up.
 - **AMF0 command flow** is what every commodity ingest endpoint
-  negotiates by default. The
+  negotiates by default. The decoder handles every marker real RTMP
+  traffic uses, including **object references** (marker 0x07, FLV v10.1
+  §E.4.4.2 `SCRIPTDATAVALUE.Type == 7`, a `UI16` index into the
+  serialized complex-object table): a reference is dereferenced
+  transparently to a clone of the value it points at, so callers never
+  see a `Reference` variant and a reference-deduplicated `onMetaData`
+  decodes correctly instead of being refused. An out-of-range or
+  truncated reference index is a clean `InvalidAmf0` error. The
   [`amf3`] module ships a complete AMF3 wire-format encoder +
   decoder — all thirteen markers plus the three reference tables —
   and AMF3 data / command messages are now **routed end-to-end**:

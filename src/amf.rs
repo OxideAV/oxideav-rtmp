@@ -2,12 +2,20 @@
 //!
 //! RTMP command / data messages are AMF0-encoded. This module implements
 //! the subset of markers that real RTMP traffic uses in practice:
-//! Number, Boolean, String, Object, Null, Undefined, ECMA array, strict
-//! array, date, long string, end-of-object sentinel. We never emit nor
-//! consume AMF3 — RTMP occasionally upgrades a channel to AMF3 via the
-//! `avmplus` command, but we simply keep the channel on AMF0; every
-//! commodity client / server we have interoperated with stays in AMF0
-//! for publish flows.
+//! Number, Boolean, String, Object, Null, Undefined, Reference, ECMA
+//! array, strict array, date, long string, end-of-object sentinel. We
+//! never emit nor consume AMF3 — RTMP occasionally upgrades a channel to
+//! AMF3 via the `avmplus` command, but we simply keep the channel on
+//! AMF0; every commodity client / server we have interoperated with
+//! stays in AMF0 for publish flows.
+//!
+//! AMF0 object references (marker 0x07) are **dereferenced
+//! transparently** on decode: a reference resolves to a clone of the
+//! complex value it points at, so callers never see a `Reference`
+//! variant in the value graph. Encoding always emits the expanded
+//! (inline) form — references are an optional wire compression, so the
+//! expanded form is byte-valid AMF0 and a decode→encode round-trip of a
+//! reference-using stream produces an equivalent inline stream.
 //!
 //! See the "AMF0 File Format Specification" (Adobe, 2007) for marker
 //! tables; kept minimal here to avoid drift from the spec.
@@ -105,11 +113,33 @@ pub const MAX_DECODE_DEPTH: usize = 64;
 /// past the value on success. Returns `InvalidAmf0` for unknown markers,
 /// truncated input, or container nesting deeper than
 /// [`MAX_DECODE_DEPTH`].
+///
+/// AMF0 object references (marker 0x07, `SCRIPTDATAVALUE.Type == 7` per
+/// the FLV v10.1 spec §E.4.4.2) are resolved against a reference table
+/// scoped to this single call: each complex value (Object, typed
+/// object, ECMA array, strict array) is appended to the table as it is
+/// decoded, and a reference resolves to the `UI16`-indexed prior entry.
+/// Because the resolution table is per-call, a reference only "sees"
+/// complex values that appeared earlier within the same top-level value.
+/// To resolve references across a multi-value packet (where the table
+/// spans the whole message), use [`decode_all`].
 pub fn decode(buf: &[u8], pos: &mut usize) -> Result<Amf0Value> {
-    decode_at_depth(buf, pos, 0)
+    let mut refs = Vec::new();
+    decode_at_depth(buf, pos, 0, &mut refs)
 }
 
-fn decode_at_depth(buf: &[u8], pos: &mut usize, depth: usize) -> Result<Amf0Value> {
+/// The reference table threaded through one AMF0 serialization context.
+/// Each entry is a fully-decoded complex value, in the order the spec's
+/// "complex object" rule appends them. A `REFERENCE` (UI16) indexes into
+/// this list.
+type RefTable = Vec<Amf0Value>;
+
+fn decode_at_depth(
+    buf: &[u8],
+    pos: &mut usize,
+    depth: usize,
+    refs: &mut RefTable,
+) -> Result<Amf0Value> {
     if depth >= MAX_DECODE_DEPTH {
         return Err(Error::InvalidAmf0(format!(
             "nested container depth exceeded {MAX_DECODE_DEPTH}"
@@ -126,30 +156,46 @@ fn decode_at_depth(buf: &[u8], pos: &mut usize, depth: usize) -> Result<Amf0Valu
         M_LONG_STRING => Ok(Amf0Value::String(read_utf8_long(buf, pos)?)),
         M_NULL => Ok(Amf0Value::Null),
         M_UNDEFINED => Ok(Amf0Value::Undefined),
-        M_OBJECT => Ok(Amf0Value::Object(read_object_body_at_depth(
-            buf,
-            pos,
-            depth + 1,
-        )?)),
+        M_OBJECT => {
+            // Reserve the table slot *before* decoding the body so a
+            // reference appearing inside the body still indexes this
+            // object at its eventual position. We can't fill the value
+            // until the body is decoded, so we push a placeholder and
+            // overwrite it; a self-reference inside the body therefore
+            // resolves to the placeholder (an empty Object) rather than
+            // looping — acyclic graphs (every onMetaData in practice)
+            // are unaffected.
+            let slot = refs.len();
+            refs.push(Amf0Value::Object(Vec::new()));
+            let body = read_object_body_at_depth(buf, pos, depth + 1, refs)?;
+            let v = Amf0Value::Object(body);
+            refs[slot] = v.clone();
+            Ok(v)
+        }
         M_ECMA_ARRAY => {
             // Spec says this is preceded by a u32 associative count, then
             // the body is the same key/value/OBJECT_END terminator
             // sequence as a plain Object. The count is advisory — walk
             // until OBJECT_END.
             let _count = read_u32_be(buf, pos)?;
-            Ok(Amf0Value::EcmaArray(read_object_body_at_depth(
-                buf,
-                pos,
-                depth + 1,
-            )?))
+            let slot = refs.len();
+            refs.push(Amf0Value::EcmaArray(Vec::new()));
+            let body = read_object_body_at_depth(buf, pos, depth + 1, refs)?;
+            let v = Amf0Value::EcmaArray(body);
+            refs[slot] = v.clone();
+            Ok(v)
         }
         M_STRICT_ARRAY => {
             let count = read_u32_be(buf, pos)? as usize;
+            let slot = refs.len();
+            refs.push(Amf0Value::StrictArray(Vec::new()));
             let mut out = Vec::with_capacity(count.min(1024));
             for _ in 0..count {
-                out.push(decode_at_depth(buf, pos, depth + 1)?);
+                out.push(decode_at_depth(buf, pos, depth + 1, refs)?);
             }
-            Ok(Amf0Value::StrictArray(out))
+            let v = Amf0Value::StrictArray(out);
+            refs[slot] = v.clone();
+            Ok(v)
         }
         M_DATE => {
             let bits = read_u64_be(buf, pos)?;
@@ -159,11 +205,18 @@ fn decode_at_depth(buf: &[u8], pos: &mut usize, depth: usize) -> Result<Amf0Valu
                 timezone: tz,
             })
         }
-        M_REFERENCE => Err(Error::InvalidAmf0(
-            "REFERENCE marker not supported (AMF0 object references are \
-             exceedingly rare in RTMP)"
-                .into(),
-        )),
+        M_REFERENCE => {
+            // §E.4.4.2: `IF Type == 7 { UI16 }` — a 16-bit big-endian
+            // index into the table of complex objects serialized so far
+            // in this context. Resolve by cloning the referenced value.
+            let idx = read_u16_be(buf, pos)? as usize;
+            refs.get(idx).cloned().ok_or_else(|| {
+                Error::InvalidAmf0(format!(
+                    "AMF0 reference index {idx} out of range (table has {} entries)",
+                    refs.len()
+                ))
+            })
+        }
         other => Err(Error::InvalidAmf0(format!("unknown marker {other:#x}"))),
     }
 }
@@ -171,11 +224,17 @@ fn decode_at_depth(buf: &[u8], pos: &mut usize, depth: usize) -> Result<Amf0Valu
 /// Decode a sequence of AMF0 values until the input is exhausted.
 /// Useful for parsing command payloads where the count isn't known in
 /// advance (connect / _result / onStatus etc.).
+///
+/// All top-level values share one reference table, so an AMF0 reference
+/// (marker 0x07) in a later value can resolve a complex object that
+/// appeared in an earlier value of the same packet — the serialization
+/// context the spec describes.
 pub fn decode_all(buf: &[u8]) -> Result<Vec<Amf0Value>> {
     let mut pos = 0;
     let mut out = Vec::new();
+    let mut refs = Vec::new();
     while pos < buf.len() {
-        out.push(decode(buf, &mut pos)?);
+        out.push(decode_at_depth(buf, &mut pos, 0, &mut refs)?);
     }
     Ok(out)
 }
@@ -184,6 +243,7 @@ fn read_object_body_at_depth(
     buf: &[u8],
     pos: &mut usize,
     depth: usize,
+    refs: &mut RefTable,
 ) -> Result<Vec<(String, Amf0Value)>> {
     let mut out = Vec::new();
     loop {
@@ -201,7 +261,7 @@ fn read_object_body_at_depth(
                 )));
             }
         }
-        let value = decode_at_depth(buf, pos, depth)?;
+        let value = decode_at_depth(buf, pos, depth, refs)?;
         out.push((key, value));
     }
 }
@@ -433,9 +493,103 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reference_marker() {
-        // Marker 0x07 = REFERENCE — not supported.
-        let b = [0x07, 0x00, 0x00];
+    fn reference_resolves_to_prior_complex_object() {
+        // Two top-level values in one packet: an object, then a
+        // reference (marker 0x07, UI16 index 0) pointing back at it.
+        // §E.4.4.2: `IF Type == 7 { UI16 }`.
+        let obj = Amf0Value::Object(vec![
+            ("app".into(), Amf0Value::String("live".into())),
+            ("n".into(), Amf0Value::Number(7.0)),
+        ]);
+        let mut b = Vec::new();
+        encode(&mut b, &obj);
+        b.push(M_REFERENCE);
+        b.extend_from_slice(&0u16.to_be_bytes()); // reference index 0
+
+        let values = decode_all(&b).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], obj);
+        // The reference dereferences transparently to a clone of the
+        // object — callers never see a Reference variant.
+        assert_eq!(values[1], obj);
+    }
+
+    #[test]
+    fn reference_to_second_complex_object() {
+        // Object index 0, ECMA array index 1, strict array index 2, then
+        // a reference to index 1. Confirms the table appends each complex
+        // value in serialization order across the whole packet.
+        let o0 = Amf0Value::Object(vec![("a".into(), Amf0Value::Number(1.0))]);
+        let e1 = Amf0Value::EcmaArray(vec![("b".into(), Amf0Value::Boolean(true))]);
+        let s2 = Amf0Value::StrictArray(vec![Amf0Value::Number(9.0)]);
+        let mut b = Vec::new();
+        encode(&mut b, &o0);
+        encode(&mut b, &e1);
+        encode(&mut b, &s2);
+        b.push(M_REFERENCE);
+        b.extend_from_slice(&1u16.to_be_bytes()); // → e1
+
+        let values = decode_all(&b).unwrap();
+        assert_eq!(values.len(), 4);
+        assert_eq!(values[3], e1);
+    }
+
+    #[test]
+    fn nested_reference_inside_object_body() {
+        // Outer object whose "self" key references index 0 (the outer
+        // object itself, decoded so far as its placeholder). Proves a
+        // reference inside a body resolves against the in-flight table.
+        let mut body = Vec::new();
+        // key "x" → number
+        body.extend_from_slice(&(1u16).to_be_bytes());
+        body.extend_from_slice(b"x");
+        encode(&mut body, &Amf0Value::Number(5.0));
+        // key "self" → reference index 0
+        body.extend_from_slice(&(4u16).to_be_bytes());
+        body.extend_from_slice(b"self");
+        body.push(M_REFERENCE);
+        body.extend_from_slice(&0u16.to_be_bytes());
+        // terminator
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.push(M_OBJECT_END);
+
+        let mut frame = vec![M_OBJECT];
+        frame.extend_from_slice(&body);
+
+        let mut p = 0;
+        let v = decode(&frame, &mut p).unwrap();
+        if let Amf0Value::Object(pairs) = &v {
+            assert_eq!(pairs[0].0, "x");
+            // The self-reference resolves to the placeholder (an empty
+            // Object) — acyclic, no infinite loop.
+            assert_eq!(pairs[1].0, "self");
+            assert_eq!(pairs[1].1, Amf0Value::Object(Vec::new()));
+        } else {
+            panic!("expected object, got {v:?}");
+        }
+    }
+
+    #[test]
+    fn out_of_range_reference_is_clean_error() {
+        // Reference index 0 with an empty table → clean error, no panic.
+        let b = [M_REFERENCE, 0x00, 0x05];
+        let mut p = 0;
+        assert!(matches!(decode(&b, &mut p), Err(Error::InvalidAmf0(_))));
+    }
+
+    #[test]
+    fn truncated_reference_index_is_clean_error() {
+        // Marker present but only one of the two UI16 bytes follows.
+        let b = [M_REFERENCE, 0x00];
+        let mut p = 0;
+        assert!(matches!(decode(&b, &mut p), Err(Error::InvalidAmf0(_))));
+    }
+
+    #[test]
+    fn reference_scope_is_per_top_level_value_in_decode() {
+        // Single-value `decode` has a fresh table: a reference at the
+        // top level of its own call has nothing to point at.
+        let b = [M_REFERENCE, 0x00, 0x00];
         let mut p = 0;
         assert!(matches!(decode(&b, &mut p), Err(Error::InvalidAmf0(_))));
     }

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AMF0 object references (marker 0x07) — decoded and dereferenced
+  transparently** (`src/amf.rs`). The FLV v10.1 spec §E.4.4.2
+  `SCRIPTDATAVALUE` table defines `Type == 7` with the wire shape
+  `IF Type == 7 { UI16 }` — a 16-bit big-endian index into the table of
+  complex objects (Object, ECMA array, strict array) serialized so far
+  in the same context. The decoder previously rejected marker 0x07
+  outright, so any `onMetaData`/command payload that used a reference to
+  deduplicate a repeated complex value failed to decode entirely. The
+  decoder now maintains a per-context reference table (scoped to one
+  `decode_all` packet, or one top-level value for `decode`), appends
+  each complex value as it is decoded — reserving the slot *before* the
+  body so a reference appearing inside that body still resolves — and
+  resolves a reference to a clone of the indexed value. Callers never
+  see a `Reference` variant in the value graph; encoding always emits
+  the expanded (inline) form, which is byte-valid AMF0. An
+  out-of-range or truncated reference index surfaces a clean
+  `InvalidAmf0` error rather than a panic. Six tests cover prior-object
+  resolution, second-object indexing, in-body references, out-of-range
+  and truncated indices, and the per-value scope of `decode`.
 - **AMF3 §3.12 `U29O-traits-ext` externalizable objects — decodable via
   registered per-class handlers** (`src/amf3.rs`). The spec encodes an
   externalizable object's body as "an indeterminable number of bytes as
