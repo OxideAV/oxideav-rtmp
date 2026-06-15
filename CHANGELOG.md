@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.5...v0.0.6) - 2026-06-15
+
+### Other
+
+- strongly-typed colorInfo HDR metadata for VideoPacketType.Metadata
+- decode AMF0 object references (marker 0x07) per FLV §E.4.4.2
+- decode externalizable objects via registered per-class handlers (§3.12 U29O-traits-ext)
+- RTMP §5.3 Acknowledgement honoured on received-byte window
+- Enhanced RTMP v2 NetConnection.Connect.ReconnectRequest end-to-end
+- RTMP §5.2 Abort Message builder + reader partial-discard
+- typed UserControlEvent enum + round-trip parser
+- drop release-plz.toml — use release-plz defaults across the workspace
+- bump publisher-close drain windows for Ubuntu CI scheduling
+- RTMP §3.7 StreamDry / StreamIsRecorded / PingResponse + builders
+- typed MessageStreamKind accessor + spec-§5 protocol-control invariant validator
+- bind set_read_timeout to the reader's actual socket clone
+- replace drop(client) with close() so Windows CI doesn't race the flush
+- route Aggregate Messages (type 22) through next_packet + poll_event
+- fold ModEx TimestampOffsetNano onto the Packet timeline
+- Aggregate Message (type 22) parser + builder
+- Enhanced RTMP v1+v2 NetConnection connect capability negotiation
+- rephrase FlvReader::with_max_tag_size docs
+- FLV file / byte-stream reader (Annex E)
+- FLV file / byte-stream writer (Annex E)
+
 ### Added
 
 - **Strongly-typed `colorInfo` HDR metadata for `VideoPacketType.Metadata`**
