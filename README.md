@@ -152,6 +152,19 @@ client.close()?;
   `RtmpClient::resolve_reconnect_url` / `resolve_tc_url` apply the
   spec's resolution rule for all four documented `tcUrl` shapes.
   Neither side tears the session down on the event.
+- **Inbound NetStream control commands.** A server session surfaces a
+  peer-issued RTMP 1.0 §4.2 NetStream control command — `play`,
+  `play2`, `pause`, `seek`, `receiveAudio`, `receiveVideo` — as a
+  typed [`StreamPacket::Command`] carrying [`NetStreamCommand`], so a
+  server application can react (e.g. honour `receiveAudio false` by
+  suspending audio forwarding). `NetStreamCommand::parse` classifies a
+  decoded AMF0/AMF3 command frame and `to_message` is the byte-level
+  inverse (transaction id 0, Null Command Object per §4.2); the
+  optional `play` Start/Duration/Reset trailing fields round-trip with
+  spec defaults (−2 / −1 / false) materialised only when a later field
+  is present, and `play2`'s parameter object is preserved verbatim.
+  Teardown commands (`closeStream` / `deleteStream` / `FCUnpublish`)
+  still end the session silently and are not surfaced as commands.
 - **`ModEx` prelude.** The `ModEx` packet-type signal (a chain of
   size-prefixed `modExData` entries preceding the FourCC) is decoded
   for both audio and video, round-tripping through `VideoTag::mod_ex` /

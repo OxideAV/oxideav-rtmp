@@ -742,6 +742,204 @@ pub fn build_set_data_frame(stream_id: u32, metadata: Amf0Value) -> Message {
     }
 }
 
+/// A NetStream control command sent **by a client to the server**,
+/// per RTMP 1.0 Commands-Messages §4.2. These are the subscriber-side
+/// (play) and shared control commands a server receives on a NetStream
+/// after `createStream`: `play`, `play2`, `pause`, `seek`,
+/// `receiveAudio`, `receiveVideo`.
+///
+/// Every §4.2 command shares the same envelope on the wire — a
+/// command-name String, a transaction-id Number (always 0 for these),
+/// and a Null Command Object — followed by command-specific
+/// arguments. [`NetStreamCommand::parse`] classifies an
+/// already-decoded AMF0 command frame; [`NetStreamCommand::to_message`]
+/// is the byte-level inverse, emitting the frame on the supplied
+/// message stream id.
+///
+/// `play2` carries a single AMF object of parameters rather than flat
+/// arguments (§4.2.2); the whole object is preserved verbatim as
+/// [`NetStreamCommand::Play2`]'s payload so an unusual or
+/// vendor-extended parameter set round-trips without loss.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NetStreamCommand {
+    /// §4.2.1 `play` — request a stream by name. `start` / `duration` /
+    /// `reset` are optional trailing arguments (defaults −2 / −1 /
+    /// `false` per spec) and are `None` when the client omitted them.
+    Play {
+        /// Stream name to play (may carry an `mp4:` / `mp3:` prefix).
+        stream_name: String,
+        /// Optional Start time in seconds (spec default −2).
+        start: Option<f64>,
+        /// Optional Duration of playback in seconds (spec default −1).
+        duration: Option<f64>,
+        /// Optional Reset flag — clear the queued playlist first.
+        reset: Option<bool>,
+    },
+    /// §4.2.2 `play2` — switch bit-rate without a timeline change. The
+    /// AMF parameter object is preserved as-is.
+    Play2(Amf0Value),
+    /// §4.2.7 `seek` — seek `milliseconds` into the playlist.
+    Seek {
+        /// Offset in milliseconds to seek to.
+        milliseconds: f64,
+    },
+    /// §4.2.8 `pause` — pause (`true`) or resume (`false`) playback at
+    /// the given current stream time in milliseconds.
+    Pause {
+        /// `true` to pause, `false` to resume.
+        pause: bool,
+        /// Current stream time in milliseconds at the pause point.
+        milliseconds: f64,
+    },
+    /// §4.2.4 `receiveAudio` — tell the server whether to forward audio.
+    ReceiveAudio(bool),
+    /// §4.2.5 `receiveVideo` — tell the server whether to forward video.
+    ReceiveVideo(bool),
+}
+
+impl NetStreamCommand {
+    /// Classify an already-decoded AMF0 command frame (the output of
+    /// [`amf::decode_all`](crate::amf::decode_all) on a type-20 /
+    /// type-17 command message body). Returns `Ok(Some(cmd))` for a
+    /// recognised §4.2 NetStream control command, `Ok(None)` for any
+    /// other command name (e.g. `connect`, `publish`, `_result`,
+    /// `closeStream`) — those are handled elsewhere and are not an
+    /// error here.
+    ///
+    /// The leading three values are the §4.2 envelope (name,
+    /// transaction id, Command Object); command-specific arguments
+    /// follow. Missing optional trailing arguments are tolerated;
+    /// a missing **required** argument is an [`Error::InvalidCommand`].
+    pub fn parse(values: &[Amf0Value]) -> Result<Option<Self>> {
+        let name = match values.first().and_then(Amf0Value::as_str) {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        // Command-specific arguments begin after name, transaction id,
+        // and the (Null) Command Object.
+        let args = values.get(3..).unwrap_or(&[]);
+        let cmd =
+            match name {
+                "play" => {
+                    let stream_name = args
+                        .first()
+                        .and_then(Amf0Value::as_str)
+                        .ok_or_else(|| Error::InvalidCommand("`play` missing stream name".into()))?
+                        .to_string();
+                    NetStreamCommand::Play {
+                        stream_name,
+                        start: args.get(1).and_then(Amf0Value::as_f64),
+                        duration: args.get(2).and_then(Amf0Value::as_f64),
+                        reset: args.get(3).and_then(Amf0Value::as_bool),
+                    }
+                }
+                "play2" => {
+                    let params = args.first().cloned().ok_or_else(|| {
+                        Error::InvalidCommand("`play2` missing parameters".into())
+                    })?;
+                    NetStreamCommand::Play2(params)
+                }
+                "seek" => {
+                    let milliseconds =
+                        args.first().and_then(Amf0Value::as_f64).ok_or_else(|| {
+                            Error::InvalidCommand("`seek` missing milliSeconds".into())
+                        })?;
+                    NetStreamCommand::Seek { milliseconds }
+                }
+                "pause" => {
+                    let pause = args.first().and_then(Amf0Value::as_bool).ok_or_else(|| {
+                        Error::InvalidCommand("`pause` missing pause flag".into())
+                    })?;
+                    let milliseconds =
+                        args.get(1).and_then(Amf0Value::as_f64).ok_or_else(|| {
+                            Error::InvalidCommand("`pause` missing milliSeconds".into())
+                        })?;
+                    NetStreamCommand::Pause {
+                        pause,
+                        milliseconds,
+                    }
+                }
+                "receiveAudio" => {
+                    let flag = args.first().and_then(Amf0Value::as_bool).ok_or_else(|| {
+                        Error::InvalidCommand("`receiveAudio` missing bool flag".into())
+                    })?;
+                    NetStreamCommand::ReceiveAudio(flag)
+                }
+                "receiveVideo" => {
+                    let flag = args.first().and_then(Amf0Value::as_bool).ok_or_else(|| {
+                        Error::InvalidCommand("`receiveVideo` missing bool flag".into())
+                    })?;
+                    NetStreamCommand::ReceiveVideo(flag)
+                }
+                _ => return Ok(None),
+            };
+        Ok(Some(cmd))
+    }
+
+    /// The §4.2 command name string this variant carries on the wire.
+    pub fn command_name(&self) -> &'static str {
+        match self {
+            NetStreamCommand::Play { .. } => "play",
+            NetStreamCommand::Play2(_) => "play2",
+            NetStreamCommand::Seek { .. } => "seek",
+            NetStreamCommand::Pause { .. } => "pause",
+            NetStreamCommand::ReceiveAudio(_) => "receiveAudio",
+            NetStreamCommand::ReceiveVideo(_) => "receiveVideo",
+        }
+    }
+
+    /// Build the AMF0 command arguments (everything after the §4.2
+    /// envelope: name + transaction id 0 + Null Command Object).
+    fn args(&self) -> Vec<Amf0Value> {
+        match self {
+            NetStreamCommand::Play {
+                stream_name,
+                start,
+                duration,
+                reset,
+            } => {
+                // Trailing optionals are positional: a present later
+                // field forces the earlier optionals to materialise
+                // (spec defaults) so position is unambiguous.
+                let mut out = vec![Amf0Value::String(stream_name.clone())];
+                if start.is_some() || duration.is_some() || reset.is_some() {
+                    out.push(Amf0Value::Number(start.unwrap_or(-2.0)));
+                }
+                if duration.is_some() || reset.is_some() {
+                    out.push(Amf0Value::Number(duration.unwrap_or(-1.0)));
+                }
+                if let Some(r) = reset {
+                    out.push(Amf0Value::Boolean(*r));
+                }
+                out
+            }
+            NetStreamCommand::Play2(params) => vec![params.clone()],
+            NetStreamCommand::Seek { milliseconds } => vec![Amf0Value::Number(*milliseconds)],
+            NetStreamCommand::Pause {
+                pause,
+                milliseconds,
+            } => vec![Amf0Value::Boolean(*pause), Amf0Value::Number(*milliseconds)],
+            NetStreamCommand::ReceiveAudio(flag) | NetStreamCommand::ReceiveVideo(flag) => {
+                vec![Amf0Value::Boolean(*flag)]
+            }
+        }
+    }
+
+    /// Serialise this command to an AMF0 command [`Message`] on the
+    /// given message stream id. Transaction id is 0 and the Command
+    /// Object is Null, per §4.2 ("Transaction ID set to 0", "Command
+    /// information object does not exist. Set to null type.").
+    pub fn to_message(&self, stream_id: u32) -> Message {
+        let payload = encode_command(self.command_name(), 0.0, Amf0Value::Null, &self.args());
+        Message {
+            msg_type_id: MSG_COMMAND_AMF0,
+            msg_stream_id: stream_id,
+            timestamp: 0,
+            payload,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,5 +1347,148 @@ mod tests {
             info.get("description").is_none(),
             "description omitted when None"
         );
+    }
+
+    /// Round-trip a NetStreamCommand through `to_message` → decode →
+    /// `parse` and confirm the typed value is preserved.
+    fn round_trip(cmd: NetStreamCommand) {
+        let m = cmd.to_message(1);
+        assert_eq!(m.msg_type_id, MSG_COMMAND_AMF0);
+        assert_eq!(m.msg_stream_id, 1);
+        let vals = crate::amf::decode_all(&m.payload).unwrap();
+        // §4.2 envelope: name, transaction id 0, Null Command Object.
+        assert_eq!(vals[0].as_str(), Some(cmd.command_name()));
+        assert_eq!(vals[1].as_f64(), Some(0.0));
+        assert!(matches!(vals[2], Amf0Value::Null));
+        let parsed = NetStreamCommand::parse(&vals).unwrap().unwrap();
+        assert_eq!(parsed, cmd);
+    }
+
+    #[test]
+    fn netstream_play_full_round_trip() {
+        round_trip(NetStreamCommand::Play {
+            stream_name: "mp4:sample.m4v".into(),
+            start: Some(-2.0),
+            duration: Some(-1.0),
+            reset: Some(true),
+        });
+    }
+
+    /// A `play` with only the stream name omits the optional trailing
+    /// fields on the wire and parses them back as `None`.
+    #[test]
+    fn netstream_play_name_only() {
+        let cmd = NetStreamCommand::Play {
+            stream_name: "live".into(),
+            start: None,
+            duration: None,
+            reset: None,
+        };
+        let m = cmd.to_message(1);
+        let vals = crate::amf::decode_all(&m.payload).unwrap();
+        // name + txn + null + stream name = exactly 4 values.
+        assert_eq!(vals.len(), 4);
+        round_trip(cmd);
+    }
+
+    /// `reset` present forces `start`/`duration` to materialise at
+    /// their spec defaults so positional parsing stays unambiguous.
+    #[test]
+    fn netstream_play_reset_forces_defaults() {
+        let cmd = NetStreamCommand::Play {
+            stream_name: "s".into(),
+            start: None,
+            duration: None,
+            reset: Some(false),
+        };
+        let m = cmd.to_message(1);
+        let vals = crate::amf::decode_all(&m.payload).unwrap();
+        assert_eq!(vals[3].as_str(), Some("s"));
+        assert_eq!(vals[4].as_f64(), Some(-2.0)); // start default
+        assert_eq!(vals[5].as_f64(), Some(-1.0)); // duration default
+        assert_eq!(vals[6].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn netstream_pause_round_trip() {
+        round_trip(NetStreamCommand::Pause {
+            pause: true,
+            milliseconds: 4096.0,
+        });
+        round_trip(NetStreamCommand::Pause {
+            pause: false,
+            milliseconds: 0.0,
+        });
+    }
+
+    #[test]
+    fn netstream_seek_round_trip() {
+        round_trip(NetStreamCommand::Seek {
+            milliseconds: 12345.0,
+        });
+    }
+
+    #[test]
+    fn netstream_receive_audio_video_round_trip() {
+        round_trip(NetStreamCommand::ReceiveAudio(false));
+        round_trip(NetStreamCommand::ReceiveAudio(true));
+        round_trip(NetStreamCommand::ReceiveVideo(false));
+        round_trip(NetStreamCommand::ReceiveVideo(true));
+    }
+
+    #[test]
+    fn netstream_play2_preserves_param_object() {
+        let params = Amf0Value::Object(vec![
+            ("len".into(), Amf0Value::Number(-1.0)),
+            ("offset".into(), Amf0Value::Number(0.0)),
+            ("start".into(), Amf0Value::Number(0.0)),
+            ("streamName".into(), Amf0Value::String("hi".into())),
+            ("transition".into(), Amf0Value::String("switch".into())),
+        ]);
+        round_trip(NetStreamCommand::Play2(params));
+    }
+
+    /// A non-NetStream command name (`connect`, `_result`, teardown,
+    /// …) is not a §4.2 control command: `parse` returns `Ok(None)`
+    /// rather than erroring, so the server's teardown / connect paths
+    /// keep handling it.
+    #[test]
+    fn netstream_parse_ignores_other_commands() {
+        for name in [
+            "connect",
+            "_result",
+            "createStream",
+            "closeStream",
+            "publish",
+        ] {
+            let vals = vec![
+                Amf0Value::String(name.into()),
+                Amf0Value::Number(1.0),
+                Amf0Value::Null,
+            ];
+            assert!(NetStreamCommand::parse(&vals).unwrap().is_none());
+        }
+    }
+
+    /// A recognised command name missing a required argument is a hard
+    /// `InvalidCommand`, not a silently-dropped frame.
+    #[test]
+    fn netstream_parse_missing_required_arg_errors() {
+        // `seek` with no milliSeconds.
+        let vals = vec![
+            Amf0Value::String("seek".into()),
+            Amf0Value::Number(0.0),
+            Amf0Value::Null,
+        ];
+        assert!(matches!(
+            NetStreamCommand::parse(&vals),
+            Err(Error::InvalidCommand(_))
+        ));
+    }
+
+    /// An empty / nameless frame is `Ok(None)` (no command name).
+    #[test]
+    fn netstream_parse_empty_is_none() {
+        assert!(NetStreamCommand::parse(&[]).unwrap().is_none());
     }
 }

@@ -77,5 +77,5 @@ pub use flv::{
     MultichannelConfigOrder, Multitrack, MultitrackTrack, VideoTag,
 };
 pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
-pub use message::{UserControlEvent, RECONNECT_REQUEST_CODE};
+pub use message::{NetStreamCommand, UserControlEvent, RECONNECT_REQUEST_CODE};
 pub use server::{PublishRequest, RtmpServer, RtmpSession, StreamPacket};

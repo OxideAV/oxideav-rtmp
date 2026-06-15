@@ -49,6 +49,7 @@ fn client_publishes_and_server_receives_same_frames() {
                 Ok(Some(StreamPacket::Metadata(_))) => {
                     recv_tx.send(ReceivedPacket::Metadata).unwrap();
                 }
+                Ok(Some(StreamPacket::Command(_))) => {}
                 Ok(None) => break,
                 Err(_) => break,
             }

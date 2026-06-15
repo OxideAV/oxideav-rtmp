@@ -125,6 +125,7 @@ fn record_rtmp_publish_into_flv_file_byte_stream() {
                 Ok(Some(StreamPacket::Metadata(value))) => writer
                     .write_script_data(0, "onMetaData", &value)
                     .expect("write meta runtime"),
+                Ok(Some(StreamPacket::Command(_))) => {}
                 Ok(None) | Err(_) => break,
             }
         }
@@ -284,6 +285,7 @@ fn record_rtmp_publish_then_read_back_through_flv_reader() {
                 Ok(Some(StreamPacket::Metadata(v))) => writer
                     .write_script_data(0, "onMetaData", &v)
                     .expect("meta rt"),
+                Ok(Some(StreamPacket::Command(_))) => {}
                 Ok(None) | Err(_) => break,
             }
         }

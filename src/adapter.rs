@@ -259,6 +259,10 @@ impl RtmpPacketSource {
                 StreamPacket::Metadata(value) => {
                     flatten_metadata(&value, &mut metadata);
                 }
+                // NetStream control commands (play / pause / seek /
+                // receiveAudio / receiveVideo) aren't media packets; the
+                // PacketSource bridge ignores them.
+                StreamPacket::Command(_) => {}
             }
         }
 
@@ -333,6 +337,10 @@ impl PacketSource for RtmpPacketSource {
                 Some(StreamPacket::Metadata(value)) => {
                     flatten_metadata(&value, &mut self.metadata);
                     // Loop again — metadata isn't a media packet.
+                    continue;
+                }
+                Some(StreamPacket::Command(_)) => {
+                    // NetStream control command — not a media packet.
                     continue;
                 }
                 None => {

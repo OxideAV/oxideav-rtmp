@@ -293,6 +293,15 @@ pub enum StreamPacket {
     /// metadata object (usually width, height, codec ids, framerate,
     /// bitrate, audiodatarate, ...).
     Metadata(Amf0Value),
+    /// A NetStream control command the peer issued on the stream —
+    /// `play` / `play2` / `pause` / `seek` / `receiveAudio` /
+    /// `receiveVideo` per RTMP 1.0 Commands-Messages §4.2. Surfaced so
+    /// a server application can react (e.g. honour `receiveAudio false`
+    /// by suspending audio forwarding). The session does not act on
+    /// these itself; teardown commands (`closeStream` / `deleteStream`
+    /// / `FCUnpublish`) are still consumed silently and end the
+    /// session.
+    Command(NetStreamCommand),
 }
 
 impl RtmpSession {
@@ -560,29 +569,18 @@ impl RtmpSession {
                 Ok(metadata_object(&values).map(StreamPacket::Metadata))
             }
             MSG_COMMAND_AMF0 => {
-                // Likely closeStream / deleteStream /
-                // FCUnpublish — peer is shutting down.
                 let values = amf::decode_all(&msg.payload)?;
-                if let Some(name) = values.first().and_then(Amf0Value::as_str) {
-                    if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
-                        self.ended = true;
-                    }
-                }
-                Ok(None)
+                self.handle_command_values(&values)
             }
             MSG_COMMAND_AMF3 => {
-                // AMF3-encoded command (type 17). Same teardown
-                // detection as the AMF0 command path.
+                // AMF3-encoded command (type 17). Bridge each value onto
+                // the AMF0 shape so the same dispatch handles teardown
+                // detection and §4.2 NetStream control commands.
                 let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
                     .iter()
                     .map(amf3::Amf3Value::to_amf0)
                     .collect();
-                if let Some(name) = values.first().and_then(Amf0Value::as_str) {
-                    if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
-                        self.ended = true;
-                    }
-                }
-                Ok(None)
+                self.handle_command_values(&values)
             }
             MSG_AGGREGATE => {
                 // RTMP 1.0 §7.1.6 Aggregate Message. Split into
@@ -635,6 +633,23 @@ impl RtmpSession {
                 Ok(None)
             }
         }
+    }
+
+    /// Dispatch a decoded command frame (shared between the AMF0 and
+    /// AMF3 command arms). Teardown commands (`closeStream` /
+    /// `deleteStream` / `FCUnpublish`) end the session and produce no
+    /// packet; a recognised §4.2 NetStream control command
+    /// (`play` / `play2` / `pause` / `seek` / `receiveAudio` /
+    /// `receiveVideo`) surfaces as [`StreamPacket::Command`]; anything
+    /// else is consumed silently.
+    fn handle_command_values(&mut self, values: &[Amf0Value]) -> Result<Option<StreamPacket>> {
+        if let Some(name) = values.first().and_then(Amf0Value::as_str) {
+            if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
+                self.ended = true;
+                return Ok(None);
+            }
+        }
+        Ok(NetStreamCommand::parse(values)?.map(StreamPacket::Command))
     }
 }
 
