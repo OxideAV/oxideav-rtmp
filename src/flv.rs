@@ -22,6 +22,7 @@
 //! These shapes are stable across every commodity RTMP implementation
 //! we have interoperated with.
 
+use crate::amf::{self, Amf0Value};
 use crate::error::{Error, Result};
 
 // §E.4.3 "Video tag body" (FLV 10.1 spec annex E).
@@ -613,6 +614,269 @@ impl MultichannelConfig {
 }
 
 // ---------------------------------------------------------------------------
+// ColorInfo — Enhanced RTMP §"Metadata Frame" (VideoPacketType.Metadata)
+// ---------------------------------------------------------------------------
+//
+// A `VideoPacketType.Metadata` (= 4) video message carries an AMF-encoded
+// sequence of `[name, value]` pairs. The only `name` Enhanced RTMP defines is
+// `"colorInfo"`, whose `value` is an Object with three optional sub-objects
+// describing HDR metadata for a BT.2020 (Rec. 2020) source:
+//
+//   type ColorInfo = {
+//     colorConfig: {
+//       bitDepth:                number,  // 8 | 10 | 12
+//       colorPrimaries:          number,  // H.273 enumeration [0-255]
+//       transferCharacteristics: number,  // H.273 enumeration [0-255]
+//       matrixCoefficients:      number,  // H.273 enumeration [0-255]
+//     },
+//     hdrCll: { maxFall: number, maxCLL: number },          // cd/m2
+//     hdrMdcv: {                                             // ST 2086:2018
+//       redX, redY, greenX, greenY, blueX, blueY,
+//       whitePointX, whitePointY,
+//       maxLuminance, minLuminance,                          // cd/m2 (nits)
+//     },
+//   }
+//
+// Every property is OPTIONAL on the wire (the spec marks the sub-objects
+// SHOULD/RECOMMENDED, never MUST), so a partial colorInfo — e.g. only
+// colorConfig — must round-trip. We therefore model each field as
+// `Option<f64>` (AMF's native numeric type is the IEEE-754 double, so storing
+// f64 keeps the round-trip byte-exact instead of coercing to an integer that
+// would lose a fractional luminance value). A missing sub-object is `None`;
+// an empty `{}` object is `Some(default)` (all fields `None`), preserving the
+// spec's "reset to original color state via an empty object" signal distinct
+// from "sub-object absent".
+
+/// `colorConfig` sub-object of [`ColorInfo`]. Bit depth plus the three
+/// ITU-T H.273 / ISO-IEC 23091-4 enumeration indices (colour primaries,
+/// transfer characteristics, matrix coefficients). Stored as `Option<f64>`
+/// to round-trip a partial object byte-for-byte; use [`ColorConfig::is_empty`]
+/// to detect the all-absent case.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ColorConfig {
+    /// Bits per colour channel. SHOULD be 8, 10 or 12.
+    pub bit_depth: Option<f64>,
+    /// Colour primaries — H.273 "Colour primaries" table index [0-255].
+    pub color_primaries: Option<f64>,
+    /// Transfer characteristics — H.273 table index [0-255] (e.g. PQ, HLG).
+    pub transfer_characteristics: Option<f64>,
+    /// Matrix coefficients — H.273 table index [0-255].
+    pub matrix_coefficients: Option<f64>,
+}
+
+impl ColorConfig {
+    /// True when no field is set (an absent or `{}` `colorConfig`).
+    pub fn is_empty(&self) -> bool {
+        self.bit_depth.is_none()
+            && self.color_primaries.is_none()
+            && self.transfer_characteristics.is_none()
+            && self.matrix_coefficients.is_none()
+    }
+}
+
+/// `hdrCll` sub-object of [`ColorInfo`] — content light level. Both values
+/// are in cd/m2 (nits), spec range `[0.0001, 10000]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HdrCll {
+    /// Maximum frame-average light level over the playback sequence.
+    pub max_fall: Option<f64>,
+    /// Maximum light level of any single pixel over the playback sequence.
+    pub max_cll: Option<f64>,
+}
+
+impl HdrCll {
+    /// True when neither value is set.
+    pub fn is_empty(&self) -> bool {
+        self.max_fall.is_none() && self.max_cll.is_none()
+    }
+}
+
+/// `hdrMdcv` sub-object of [`ColorInfo`] — mastering display colour volume
+/// per SMPTE ST 2086:2018. Chromaticity coordinates are CIE-1931 xy; the
+/// luminance pair is in cd/m2 (nits).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HdrMdcv {
+    pub red_x: Option<f64>,
+    pub red_y: Option<f64>,
+    pub green_x: Option<f64>,
+    pub green_y: Option<f64>,
+    pub blue_x: Option<f64>,
+    pub blue_y: Option<f64>,
+    pub white_point_x: Option<f64>,
+    pub white_point_y: Option<f64>,
+    /// Max display luminance of the mastering display, range `[5, 10000]`.
+    pub max_luminance: Option<f64>,
+    /// Min display luminance of the mastering display, range `[0.0001, 5]`.
+    pub min_luminance: Option<f64>,
+}
+
+impl HdrMdcv {
+    /// True when no coordinate or luminance field is set.
+    pub fn is_empty(&self) -> bool {
+        self.red_x.is_none()
+            && self.red_y.is_none()
+            && self.green_x.is_none()
+            && self.green_y.is_none()
+            && self.blue_x.is_none()
+            && self.blue_y.is_none()
+            && self.white_point_x.is_none()
+            && self.white_point_y.is_none()
+            && self.max_luminance.is_none()
+            && self.min_luminance.is_none()
+    }
+}
+
+/// Strongly-typed view of the `"colorInfo"` HDR metadata object carried in a
+/// `VideoPacketType.Metadata` video message (Enhanced RTMP §"Metadata Frame").
+///
+/// Each of the three sub-objects (`colorConfig`, `hdrCll`, `hdrMdcv`) is
+/// `Option`: `None` means the property was absent from the wire object,
+/// `Some(..)` (possibly all-`None` inside) means it was present. This
+/// distinction matters because the spec's "reset to the original color state"
+/// signal is an empty object `{}` — distinct from omitting `colorInfo`
+/// altogether (which sends `Undefined`, surfaced as [`ColorInfo::is_reset`]).
+///
+/// Lift it from a parsed metadata [`VideoTag`] with
+/// [`VideoTag::color_info`], and rebuild an outgoing tag with
+/// [`VideoTag::color_info_tag`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ColorInfo {
+    pub color_config: Option<ColorConfig>,
+    pub hdr_cll: Option<HdrCll>,
+    pub hdr_mdcv: Option<HdrMdcv>,
+}
+
+impl ColorInfo {
+    /// Decode a `colorInfo` value (the AMF `value` half of the
+    /// `["colorInfo", value]` pair) from an already-decoded [`Amf0Value`].
+    ///
+    /// * An [`Amf0Value::Object`] / [`Amf0Value::EcmaArray`] is walked for
+    ///   the three sub-objects.
+    /// * [`Amf0Value::Undefined`] (the spec's RECOMMENDED reset signal) or
+    ///   an empty object decode to the all-`None` reset state.
+    /// * Any other AMF type is rejected with [`Error::Other`].
+    pub fn from_amf0(value: &Amf0Value) -> Result<ColorInfo> {
+        match value {
+            Amf0Value::Undefined | Amf0Value::Null => Ok(ColorInfo::default()),
+            Amf0Value::Object(_) | Amf0Value::EcmaArray(_) => Ok(ColorInfo {
+                color_config: value.get("colorConfig").map(parse_color_config),
+                hdr_cll: value.get("hdrCll").map(parse_hdr_cll),
+                hdr_mdcv: value.get("hdrMdcv").map(parse_hdr_mdcv),
+            }),
+            _ => Err(Error::Other(
+                "colorInfo: value must be an Object/ECMA array or Undefined".into(),
+            )),
+        }
+    }
+
+    /// True when this is the reset signal — no sub-object present. Encodes as
+    /// `Undefined` per the spec's RECOMMENDED reset approach (see
+    /// [`ColorInfo::to_amf0`]).
+    pub fn is_reset(&self) -> bool {
+        self.color_config.is_none() && self.hdr_cll.is_none() && self.hdr_mdcv.is_none()
+    }
+
+    /// Encode to the AMF `value` half of the `["colorInfo", value]` pair.
+    ///
+    /// The reset state ([`ColorInfo::is_reset`]) encodes as
+    /// [`Amf0Value::Undefined`] — the spec's RECOMMENDED reset form. A
+    /// present-but-empty sub-object encodes as an empty `{}` object so the
+    /// presence bit round-trips.
+    pub fn to_amf0(&self) -> Amf0Value {
+        if self.is_reset() {
+            return Amf0Value::Undefined;
+        }
+        let mut obj: Vec<(String, Amf0Value)> = Vec::new();
+        if let Some(cc) = &self.color_config {
+            obj.push(("colorConfig".into(), color_config_to_amf0(cc)));
+        }
+        if let Some(cll) = &self.hdr_cll {
+            obj.push(("hdrCll".into(), hdr_cll_to_amf0(cll)));
+        }
+        if let Some(mdcv) = &self.hdr_mdcv {
+            obj.push(("hdrMdcv".into(), hdr_mdcv_to_amf0(mdcv)));
+        }
+        Amf0Value::Object(obj)
+    }
+}
+
+fn opt_num(v: &Amf0Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(Amf0Value::as_f64)
+}
+
+fn parse_color_config(v: &Amf0Value) -> ColorConfig {
+    ColorConfig {
+        bit_depth: opt_num(v, "bitDepth"),
+        color_primaries: opt_num(v, "colorPrimaries"),
+        transfer_characteristics: opt_num(v, "transferCharacteristics"),
+        matrix_coefficients: opt_num(v, "matrixCoefficients"),
+    }
+}
+
+fn parse_hdr_cll(v: &Amf0Value) -> HdrCll {
+    HdrCll {
+        max_fall: opt_num(v, "maxFall"),
+        max_cll: opt_num(v, "maxCLL"),
+    }
+}
+
+fn parse_hdr_mdcv(v: &Amf0Value) -> HdrMdcv {
+    HdrMdcv {
+        red_x: opt_num(v, "redX"),
+        red_y: opt_num(v, "redY"),
+        green_x: opt_num(v, "greenX"),
+        green_y: opt_num(v, "greenY"),
+        blue_x: opt_num(v, "blueX"),
+        blue_y: opt_num(v, "blueY"),
+        white_point_x: opt_num(v, "whitePointX"),
+        white_point_y: opt_num(v, "whitePointY"),
+        max_luminance: opt_num(v, "maxLuminance"),
+        min_luminance: opt_num(v, "minLuminance"),
+    }
+}
+
+fn push_num(obj: &mut Vec<(String, Amf0Value)>, key: &str, val: Option<f64>) {
+    if let Some(n) = val {
+        obj.push((key.to_string(), Amf0Value::Number(n)));
+    }
+}
+
+fn color_config_to_amf0(cc: &ColorConfig) -> Amf0Value {
+    let mut obj = Vec::new();
+    push_num(&mut obj, "bitDepth", cc.bit_depth);
+    push_num(&mut obj, "colorPrimaries", cc.color_primaries);
+    push_num(
+        &mut obj,
+        "transferCharacteristics",
+        cc.transfer_characteristics,
+    );
+    push_num(&mut obj, "matrixCoefficients", cc.matrix_coefficients);
+    Amf0Value::Object(obj)
+}
+
+fn hdr_cll_to_amf0(cll: &HdrCll) -> Amf0Value {
+    let mut obj = Vec::new();
+    push_num(&mut obj, "maxFall", cll.max_fall);
+    push_num(&mut obj, "maxCLL", cll.max_cll);
+    Amf0Value::Object(obj)
+}
+
+fn hdr_mdcv_to_amf0(mdcv: &HdrMdcv) -> Amf0Value {
+    let mut obj = Vec::new();
+    push_num(&mut obj, "redX", mdcv.red_x);
+    push_num(&mut obj, "redY", mdcv.red_y);
+    push_num(&mut obj, "greenX", mdcv.green_x);
+    push_num(&mut obj, "greenY", mdcv.green_y);
+    push_num(&mut obj, "blueX", mdcv.blue_x);
+    push_num(&mut obj, "blueY", mdcv.blue_y);
+    push_num(&mut obj, "whitePointX", mdcv.white_point_x);
+    push_num(&mut obj, "whitePointY", mdcv.white_point_y);
+    push_num(&mut obj, "maxLuminance", mdcv.max_luminance);
+    push_num(&mut obj, "minLuminance", mdcv.min_luminance);
+    Amf0Value::Object(obj)
+}
+
+// ---------------------------------------------------------------------------
 // Multitrack — Enhanced RTMP v2 §"ExVideoTagBody" / §"ExAudioTagBody"
 // ---------------------------------------------------------------------------
 //
@@ -913,6 +1177,63 @@ impl VideoTag {
     /// short-circuit on this predicate first.
     pub fn is_ex_metadata(&self) -> bool {
         self.fourcc.is_some() && self.ex_packet_type == Some(EX_PACKET_TYPE_METADATA)
+    }
+
+    /// Lift the `"colorInfo"` HDR metadata out of a
+    /// `VideoPacketType.Metadata` tag into the strongly-typed [`ColorInfo`]
+    /// view (Enhanced RTMP §"Metadata Frame").
+    ///
+    /// The metadata [`body`][VideoTag::body] is an AMF-encoded sequence of
+    /// `[name, value]` pairs; this scans for the `"colorInfo"` name and
+    /// decodes the following value. Returns:
+    ///
+    /// * `Ok(None)` when this is not a metadata tag, or no `"colorInfo"`
+    ///   pair is present (the spec leaves room for other future names).
+    /// * `Ok(Some(ColorInfo))` for a decoded `colorInfo` value, including
+    ///   the reset signal (`Undefined`/`{}` → [`ColorInfo::is_reset`]).
+    /// * `Err(..)` when the AMF body is malformed or the `colorInfo` value
+    ///   is the wrong AMF type.
+    pub fn color_info(&self) -> Result<Option<ColorInfo>> {
+        if !self.is_ex_metadata() {
+            return Ok(None);
+        }
+        let values = amf::decode_all(&self.body)?;
+        // The body is a flat `name, value, name, value, …` stream. Find the
+        // "colorInfo" name string and decode the value that follows it.
+        let mut i = 0;
+        while i + 1 < values.len() {
+            if values[i].as_str() == Some("colorInfo") {
+                return ColorInfo::from_amf0(&values[i + 1]).map(Some);
+            }
+            i += 2;
+        }
+        Ok(None)
+    }
+
+    /// Build a `VideoPacketType.Metadata` tag carrying a single
+    /// `["colorInfo", value]` pair for the given codec FourCC (Enhanced RTMP
+    /// §"Metadata Frame"). The `FrameType` flags are ignored by spec for a
+    /// metadata packet, so this stamps the conventional `Info` (5) value.
+    ///
+    /// The inverse of [`VideoTag::color_info`]: the produced tag's
+    /// [`body`][VideoTag::body] is `encode("colorInfo") ++ encode(value)`,
+    /// where a [reset][ColorInfo::is_reset] `ColorInfo` encodes the value as
+    /// `Undefined`.
+    pub fn color_info_tag(fourcc: [u8; 4], color_info: &ColorInfo) -> VideoTag {
+        let mut body = Vec::new();
+        amf::encode(&mut body, &Amf0Value::String("colorInfo".into()));
+        amf::encode(&mut body, &color_info.to_amf0());
+        VideoTag {
+            frame_type: VIDEO_FRAME_INFO,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body,
+            ex_packet_type: Some(EX_PACKET_TYPE_METADATA),
+            fourcc: Some(fourcc),
+            mod_ex: Vec::new(),
+            multitrack: None,
+        }
     }
 
     /// Sum of the `TimestampOffsetNano` ModEx entries on this tag, in
@@ -1965,6 +2286,145 @@ mod tests {
         let back = parse_video(&payload).unwrap();
         assert_eq!(back, tag);
         assert!(back.is_ex_metadata());
+    }
+
+    #[test]
+    fn color_info_round_trips_full_hdr10() {
+        // Realistic HDR10 colorInfo: 10-bit, BT.2020 primaries (9),
+        // PQ transfer (16), BT.2020 NCL matrix (9), with hdrCll + hdrMdcv.
+        let ci = ColorInfo {
+            color_config: Some(ColorConfig {
+                bit_depth: Some(10.0),
+                color_primaries: Some(9.0),
+                transfer_characteristics: Some(16.0),
+                matrix_coefficients: Some(9.0),
+            }),
+            hdr_cll: Some(HdrCll {
+                max_fall: Some(400.0),
+                max_cll: Some(1000.0),
+            }),
+            hdr_mdcv: Some(HdrMdcv {
+                red_x: Some(0.708),
+                red_y: Some(0.292),
+                green_x: Some(0.170),
+                green_y: Some(0.797),
+                blue_x: Some(0.131),
+                blue_y: Some(0.046),
+                white_point_x: Some(0.3127),
+                white_point_y: Some(0.3290),
+                max_luminance: Some(1000.0),
+                min_luminance: Some(0.0001),
+            }),
+        };
+        let tag = VideoTag::color_info_tag(FOURCC_HEVC, &ci);
+        assert!(tag.is_ex_metadata());
+        let payload = build_video(&tag);
+        let back = parse_video(&payload).unwrap();
+        assert_eq!(back, tag);
+        let decoded = back.color_info().unwrap().unwrap();
+        assert_eq!(decoded, ci);
+        assert!(!decoded.is_reset());
+    }
+
+    #[test]
+    fn color_info_partial_only_color_config_round_trips() {
+        // Only colorConfig present — hdrCll/hdrMdcv absent must stay absent.
+        let ci = ColorInfo {
+            color_config: Some(ColorConfig {
+                bit_depth: Some(8.0),
+                color_primaries: Some(1.0),
+                transfer_characteristics: Some(1.0),
+                matrix_coefficients: Some(1.0),
+            }),
+            hdr_cll: None,
+            hdr_mdcv: None,
+        };
+        let tag = VideoTag::color_info_tag(FOURCC_AV1, &ci);
+        let decoded = VideoTag::color_info(&parse_video(&build_video(&tag)).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, ci);
+        assert!(decoded.hdr_cll.is_none());
+        assert!(decoded.hdr_mdcv.is_none());
+    }
+
+    #[test]
+    fn color_info_reset_encodes_undefined() {
+        // The spec's RECOMMENDED reset signal: colorInfo = Undefined.
+        let ci = ColorInfo::default();
+        assert!(ci.is_reset());
+        let tag = VideoTag::color_info_tag(FOURCC_HEVC, &ci);
+        let back = parse_video(&build_video(&tag)).unwrap();
+        let decoded = back.color_info().unwrap().unwrap();
+        assert!(decoded.is_reset());
+        assert_eq!(decoded, ColorInfo::default());
+        // Body must be the "colorInfo" string followed by an AMF Undefined
+        // marker (0x06), not an Object.
+        let values = crate::amf::decode_all(&tag.body).unwrap();
+        assert_eq!(values[0].as_str(), Some("colorInfo"));
+        assert_eq!(values[1], Amf0Value::Undefined);
+    }
+
+    #[test]
+    fn color_info_empty_object_is_present_but_empty() {
+        // An empty `{}` colorInfo (alternative reset form) decodes to a
+        // present-but-all-None ColorInfo, distinct from a missing pair.
+        let mut body = Vec::new();
+        crate::amf::encode(&mut body, &Amf0Value::String("colorInfo".into()));
+        crate::amf::encode(&mut body, &Amf0Value::Object(Vec::new()));
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_INFO,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body,
+            ex_packet_type: Some(EX_PACKET_TYPE_METADATA),
+            fourcc: Some(FOURCC_HEVC),
+            mod_ex: Vec::new(),
+            multitrack: None,
+        };
+        let decoded = tag.color_info().unwrap().unwrap();
+        // Empty object → all sub-objects absent → reset.
+        assert!(decoded.is_reset());
+    }
+
+    #[test]
+    fn color_info_none_for_non_metadata_tag() {
+        let tag = VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: VIDEO_CODEC_AVC,
+            avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
+            composition_time: 0,
+            body: vec![0, 0, 0, 1, 0x65],
+            ex_packet_type: None,
+            fourcc: None,
+            mod_ex: Vec::new(),
+            multitrack: None,
+        };
+        assert_eq!(tag.color_info().unwrap(), None);
+    }
+
+    #[test]
+    fn color_info_none_when_pair_name_is_not_colorinfo() {
+        // A metadata tag carrying some other (future) name yields None,
+        // not an error.
+        let mut body = Vec::new();
+        crate::amf::encode(&mut body, &Amf0Value::String("somethingElse".into()));
+        crate::amf::encode(&mut body, &Amf0Value::Number(1.0));
+        let tag = VideoTag::color_info_tag(FOURCC_HEVC, &ColorInfo::default());
+        let tag = VideoTag { body, ..tag };
+        assert_eq!(tag.color_info().unwrap(), None);
+    }
+
+    #[test]
+    fn color_info_rejects_wrong_amf_type() {
+        // colorInfo value of a scalar AMF type is a malformed metadata body.
+        let mut body = Vec::new();
+        crate::amf::encode(&mut body, &Amf0Value::String("colorInfo".into()));
+        crate::amf::encode(&mut body, &Amf0Value::Number(42.0));
+        let tag = VideoTag::color_info_tag(FOURCC_HEVC, &ColorInfo::default());
+        let tag = VideoTag { body, ..tag };
+        assert!(tag.color_info().is_err());
     }
 
     #[test]

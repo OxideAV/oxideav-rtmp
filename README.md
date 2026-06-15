@@ -104,6 +104,19 @@ client.close()?;
   VP8 + VP9), `CodedFrames`, `CodedFramesX` (CTS=0 omitted),
   `SequenceEnd`, and the HDR `PacketTypeMetadata` (`colorInfo`)
   frames all round-trip via `flv::parse_video` / `flv::build_video`.
+  The HDR `colorInfo` object is also lifted into a **strongly-typed
+  [`ColorInfo`] view** (per `enhanced-rtmp-v2.pdf` §"Metadata Frame"):
+  `VideoTag::color_info()` decodes the `["colorInfo", Object]` pair into
+  `colorConfig` (`bitDepth` + the ITU-T H.273 `colorPrimaries` /
+  `transferCharacteristics` / `matrixCoefficients` enumeration indices),
+  `hdrCll` (`maxFall` / `maxCLL` content light level) and `hdrMdcv`
+  (SMPTE ST 2086:2018 mastering-display chromaticities + min/max
+  luminance), and `VideoTag::color_info_tag(fourcc, &ColorInfo)` rebuilds
+  the outbound metadata tag. Every property is `Option<f64>` (AMF's native
+  double, byte-exact) and each sub-object is `Option`, so a partial
+  `colorInfo` round-trips; the spec's "reset to original color state"
+  signal — `Undefined` (RECOMMENDED) or an empty `{}` — surfaces as
+  [`ColorInfo::is_reset`] and re-encodes as `Undefined`.
   SI24 `compositionTimeOffset` is emitted on the wire for the three
   NALU-based FourCCs (`hvc1` / `avc1` / `vvc1`) with `CodedFrames`
   and stripped for `CodedFramesX` per the v2 spec. The crate passes

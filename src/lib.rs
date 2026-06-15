@@ -73,8 +73,8 @@ pub use chunk::{Message, MessageStreamKind};
 pub use client::{resolve_tc_url, ClientEvent, RtmpClient, RtmpUrl};
 pub use error::{Error, Result};
 pub use flv::{
-    AudioTag, ModEx, MultichannelConfig, MultichannelConfigOrder, Multitrack, MultitrackTrack,
-    VideoTag,
+    AudioTag, ColorConfig, ColorInfo, HdrCll, HdrMdcv, ModEx, MultichannelConfig,
+    MultichannelConfigOrder, Multitrack, MultitrackTrack, VideoTag,
 };
 pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
 pub use message::{UserControlEvent, RECONNECT_REQUEST_CODE};

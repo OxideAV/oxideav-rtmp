@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Strongly-typed `colorInfo` HDR metadata for `VideoPacketType.Metadata`**
+  (`src/flv.rs`). Enhanced RTMP §"Metadata Frame" defines the
+  `VideoPacketType.Metadata` (= 4) video message as an AMF-encoded
+  sequence of `[name, value]` pairs, the only defined name being
+  `"colorInfo"` — an HDR metadata object carrying `colorConfig`
+  (bitDepth + the ITU-T H.273 colourPrimaries / transferCharacteristics /
+  matrixCoefficients enumeration indices), `hdrCll` (maxFall / maxCLL
+  content light level in cd/m2) and `hdrMdcv` (SMPTE ST 2086:2018
+  mastering-display chromaticity coordinates + min/max luminance). The
+  body previously passed through as opaque AMF bytes; it now lifts into
+  the typed [`ColorInfo`] / [`ColorConfig`] / [`HdrCll`] / [`HdrMdcv`]
+  views via `VideoTag::color_info()`, and `VideoTag::color_info_tag(fourcc,
+  &ColorInfo)` rebuilds the matching outbound metadata tag. Every property
+  is `Option<f64>` (AMF's native double, kept byte-exact rather than
+  coerced to an integer that would lose a fractional luminance value), and
+  each sub-object is `Option` so a partial `colorInfo` — e.g. only
+  `colorConfig` — round-trips. The spec's "reset to original color state"
+  signal is preserved: an `Undefined` value (the RECOMMENDED form) and an
+  empty `{}` object both decode to [`ColorInfo::is_reset`], and a reset
+  `ColorInfo` re-encodes as `Undefined`. A `colorInfo` value of the wrong
+  AMF type is a clean `Error::Other`; a metadata tag with a different
+  (future) pair name yields `Ok(None)` rather than an error. Seven tests
+  cover full-HDR10 round-trip, colorConfig-only partial, the two reset
+  forms, the non-metadata-tag / non-colorInfo-name `None` cases, and the
+  wrong-type rejection.
 - **AMF0 object references (marker 0x07) — decoded and dereferenced
   transparently** (`src/amf.rs`). The FLV v10.1 spec §E.4.4.2
   `SCRIPTDATAVALUE` table defines `Type == 7` with the wire shape
