@@ -51,6 +51,7 @@ pub mod chunk;
 pub mod client;
 pub mod error;
 pub mod flv;
+pub mod flv_crypt;
 pub mod flv_file;
 pub mod handshake;
 pub mod message;
@@ -75,6 +76,10 @@ pub use error::{Error, Result};
 pub use flv::{
     AudioTag, ColorConfig, ColorInfo, HdrCll, HdrMdcv, ModEx, MultichannelConfig,
     MultichannelConfigOrder, Multitrack, MultitrackTrack, VideoTag,
+};
+pub use flv_crypt::{
+    parse_encrypted_body, EncryptedTag, FilterParams, FILTER_NAME_ENCRYPTION,
+    FILTER_NAME_SELECTIVE, IV_LEN, NUM_FILTERS,
 };
 pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
 pub use message::{NetStreamCommand, UserControlEvent, RECONNECT_REQUEST_CODE};

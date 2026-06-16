@@ -76,6 +76,7 @@ use std::io::{self, Read, Write};
 use crate::amf::{self, Amf0Value};
 use crate::error::{Error, Result};
 use crate::flv::{self, AudioTag, VideoTag};
+use crate::flv_crypt::{self, EncryptedTag};
 
 /// FLV tag type — `TagType` field of an `FLVTAG`, §E.4.1.
 pub const FLV_TAG_TYPE_AUDIO: u8 = 8;
@@ -317,6 +318,24 @@ impl<W: Write> FlvWriter<W> {
         self.write_payload(tag_type, timestamp_ms, payload)
     }
 
+    /// Frame an encrypted tag (§E.4.1 `Filter = 1`, Annex F). `tag_type`
+    /// is the in-clear underlying type (audio `8` / video `9` / script
+    /// `18`); the filter bit is set in the framed header and the body
+    /// is the §F.3.1 + §F.3.2 envelope plus ciphertext produced by
+    /// [`EncryptedTag::encode`]. The inverse of the [`FlvReader`]
+    /// `FlvTag::Encrypted` path.
+    pub fn write_encrypted_tag(
+        &mut self,
+        tag_type: u8,
+        timestamp_ms: u32,
+        crypt: &EncryptedTag,
+    ) -> io::Result<()> {
+        // Set the §E.4.1 Filter bit (UB[1] at bit 5) on the type byte.
+        // `build_flv_tag` writes the supplied `tag_type` argument
+        // verbatim as the first byte, so OR-ing in 0x20 sets Filter=1.
+        self.write_payload((tag_type & 0x1F) | 0x20, timestamp_ms, &crypt.encode())
+    }
+
     fn write_payload(&mut self, tag_type: u8, timestamp_ms: u32, payload: &[u8]) -> io::Result<()> {
         if self.finished {
             return Err(io::Error::new(
@@ -397,6 +416,20 @@ pub enum FlvTag {
         timestamp_ms: u32,
         body: Vec<u8>,
     },
+    /// A tag whose §E.4.1 `Filter` bit is set: the body is encrypted
+    /// per Annex F. `tag_type` is the underlying §E.4.1 type (audio /
+    /// video / script — kept in clear so a player can route without
+    /// decrypting), and [`EncryptedTag`] carries the §F.3.1 +§F.3.2
+    /// encryption envelope plus the still-ciphered body. Decryption is
+    /// out of scope (the §F.2.5 content key is retrieved via a
+    /// DRM-server protocol the spec leaves undefined); the envelope is
+    /// surfaced so a caller can route the body to a decryption stage or
+    /// skip the tag without failing the whole stream.
+    Encrypted {
+        tag_type: u8,
+        timestamp_ms: u32,
+        crypt: EncryptedTag,
+    },
 }
 
 impl FlvTag {
@@ -407,6 +440,7 @@ impl FlvTag {
             FlvTag::Video { .. } => FLV_TAG_TYPE_VIDEO,
             FlvTag::Script { .. } => FLV_TAG_TYPE_SCRIPT_DATA,
             FlvTag::Unknown { tag_type, .. } => *tag_type,
+            FlvTag::Encrypted { tag_type, .. } => *tag_type,
         }
     }
 
@@ -417,7 +451,18 @@ impl FlvTag {
             FlvTag::Audio { timestamp_ms, .. }
             | FlvTag::Video { timestamp_ms, .. }
             | FlvTag::Script { timestamp_ms, .. }
-            | FlvTag::Unknown { timestamp_ms, .. } => *timestamp_ms,
+            | FlvTag::Unknown { timestamp_ms, .. }
+            | FlvTag::Encrypted { timestamp_ms, .. } => *timestamp_ms,
+        }
+    }
+
+    /// The §F encryption envelope, if this tag's §E.4.1 `Filter` bit
+    /// was set. `None` for the plain audio / video / script / unknown
+    /// variants.
+    pub fn encrypted(&self) -> Option<&EncryptedTag> {
+        match self {
+            FlvTag::Encrypted { crypt, .. } => Some(crypt),
+            _ => None,
         }
     }
 }
@@ -613,16 +658,6 @@ impl<R: Read> FlvReader<R> {
         let raw_type = header[0];
         // UB[2] reserved + UB[1] filter + UB[5] tag type.
         let filter = (raw_type >> 5) & 0x01;
-        if filter != 0 {
-            // §E.4.1 — the Filter bit means the body is encrypted per
-            // Annex F. We don't implement the Annex F decrypt path
-            // here; surface the situation as a structured error so
-            // the caller can either route to a decryption stage or
-            // skip the tag.
-            return Err(Error::Other(
-                "FLV: encrypted tag (Filter=1, Annex F) — decryption not implemented".into(),
-            ));
-        }
         let tag_type = raw_type & 0x1F;
         let data_size = ((header[1] as u32) << 16) | ((header[2] as u32) << 8) | header[3] as u32;
         if data_size > self.max_tag_size {
@@ -659,6 +694,24 @@ impl<R: Read> FlvReader<R> {
         }
         self.bytes_read += 4;
         self.last_tag_size = expected;
+
+        // §E.4.1 — if the Filter bit is set, the body is encrypted per
+        // Annex F: it begins with the in-clear §F.3.1 EncryptionTagHeader
+        // + §F.3.2 FilterParams and is followed by the §F.3.3 ciphered
+        // body. The underlying audio/video/script `tag_type` stays in
+        // clear so a player can route without decrypting. We parse the
+        // envelope and surface the still-ciphered body rather than
+        // decoding the payload (decryption needs a DRM-supplied key —
+        // §F.2.5 — that the spec leaves out of scope).
+        if filter != 0 {
+            let crypt = flv_crypt::parse_encrypted_body(&body)
+                .map_err(|e| Error::Other(format!("FLV encrypted tag (Annex F): {e}")))?;
+            return Ok(Some(FlvTag::Encrypted {
+                tag_type,
+                timestamp_ms,
+                crypt,
+            }));
+        }
 
         let decoded = match tag_type {
             FLV_TAG_TYPE_AUDIO => {
@@ -1575,8 +1628,17 @@ mod tests {
     }
 
     #[test]
-    fn reader_rejects_encrypted_filter_bit() {
-        // Filter bit set (Annex F) — we don't implement decrypt.
+    fn reader_decodes_encrypted_filter_bit() {
+        // Filter bit set (Annex F) — the body carries the §F.3.1/§F.3.2
+        // envelope + ciphertext; the reader surfaces it as
+        // FlvTag::Encrypted instead of failing.
+        let crypt = EncryptedTag {
+            filter_name: flv_crypt::FILTER_NAME_ENCRYPTION.into(),
+            params: flv_crypt::FilterParams::Encryption { iv: [0x5A; 16] },
+            body: vec![0xAB; 48],
+        };
+        let body = crypt.encode();
+
         let header = build_flv_header(FlvHeaderFlags {
             audio: false,
             video: true,
@@ -1584,10 +1646,45 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(&header);
         buf.extend_from_slice(&0u32.to_be_bytes());
-        // TagType byte = 0x29 = 0b0010_1001 → filter bit (1 << 5) +
-        // tag_type 9.
+        // TagType byte = filter bit (1 << 5) + tag_type 9 (video).
+        let raw_type = 0x20 | FLV_TAG_TYPE_VIDEO;
+        let ds = body.len() as u32;
+        buf.push(raw_type);
+        buf.extend_from_slice(&[(ds >> 16) as u8, (ds >> 8) as u8, ds as u8]);
+        buf.extend_from_slice(&[0, 0, 0, 0]); // ts + ts_ext
+        buf.extend_from_slice(&[0, 0, 0]); // StreamID
+        buf.extend_from_slice(&body);
+        buf.extend_from_slice(&(11 + ds).to_be_bytes());
+
+        let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
+        let tag = r.read_tag().expect("read").expect("some");
+        match tag {
+            FlvTag::Encrypted {
+                tag_type,
+                crypt: got,
+                ..
+            } => {
+                assert_eq!(tag_type, FLV_TAG_TYPE_VIDEO);
+                assert_eq!(got, crypt);
+                assert!(got.is_encrypted());
+                assert_eq!(got.iv(), Some(&[0x5A; 16]));
+            }
+            other => panic!("expected Encrypted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reader_rejects_malformed_encrypted_body() {
+        // Filter bit set but the body isn't a valid §F.3.1 envelope.
+        let header = build_flv_header(FlvHeaderFlags {
+            audio: false,
+            video: true,
+        });
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&0u32.to_be_bytes());
         buf.extend_from_slice(&[
-            0x29, 0, 0, 0, // DataSize = 0
+            0x29, 0, 0, 0, // filter + video, DataSize = 0 (empty body)
             0, 0, 0, 0, // ts
             0, 0, 0, // StreamID
         ]);
@@ -1596,7 +1693,7 @@ mod tests {
         let mut r = FlvReader::new(Cursor::new(buf)).expect("reader new");
         let err = r.read_tag().unwrap_err();
         assert!(
-            matches!(err, Error::Other(ref m) if m.contains("encrypted")),
+            matches!(err, Error::Other(ref m) if m.contains("Annex F")),
             "got {err:?}"
         );
     }
@@ -1729,6 +1826,13 @@ mod tests {
                     timestamp_ms,
                     body,
                 } => w2.write_raw_tag(*tag_type, *timestamp_ms, body).unwrap(),
+                FlvTag::Encrypted {
+                    tag_type,
+                    timestamp_ms,
+                    crypt,
+                } => w2
+                    .write_encrypted_tag(*tag_type, *timestamp_ms, crypt)
+                    .unwrap(),
             }
         }
         let re = w2.finish().expect("finish2");

@@ -334,6 +334,48 @@ fn flv_parse_audio_empty_payload_returns_error() {
 }
 
 // ---------------------------------------------------------------------------
+// FLV Encryption envelope fuzz — `flv_crypt::parse_encrypted_body`
+// (Annex F.3.1 / F.3.2). The body of a Filter=1 tag is attacker-shaped;
+// the parser must return Err on every malformed envelope, never panic
+// or over-allocate on a forged UI24 Length field.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn flv_crypt_parse_random_bytes_never_panics() {
+    let mut rng = Xs64::new(0x0F1F_0DE0_C12F);
+    for iter in 0..4096 {
+        let len = (rng.next() as usize) % 80;
+        let mut buf = vec![0u8; len];
+        rng.fill(&mut buf);
+        let buf_copy = buf.clone();
+        let result =
+            std::panic::catch_unwind(move || oxideav_rtmp::parse_encrypted_body(&buf_copy));
+        assert!(
+            result.is_ok(),
+            "parse_encrypted_body panicked on iteration {iter}, input bytes: {buf:?}"
+        );
+    }
+}
+
+#[test]
+fn flv_crypt_empty_body_returns_error() {
+    assert!(oxideav_rtmp::parse_encrypted_body(&[]).is_err());
+}
+
+/// A valid header followed by an attacker-chosen huge UI24 Length must
+/// be refused without allocating against the claimed size (the
+/// FilterParams slice is bounded by the actual body length).
+#[test]
+fn flv_crypt_oversize_length_errors_fast() {
+    let mut buf = Vec::new();
+    buf.push(1); // NumFilters
+    buf.extend_from_slice(b"Encryption\0");
+    buf.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // Length = 16 MiB - 1
+    buf.extend_from_slice(&[0u8; 16]);
+    assert!(oxideav_rtmp::parse_encrypted_body(&buf).is_err());
+}
+
+// ---------------------------------------------------------------------------
 // Chunk-reader fuzz — feeds raw bytes through ChunkReader::read_message
 // ---------------------------------------------------------------------------
 

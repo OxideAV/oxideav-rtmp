@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- parse FLV Encryption envelope (Annex F.3.1/F.3.2): FlvReader surfaces a Filter=1 tag as FlvTag::Encrypted (EncryptionTagHeader + FilterParams + ciphered body) instead of failing; FlvWriter::write_encrypted_tag inverse; both "Encryption" and Selective-Encryption ("SE") filters round-trip
 - typed NetStreamCommand (RTMP 1.0 §4.2 play/play2/pause/seek/receiveAudio/receiveVideo) parser + builder; server surfaces inbound ones as StreamPacket::Command
 
 ## [0.0.6](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.5...v0.0.6) - 2026-06-15

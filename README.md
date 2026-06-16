@@ -227,11 +227,24 @@ non-standard:
   byte-stream serializer + parser. `FlvWriter<W>` frames tags into the
   on-disk `.flv` layout; `FlvReader<R>` walks the header, the
   alternating `PreviousTagSize` back-pointers, and each `FLVTAG`,
-  verifying the `PreviousTagSize == 11 + DataSize` invariant, bounding
-  per-tag `DataSize` by [`DEFAULT_MAX_TAG_SIZE`] (16 MiB) or a
-  caller-supplied cap, and refusing a forward-incompatible encrypted
-  body. Useful as a session recorder and as the foundation for an
-  HTTP-FLV bridge.
+  verifying the `PreviousTagSize == 11 + DataSize` invariant and
+  bounding per-tag `DataSize` by [`DEFAULT_MAX_TAG_SIZE`] (16 MiB) or a
+  caller-supplied cap. Useful as a session recorder and as the
+  foundation for an HTTP-FLV bridge.
+- `flv_crypt::{parse_encrypted_body, EncryptedTag, FilterParams}` — FLV
+  Encryption envelope (Annex F). A tag whose §E.4.1 `Filter` bit is set
+  carries the in-clear §F.3.1 `EncryptionTagHeader` (NumFilters /
+  FilterName / Length) and §F.3.2 `FilterParams` before the §F.3.3
+  ciphered body. `FlvReader` now surfaces such a tag as
+  `FlvTag::Encrypted { tag_type, crypt }` (the underlying audio / video
+  / script type stays in clear so a player can route without
+  decrypting) instead of failing the stream; `FlvWriter::write_encrypted_tag`
+  is the inverse. Both `FilterName = "Encryption"` (whole-packet) and
+  `"SE"` (Selective Encryption, with the per-packet `EncryptedAU` bit
+  and optional 16-byte AES-CBC IV) round-trip. Decryption itself is out
+  of scope — the §F.2.5 content key comes from a DRM-server protocol the
+  spec leaves undefined — so the envelope is parsed but the body is
+  preserved verbatim.
 - `message::build_*` — builders for every protocol-control / command
   message we emit.
 - `message::UserControlEvent` — typed view of a User Control Message
