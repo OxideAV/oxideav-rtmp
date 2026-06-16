@@ -49,7 +49,7 @@ pub const FILTER_NAME_SELECTIVE: &str = "SE";
 pub const IV_LEN: usize = 16;
 
 /// `FilterParams` (§F.3.2): the per-packet parameters selected by the
-/// `FilterName` in the [`EncryptionTagHeader`].
+/// `FilterName` in the [`EncryptedTag`] §F.3.1 header.
 ///
 /// * [`FilterParams::Encryption`] — `FilterName = "Encryption"`. Every
 ///   packet carrying this filter is encrypted; the only parameter is
