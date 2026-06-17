@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- typed VideoFrameType.Command (StartSeek/EndSeek) for both legacy FLV §E.4.3.1 and Enhanced-RTMP v2 framing: VideoTag::video_command / is_command accessors + command_tag / command_tag_ex builders; the command byte (no AVC packet-type, no SI24 CTS) round-trips
 - parse FLV Encryption envelope (Annex F.3.1/F.3.2): FlvReader surfaces a Filter=1 tag as FlvTag::Encrypted (EncryptionTagHeader + FilterParams + ciphered body) instead of failing; FlvWriter::write_encrypted_tag inverse; both "Encryption" and Selective-Encryption ("SE") filters round-trip
 - typed NetStreamCommand (RTMP 1.0 §4.2 play/play2/pause/seek/receiveAudio/receiveVideo) parser + builder; server surfaces inbound ones as StreamPacket::Command
 

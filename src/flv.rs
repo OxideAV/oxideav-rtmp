@@ -32,6 +32,28 @@ pub const VIDEO_FRAME_INTER: u8 = 2;
 pub const VIDEO_FRAME_DISPOSABLE: u8 = 3; // H.263 only
 pub const VIDEO_FRAME_GENERATED_KEY: u8 = 4;
 pub const VIDEO_FRAME_INFO: u8 = 5;
+/// `VideoFrameType.Command = 5` — the Enhanced-RTMP v2 name for the
+/// legacy "video info/command frame" FrameType value. When the
+/// FrameType nibble is this value (and, in Enhanced mode, the
+/// PacketType is *not* `Metadata`), the VideoTagBody carries **no
+/// coded video** — instead a single `UI8` [`VideoCommand`][crate::flv]
+/// follows the header (legacy: after the `frame_type|codec_id` byte;
+/// Enhanced: after the FourCC). It is the same wire value as
+/// [`VIDEO_FRAME_INFO`]; the two names are interchangeable aliases of
+/// the on-wire `5`. (`video_file_format_spec_v10_1.pdf` §E.4.3.1
+/// "VideoTagBody" / `enhanced-rtmp-v2.pdf` §"ExVideoTagHeader" +
+/// `enum VideoFrameType`.)
+pub const VIDEO_FRAME_COMMAND: u8 = 5;
+
+// VideoCommand (`enum VideoCommand`, enhanced-rtmp-v2.pdf §"Enhanced
+// Video"; same UI8 meanings as the legacy FLV §E.4.3.1 command byte).
+// Present in the VideoTagBody only when FrameType == VIDEO_FRAME_COMMAND.
+/// `VideoCommand.StartSeek = 0` — start of a client-side seeking video
+/// frame sequence.
+pub const VIDEO_COMMAND_START_SEEK: u8 = 0;
+/// `VideoCommand.EndSeek = 1` — end of a client-side seeking video
+/// frame sequence.
+pub const VIDEO_COMMAND_END_SEEK: u8 = 1;
 
 // codec id (low nibble of byte 0):
 pub const VIDEO_CODEC_H263: u8 = 2;
@@ -1179,6 +1201,94 @@ impl VideoTag {
         self.fourcc.is_some() && self.ex_packet_type == Some(EX_PACKET_TYPE_METADATA)
     }
 
+    /// True when this tag is a `VideoFrameType.Command` frame: the
+    /// FrameType nibble is [`VIDEO_FRAME_COMMAND`] (= 5) and, in
+    /// Enhanced mode, the PacketType is *not* `Metadata` (which also
+    /// uses FrameType 5 = `Info` but carries an AMF body rather than a
+    /// command byte). Such a tag carries no coded video — only a single
+    /// [`VideoCommand`][Self::video_command] byte.
+    ///
+    /// (`video_file_format_spec_v10_1.pdf` §E.4.3.1 "VideoTagBody" /
+    /// `enhanced-rtmp-v2.pdf` §"ExVideoTagHeader".)
+    pub fn is_command(&self) -> bool {
+        self.frame_type == VIDEO_FRAME_COMMAND
+            && self.ex_packet_type != Some(EX_PACKET_TYPE_METADATA)
+    }
+
+    /// Decode the `videoCommand = UI8` carried by a
+    /// [`VideoFrameType.Command`][Self::is_command] tag.
+    ///
+    /// Both the legacy (`video_file_format_spec_v10_1.pdf` §E.4.3.1)
+    /// and Enhanced-RTMP (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader")
+    /// framings place the command in the first body byte once the
+    /// header (legacy `frame_type|codec_id`, or Enhanced
+    /// header + FourCC) has been consumed. Returns:
+    ///
+    /// * `None` when this is not a command tag (per [`Self::is_command`]),
+    ///   or the body is empty (truncated wire form).
+    /// * `Some(cmd)` — one of [`VIDEO_COMMAND_START_SEEK`] /
+    ///   [`VIDEO_COMMAND_END_SEEK`], or a reserved value passed through
+    ///   verbatim ("if a value in the bitstream is not understood, the
+    ///   logic must fail gracefully" — we surface the raw byte rather
+    ///   than reject it, so callers ignore unknown commands).
+    pub fn video_command(&self) -> Option<u8> {
+        if !self.is_command() {
+            return None;
+        }
+        self.body.first().copied()
+    }
+
+    /// Build a legacy `VideoFrameType.Command` (= info/command) tag
+    /// carrying a single `videoCommand` byte
+    /// (`video_file_format_spec_v10_1.pdf` §E.4.3.1). The legacy
+    /// command byte's seek meaning is codec-independent, but the
+    /// spec's `CodecID` nibble is still present in the header; pass the
+    /// stream's video codec id (e.g. [`VIDEO_CODEC_AVC`]).
+    ///
+    /// The produced tag has `frame_type = VIDEO_FRAME_COMMAND`, the
+    /// given `codec_id`, no FourCC / Enhanced framing, and
+    /// `body = [command]` so [`build_video`] emits the
+    /// `frame_type|codec_id` byte followed by the single command byte.
+    pub fn command_tag(codec_id: u8, command: u8) -> VideoTag {
+        VideoTag {
+            frame_type: VIDEO_FRAME_COMMAND,
+            codec_id,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: vec![command],
+            ex_packet_type: None,
+            fourcc: None,
+            mod_ex: Vec::new(),
+            multitrack: None,
+        }
+    }
+
+    /// Build an Enhanced-RTMP `VideoFrameType.Command` tag carrying a
+    /// single `videoCommand` byte for the given codec FourCC
+    /// (`enhanced-rtmp-v2.pdf` §"ExVideoTagHeader": the
+    /// `videoPacketType != Metadata && videoFrameType == Command`
+    /// branch — the command byte follows the FourCC and the body has no
+    /// further payload).
+    ///
+    /// The `ex_packet_type` is stamped `CodedFrames` so the FrameType
+    /// nibble (`Command`) is the sole command signal; the SI24 CTS is
+    /// *not* emitted for a command tag (see [`build_video`]). The
+    /// produced tag round-trips through [`build_video`] /
+    /// [`parse_video`] back to the same [`VideoTag::video_command`].
+    pub fn command_tag_ex(fourcc: [u8; 4], command: u8) -> VideoTag {
+        VideoTag {
+            frame_type: VIDEO_FRAME_COMMAND,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: vec![command],
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+            fourcc: Some(fourcc),
+            mod_ex: Vec::new(),
+            multitrack: None,
+        }
+    }
+
     /// Lift the `"colorInfo"` HDR metadata out of a
     /// `VideoPacketType.Metadata` tag into the strongly-typed [`ColorInfo`]
     /// view (Enhanced RTMP §"Metadata Frame").
@@ -1425,7 +1535,18 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
         // wire." All other FourCCs (av01, vp09, vp08) and all
         // other PacketTypes have no CTS field — the body
         // follows the FourCC directly.
-        let needs_cts = packet_type == EX_PACKET_TYPE_CODED_FRAMES
+        // A `VideoFrameType.Command` tag carries no coded video — the
+        // single `videoCommand = UI8` byte follows the FourCC and the
+        // spec sets `processVideoBody = false`, so the CodedFrames body
+        // path (including the SI24 CTS read) is never reached. Skip the
+        // CTS so the command byte stays at `body[0]`
+        // (enhanced-rtmp-v2.pdf §"ExVideoTagHeader": the
+        // `videoPacketType != Metadata && videoFrameType == Command`
+        // branch precedes the ExVideoTagBody loop).
+        let is_command =
+            frame_type == VIDEO_FRAME_COMMAND && packet_type != EX_PACKET_TYPE_METADATA;
+        let needs_cts = !is_command
+            && packet_type == EX_PACKET_TYPE_CODED_FRAMES
             && (fcc == FOURCC_HEVC || fcc == FOURCC_AVC || fcc == FOURCC_VVC);
         let (cts, body_start) = if needs_cts {
             if pos + 3 > payload.len() {
@@ -1456,7 +1577,25 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
         // --- Legacy pre-2023 framing ---
         let frame_type = b0 >> 4;
         let codec_id = b0 & 0x0F;
-        if codec_id == VIDEO_CODEC_AVC {
+        if frame_type == VIDEO_FRAME_COMMAND {
+            // `video_file_format_spec_v10_1.pdf` §E.4.3.1: when
+            // FrameType == 5 the VideoTagBody is a single `UI8`
+            // command (StartSeek / EndSeek) for *every* CodecID — the
+            // AVC packet-type + SI24 CTS prefix is absent even when
+            // CodecID == 7. Keep the command byte in `body[0]` so
+            // [`VideoTag::video_command`] lifts it.
+            Ok(VideoTag {
+                frame_type,
+                codec_id,
+                avc_packet_type: None,
+                composition_time: 0,
+                body: payload[1..].to_vec(),
+                ex_packet_type: None,
+                fourcc: None,
+                mod_ex: Vec::new(),
+                multitrack: None,
+            })
+        } else if codec_id == VIDEO_CODEC_AVC {
             if payload.len() < 5 {
                 return Err(Error::Other("FLV/AVC tag: need 5+ bytes".into()));
             }
@@ -1556,7 +1695,15 @@ pub fn build_video(tag: &VideoTag) -> Vec<u8> {
         // everything else (CodedFramesX, SequenceStart,
         // SequenceEnd, Metadata, and the non-NALU FourCCs)
         // omits it per Enhanced RTMP v1/v2 §"ExVideoTagBody".
-        let cts_on_wire = real_packet_type == EX_PACKET_TYPE_CODED_FRAMES
+        // A Command frame (FrameType == VIDEO_FRAME_COMMAND, non-Metadata
+        // PacketType) carries only the `videoCommand` UI8 in the body and
+        // no SI24 CTS — mirror the parse-side `is_command` guard so a
+        // `command_tag_ex` (which stamps `CodedFrames` as the PacketType)
+        // does not spuriously emit three CTS bytes ahead of the command.
+        let is_command =
+            tag.frame_type == VIDEO_FRAME_COMMAND && real_packet_type != EX_PACKET_TYPE_METADATA;
+        let cts_on_wire = !is_command
+            && real_packet_type == EX_PACKET_TYPE_CODED_FRAMES
             && (fcc == FOURCC_HEVC || fcc == FOURCC_AVC || fcc == FOURCC_VVC);
         if cts_on_wire {
             let cts = tag.composition_time & 0x00FF_FFFF;
@@ -1568,7 +1715,12 @@ pub fn build_video(tag: &VideoTag) -> Vec<u8> {
         let head = (tag.frame_type << 4) | (tag.codec_id & 0x0F);
         let mut out = Vec::with_capacity(tag.body.len() + 5);
         out.push(head);
-        if tag.codec_id == VIDEO_CODEC_AVC {
+        // Legacy `VideoFrameType.Command` (FrameType == 5): per
+        // `video_file_format_spec_v10_1.pdf` §E.4.3.1 the VideoTagBody is
+        // a single `UI8` command regardless of CodecID — the AVC
+        // packet-type + SI24 CTS prefix is *not* present. Skip it so the
+        // command byte follows the header byte directly.
+        if tag.codec_id == VIDEO_CODEC_AVC && tag.frame_type != VIDEO_FRAME_COMMAND {
             out.push(tag.avc_packet_type.unwrap_or(AVC_PACKET_TYPE_NALU));
             let cts = tag.composition_time & 0x00FF_FFFF;
             out.extend_from_slice(&[(cts >> 16) as u8, (cts >> 8) as u8, cts as u8]);

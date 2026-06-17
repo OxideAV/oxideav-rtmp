@@ -93,6 +93,16 @@ client.close()?;
   `parse_audio` / `build_audio`. The crate passes through FLV tag bytes
   verbatim, so additional codecs (MP3, H.263, Speex, …) keep working
   too.
+- **Seek command frames.** A `VideoFrameType.Command` tag (FrameType
+  `5`) carries no coded video — just a single `videoCommand` byte
+  signalling the bounds of a client-side seeking sequence
+  (`StartSeek` / `EndSeek`). `VideoTag::video_command()` lifts it (for
+  both legacy FLV §E.4.3.1 framing and the Enhanced-RTMP v2
+  FourCC framing), `VideoTag::is_command()` classifies it, and
+  `VideoTag::command_tag` / `command_tag_ex` build the inverse. The
+  command path skips the AVC packet-type / SI24 composition-time prefix
+  that a coded frame would carry, and an unknown command value passes
+  through verbatim.
 - **HDR `colorInfo`.** `VideoTag::color_info()` lifts the `colorInfo`
   object into a strongly-typed [`ColorInfo`] view — `colorConfig`
   (bit depth + ITU-T H.273 primaries / transfer / matrix indices),
