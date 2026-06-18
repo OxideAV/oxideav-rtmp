@@ -111,6 +111,18 @@ client.close()?;
   property is `Option<f64>` so a partial object round-trips; the
   reset signal (`Undefined` or empty `{}`) surfaces as
   [`ColorInfo::is_reset`].
+- **Typed `onMetaData`.** [`OnMetaData::from_amf0`] lifts the Enhanced
+  RTMP v2 §"Enhancing onMetaData" typical-properties table —
+  `duration`, `width` / `height`, `framerate`, `videodatarate`,
+  `audiosamplerate`, `stereo`, `audiocodecid` / `videocodecid`, … —
+  into named `Option` fields; any property outside the table is kept
+  verbatim in `extra`, so `OnMetaData::to_amf0` (which emits the
+  spec-mandated ECMA array) round-trips losslessly. When a codec id is
+  a FourCC encoded as a number ("Opus" == `0x4F707573`),
+  `audio_fourcc()` / `video_fourcc()` reconstruct the four ASCII bytes
+  while leaving legacy single-byte CodecIDs as `None`. The v2
+  `audioTrackIdInfoMap` / `videoTrackIdInfoMap` per-track maps are
+  preserved as raw AMF for callers doing multitrack selection.
 - **Multichannel + multitrack audio.** `AudioTag::multichannel_config()`
   lifts the `MultichannelConfig` body into a typed view, and the
   `Multitrack` AudioPacketType / VideoPacketType is wired end-to-end —

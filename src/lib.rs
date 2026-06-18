@@ -75,7 +75,7 @@ pub use client::{resolve_tc_url, ClientEvent, RtmpClient, RtmpUrl};
 pub use error::{Error, Result};
 pub use flv::{
     AudioTag, ColorConfig, ColorInfo, HdrCll, HdrMdcv, ModEx, MultichannelConfig,
-    MultichannelConfigOrder, Multitrack, MultitrackTrack, VideoTag,
+    MultichannelConfigOrder, Multitrack, MultitrackTrack, OnMetaData, VideoTag,
 };
 pub use flv_crypt::{
     parse_encrypted_body, EncryptedTag, FilterParams, FILTER_NAME_ENCRYPTION,

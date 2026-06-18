@@ -899,6 +899,205 @@ fn hdr_mdcv_to_amf0(mdcv: &HdrMdcv) -> Amf0Value {
 }
 
 // ---------------------------------------------------------------------------
+// onMetaData — Enhanced RTMP v2 §"Enhancing onMetaData"
+// ---------------------------------------------------------------------------
+//
+// FLV metadata is carried in a SCRIPTDATA segment whose ScriptTagBody
+// encapsulates the method name `onMetaData` and a single argument of type
+// ECMA array. The array holds metadata properties describing the stream;
+// the spec's "Typical properties found in the onMetaData argument object"
+// table enumerates the well-known names. Availability varies by encoder, so
+// every property is optional.
+//
+// Two properties carry a codec identifier that MAY be a FourCC encoded as a
+// number: `audiocodecid` / `videocodecid`. The spec states the FourCC value
+// is big-endian relative to the underlying ASCII character sequence
+// (e.g. "Opus" == 0x4F707573 == 1332770163.0, "av01" == 0x61763031 ==
+// 1635135537.0). A small legacy CodecID (a single-byte FLV codec id from
+// the legacy AudioTagHeader / VideoTagHeader tables) is NOT a FourCC; the
+// `*_fourcc()` accessors only reconstruct the four ASCII bytes when the
+// value is in the FourCC range and every byte is printable ASCII.
+
+/// Strongly-typed view of the `onMetaData` argument object (Enhanced RTMP v2
+/// §"Enhancing onMetaData").
+///
+/// Lifts the spec's "Typical properties found in the onMetaData argument
+/// object" table into named fields. Every field is `Option` because the
+/// availability of each property "may vary depending on the software used to
+/// create the FLV" — `None` means the property was absent. Properties not in
+/// the table are preserved verbatim in [`OnMetaData::extra`] so a
+/// round-trip is lossless.
+///
+/// Decode with [`OnMetaData::from_amf0`] (pass the AMF `value` half of the
+/// `["onMetaData", value]` pair) and re-encode with [`OnMetaData::to_amf0`],
+/// which produces an [`Amf0Value::EcmaArray`] as the spec requires.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OnMetaData {
+    /// Audio codec ID. A legacy single-byte FLV CodecID, or a FourCC encoded
+    /// as a number (see [`OnMetaData::audio_fourcc`]).
+    pub audiocodecid: Option<f64>,
+    /// Audio bitrate, in kilobits per second.
+    pub audiodatarate: Option<f64>,
+    /// Delay introduced by the audio codec, in seconds.
+    pub audiodelay: Option<f64>,
+    /// Frequency at which the audio stream is replayed (Hz).
+    pub audiosamplerate: Option<f64>,
+    /// Number of bits used to represent each audio sample.
+    pub audiosamplesize: Option<f64>,
+    /// The last video frame is a key frame (seekable to end).
+    pub can_seek_to_end: Option<bool>,
+    /// Creation date and time.
+    pub creationdate: Option<String>,
+    /// Total duration of the file, in seconds.
+    pub duration: Option<f64>,
+    /// Total size of the file, in bytes.
+    pub filesize: Option<f64>,
+    /// Number of frames per second.
+    pub framerate: Option<f64>,
+    /// Height of the video, in pixels.
+    pub height: Option<f64>,
+    /// Indicates stereo audio.
+    pub stereo: Option<bool>,
+    /// Video codec ID. A legacy single-byte FLV CodecID, or a FourCC encoded
+    /// as a number (see [`OnMetaData::video_fourcc`]).
+    pub videocodecid: Option<f64>,
+    /// Video bitrate, in kilobits per second.
+    pub videodatarate: Option<f64>,
+    /// Width of the video, in pixels.
+    pub width: Option<f64>,
+    /// Per-track metadata for additional audio tracks beyond the default
+    /// (`trackId` 0). Keyed by `trackId` (1, 2, 3, …); each value is an
+    /// object of track-level attributes. Preserved verbatim because the
+    /// spec's field list for each track object is open-ended.
+    pub audio_track_id_info_map: Option<Amf0Value>,
+    /// Per-track metadata for additional video tracks beyond the default.
+    /// Mirrors [`OnMetaData::audio_track_id_info_map`].
+    pub video_track_id_info_map: Option<Amf0Value>,
+    /// Any property not in the spec's typical-properties table, preserved in
+    /// wire order so a decode/encode round-trip is lossless.
+    pub extra: Vec<(String, Amf0Value)>,
+}
+
+impl OnMetaData {
+    /// Decode the `onMetaData` argument from an already-decoded [`Amf0Value`].
+    ///
+    /// The spec mandates the argument be an ECMA array, but commodity peers
+    /// also emit a plain anonymous Object, so both are accepted. Any other
+    /// AMF type is rejected with [`Error::Other`].
+    pub fn from_amf0(value: &Amf0Value) -> Result<OnMetaData> {
+        let pairs: &[(String, Amf0Value)] = match value {
+            Amf0Value::EcmaArray(p) | Amf0Value::Object(p) => p.as_slice(),
+            _ => {
+                return Err(Error::Other(
+                    "onMetaData: argument must be an ECMA array or Object".into(),
+                ))
+            }
+        };
+        let mut m = OnMetaData::default();
+        for (k, v) in pairs {
+            match k.as_str() {
+                "audiocodecid" => m.audiocodecid = v.as_f64(),
+                "audiodatarate" => m.audiodatarate = v.as_f64(),
+                "audiodelay" => m.audiodelay = v.as_f64(),
+                "audiosamplerate" => m.audiosamplerate = v.as_f64(),
+                "audiosamplesize" => m.audiosamplesize = v.as_f64(),
+                "canSeekToEnd" => m.can_seek_to_end = v.as_bool(),
+                "creationdate" => m.creationdate = v.as_str().map(str::to_owned),
+                "duration" => m.duration = v.as_f64(),
+                "filesize" => m.filesize = v.as_f64(),
+                "framerate" => m.framerate = v.as_f64(),
+                "height" => m.height = v.as_f64(),
+                "stereo" => m.stereo = v.as_bool(),
+                "videocodecid" => m.videocodecid = v.as_f64(),
+                "videodatarate" => m.videodatarate = v.as_f64(),
+                "width" => m.width = v.as_f64(),
+                "audioTrackIdInfoMap" => m.audio_track_id_info_map = Some(v.clone()),
+                "videoTrackIdInfoMap" => m.video_track_id_info_map = Some(v.clone()),
+                _ => m.extra.push((k.clone(), v.clone())),
+            }
+        }
+        Ok(m)
+    }
+
+    /// Re-encode to the AMF `value` half of the `["onMetaData", value]` pair
+    /// as an [`Amf0Value::EcmaArray`] (the spec-mandated argument type).
+    ///
+    /// Known fields are emitted first in the spec table's order, then the
+    /// two track-info maps, then any [`OnMetaData::extra`] properties in
+    /// their preserved order.
+    pub fn to_amf0(&self) -> Amf0Value {
+        let mut obj: Vec<(String, Amf0Value)> = Vec::new();
+        push_num(&mut obj, "audiocodecid", self.audiocodecid);
+        push_num(&mut obj, "audiodatarate", self.audiodatarate);
+        push_num(&mut obj, "audiodelay", self.audiodelay);
+        push_num(&mut obj, "audiosamplerate", self.audiosamplerate);
+        push_num(&mut obj, "audiosamplesize", self.audiosamplesize);
+        push_bool(&mut obj, "canSeekToEnd", self.can_seek_to_end);
+        if let Some(s) = &self.creationdate {
+            obj.push(("creationdate".into(), Amf0Value::String(s.clone())));
+        }
+        push_num(&mut obj, "duration", self.duration);
+        push_num(&mut obj, "filesize", self.filesize);
+        push_num(&mut obj, "framerate", self.framerate);
+        push_num(&mut obj, "height", self.height);
+        push_bool(&mut obj, "stereo", self.stereo);
+        push_num(&mut obj, "videocodecid", self.videocodecid);
+        push_num(&mut obj, "videodatarate", self.videodatarate);
+        push_num(&mut obj, "width", self.width);
+        if let Some(v) = &self.audio_track_id_info_map {
+            obj.push(("audioTrackIdInfoMap".into(), v.clone()));
+        }
+        if let Some(v) = &self.video_track_id_info_map {
+            obj.push(("videoTrackIdInfoMap".into(), v.clone()));
+        }
+        obj.extend(self.extra.iter().cloned());
+        Amf0Value::EcmaArray(obj)
+    }
+
+    /// Reconstruct the four-character codec FourCC from [`audiocodecid`]
+    /// when it carries a FourCC encoded as a number (per the spec's
+    /// big-endian note, e.g. "Opus" == 0x4F707573). Returns `None` for an
+    /// absent value or a legacy single-byte CodecID.
+    ///
+    /// [`audiocodecid`]: OnMetaData::audiocodecid
+    pub fn audio_fourcc(&self) -> Option<[u8; 4]> {
+        self.audiocodecid.and_then(num_to_fourcc)
+    }
+
+    /// Reconstruct the FourCC from [`videocodecid`]. See
+    /// [`OnMetaData::audio_fourcc`].
+    ///
+    /// [`videocodecid`]: OnMetaData::videocodecid
+    pub fn video_fourcc(&self) -> Option<[u8; 4]> {
+        self.videocodecid.and_then(num_to_fourcc)
+    }
+}
+
+fn push_bool(obj: &mut Vec<(String, Amf0Value)>, key: &str, val: Option<bool>) {
+    if let Some(b) = val {
+        obj.push((key.to_string(), Amf0Value::Boolean(b)));
+    }
+}
+
+/// Decode a codec-id number into a FourCC per the Enhanced RTMP v2 note that
+/// a FourCC value is big-endian relative to the underlying ASCII character
+/// sequence. Only values that are exactly representable as a `u32` *and*
+/// whose four bytes are all printable ASCII (0x20..=0x7e) are treated as a
+/// FourCC — this rejects the small legacy single-byte CodecIDs that share
+/// the `*codecid` field.
+fn num_to_fourcc(n: f64) -> Option<[u8; 4]> {
+    if !n.is_finite() || n < 0.0 || n > u32::MAX as f64 || n.fract() != 0.0 {
+        return None;
+    }
+    let bytes = (n as u32).to_be_bytes();
+    if bytes.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Multitrack — Enhanced RTMP v2 §"ExVideoTagBody" / §"ExAudioTagBody"
 // ---------------------------------------------------------------------------
 //
