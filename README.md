@@ -88,11 +88,24 @@ client.close()?;
   `vp09` (VP9), `vp08` (VP8), `avc1` (FourCC-mode AVC), `vvc1` (VVC) —
   and FourCC audio codecs — `Opus`, `fLaC`, `ac-3`, `ec-3`, `.mp3`,
   `mp4a`. Sequence-start config records, `CodedFrames`, `CodedFramesX`
-  (CTS=0 omitted), `SequenceEnd`, and the HDR `colorInfo` metadata
-  frame round-trip via `flv::parse_video` / `build_video` /
-  `parse_audio` / `build_audio`. The crate passes through FLV tag bytes
-  verbatim, so additional codecs (MP3, H.263, Speex, …) keep working
-  too.
+  (CTS=0 omitted), `SequenceEnd`, `MPEG2TSSequenceStart` (the MPEG-2 TS
+  carriage variant; `av01` carries an `AV1VideoDescriptor`), and the HDR
+  `colorInfo` metadata frame round-trip via `flv::parse_video` /
+  `build_video` / `parse_audio` / `build_audio`. `SequenceEnd` has a
+  typed surface on both pipelines — `VideoTag` / `AudioTag`
+  `is_ex_sequence_end()` + `sequence_end_tag()` — alongside
+  `VideoTag::is_ex_mpeg2ts_sequence_start()` /
+  `mpeg2ts_video_descriptor()` / `mpeg2ts_sequence_start_tag()`. The
+  crate passes through FLV tag bytes verbatim, so additional codecs
+  (MP3, H.263, Speex, …) keep working too.
+- **Audio silence message.** A zero-length audio message is the
+  Enhanced RTMP v2 §"ExAudioTagHeader" *silence* signal (an empty
+  message with no AudioTagHeader). `flv::parse_audio_message` lifts it
+  to `AudioMessage::Silence` (a non-empty payload becomes
+  `AudioMessage::Tag`), `is_silence_payload` classifies a raw payload,
+  and `build_silence_audio` / `build_audio_message` emit the inverse.
+  Per spec `AudioPacketType.SequenceEnd` carries "no less than the same
+  meaning" as silence.
 - **Seek command frames.** A `VideoFrameType.Command` tag (FrameType
   `5`) carries no coded video — just a single `videoCommand` byte
   signalling the bounds of a client-side seeking sequence

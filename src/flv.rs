@@ -1452,6 +1452,35 @@ impl VideoTag {
         self.fourcc.is_some() && self.ex_packet_type == Some(EX_PACKET_TYPE_METADATA)
     }
 
+    /// True when this tag is the FourCC-mode
+    /// `VideoPacketType.SequenceEnd` (= 2) — signals the end of the
+    /// coded video sequence (`enhanced-rtmp-v2.pdf` §"ExVideoTagBody":
+    /// "signals end of sequence"). The body is empty.
+    pub fn is_ex_sequence_end(&self) -> bool {
+        self.fourcc.is_some() && self.ex_packet_type == Some(EX_PACKET_TYPE_SEQUENCE_END)
+    }
+
+    /// Build a FourCC-mode `VideoPacketType.SequenceEnd` tag for the
+    /// given codec FourCC (`enhanced-rtmp-v2.pdf` §"ExVideoTagBody").
+    /// The body is empty and the FrameType is stamped
+    /// [`VIDEO_FRAME_INTER`] (a sequence-end packet carries no
+    /// decodable picture). Round-trips through [`build_video`] /
+    /// [`parse_video`] back to the same
+    /// [`is_ex_sequence_end`][Self::is_ex_sequence_end].
+    pub fn sequence_end_tag(fourcc: [u8; 4]) -> VideoTag {
+        VideoTag {
+            frame_type: VIDEO_FRAME_INTER,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: Vec::new(),
+            ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_END),
+            fourcc: Some(fourcc),
+            mod_ex: Vec::new(),
+            multitrack: None,
+        }
+    }
+
     /// True when this tag is a `VideoFrameType.Command` frame: the
     /// FrameType nibble is [`VIDEO_FRAME_COMMAND`] (= 5) and, in
     /// Enhanced mode, the PacketType is *not* `Metadata` (which also
@@ -2080,6 +2109,37 @@ impl AudioTag {
     /// SequenceStart shape defined in v2).
     pub fn is_ex_sequence_header(&self) -> bool {
         self.audio_fourcc.is_some() && self.ex_packet_type == Some(AUDIO_PACKET_TYPE_SEQUENCE_START)
+    }
+
+    /// True when this tag is the FourCC-mode
+    /// `AudioPacketType.SequenceEnd` (= 2) — signals the end of the
+    /// audio sequence for the current track. Per
+    /// `enhanced-rtmp-v2.pdf` §"ExAudioTagHeader" this has "no less
+    /// than the same meaning as a silence message" (see
+    /// [`AudioMessage::Silence`]); it exists so the end of an audio
+    /// sequence can be signalled per-track. The body is empty.
+    pub fn is_ex_sequence_end(&self) -> bool {
+        self.audio_fourcc.is_some() && self.ex_packet_type == Some(AUDIO_PACKET_TYPE_SEQUENCE_END)
+    }
+
+    /// Build a FourCC-mode `AudioPacketType.SequenceEnd` tag for the
+    /// given codec FourCC (`enhanced-rtmp-v2.pdf` §"ExAudioTagHeader").
+    /// The body is empty. Round-trips through [`build_audio`] /
+    /// [`parse_audio`] back to the same
+    /// [`is_ex_sequence_end`][Self::is_ex_sequence_end].
+    pub fn sequence_end_tag(fourcc: [u8; 4]) -> AudioTag {
+        AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(AUDIO_PACKET_TYPE_SEQUENCE_END),
+            audio_fourcc: Some(fourcc),
+            body: Vec::new(),
+            mod_ex: Vec::new(),
+            multitrack: None,
+        }
     }
 
     /// Sum of the `TimestampOffsetNano` ModEx entries on this tag, in
@@ -4392,6 +4452,41 @@ mod tests {
         let hvc = VideoTag::mpeg2ts_sequence_start_tag(FOURCC_HEVC, vec![0xAA]);
         assert!(hvc.is_ex_mpeg2ts_sequence_start());
         assert_eq!(hvc.mpeg2ts_video_descriptor(), None);
+    }
+
+    // --- SequenceEnd typed surface (enhanced-rtmp-v2) ---
+
+    #[test]
+    fn video_sequence_end_tag_round_trips() {
+        let tag = VideoTag::sequence_end_tag(FOURCC_HEVC);
+        assert!(tag.is_ex_sequence_end());
+        assert!(!tag.is_ex_sequence_header());
+        assert!(tag.body.is_empty());
+        let wire = build_video(&tag);
+        assert_eq!(wire[0], 0x80 | (2 << 4) | EX_PACKET_TYPE_SEQUENCE_END);
+        assert_eq!(&wire[1..5], &FOURCC_HEVC);
+        assert_eq!(wire.len(), 5); // header + FourCC, empty body, no CTS
+        let back = parse_video(&wire).unwrap();
+        assert_eq!(back, tag);
+        assert!(back.is_ex_sequence_end());
+    }
+
+    #[test]
+    fn audio_sequence_end_tag_round_trips() {
+        let tag = AudioTag::sequence_end_tag(FOURCC_OPUS);
+        assert!(tag.is_ex_sequence_end());
+        assert!(!tag.is_ex_sequence_header());
+        assert!(tag.body.is_empty());
+        let wire = build_audio(&tag);
+        assert_eq!(
+            wire[0],
+            (AUDIO_FORMAT_EX_HEADER << 4) | AUDIO_PACKET_TYPE_SEQUENCE_END
+        );
+        assert_eq!(&wire[1..5], &FOURCC_OPUS);
+        assert_eq!(wire.len(), 5);
+        let back = parse_audio(&wire).unwrap();
+        assert_eq!(back, tag);
+        assert!(back.is_ex_sequence_end());
     }
 
     // --- Audio silence message (enhanced-rtmp-v2 §"ExAudioTagHeader") ---
