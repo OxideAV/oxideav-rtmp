@@ -2369,6 +2369,97 @@ pub fn build_audio(tag: &AudioTag) -> Vec<u8> {
     }
 }
 
+/// An Enhanced-RTMP v2 audio *message*: either a normal coded /
+/// signalling [`AudioTag`], or the special **silence** message.
+///
+/// `enhanced-rtmp-v2.pdf` §"ExAudioTagHeader" documents a previously
+/// undocumented *audio silence* message: "This silence message is
+/// identified when an audio message contains a zero-length payload,
+/// or more precisely, an empty audio message without an
+/// AudioTagHeader, indicating a period of silence." The spec further
+/// notes "`AudioPacketType.SequenceEnd` is to have no less than the
+/// same meaning as a silence message".
+///
+/// Because a silence message has **no bytes at all** on the wire (not
+/// even a SoundFormat header), it cannot be represented as an
+/// [`AudioTag`] (which always begins with at least one header byte).
+/// [`parse_audio`] therefore still rejects an empty slice; callers
+/// that want to recognise silence parse the raw audio-message payload
+/// through [`parse_audio_message`], which lifts the zero-length case
+/// to [`AudioMessage::Silence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioMessage {
+    /// The audio message carried a real tag (legacy framing or the
+    /// Enhanced-RTMP `ExHeader` framing). Decoded via [`parse_audio`].
+    Tag(AudioTag),
+    /// The audio message was zero-length — a spec-defined *silence*
+    /// signal. Per `enhanced-rtmp-v2.pdf` the receiver SHOULD play out
+    /// any buffered audio, flush the decoder, and switch to wall-clock
+    /// timing for A/V sync during the silence period. The action is
+    /// otherwise system-dependent.
+    Silence,
+}
+
+impl AudioMessage {
+    /// True for the [`AudioMessage::Silence`] variant.
+    pub fn is_silence(&self) -> bool {
+        matches!(self, AudioMessage::Silence)
+    }
+
+    /// Borrow the inner [`AudioTag`] when this is a
+    /// [`AudioMessage::Tag`]; `None` for silence.
+    pub fn as_tag(&self) -> Option<&AudioTag> {
+        match self {
+            AudioMessage::Tag(t) => Some(t),
+            AudioMessage::Silence => None,
+        }
+    }
+}
+
+/// Classify a raw RTMP audio-message payload as the spec-defined
+/// *silence* signal: a zero-length payload
+/// (`enhanced-rtmp-v2.pdf` §"ExAudioTagHeader"). An empty audio
+/// message carries no AudioTagHeader and indicates a period of
+/// silence.
+pub fn is_silence_payload(payload: &[u8]) -> bool {
+    payload.is_empty()
+}
+
+/// Build the wire bytes for an audio *silence* message — an empty
+/// payload (`enhanced-rtmp-v2.pdf` §"ExAudioTagHeader"). The returned
+/// `Vec` is always empty; the helper exists so call sites read
+/// symmetrically with [`build_audio`] and document intent at the
+/// emission point.
+pub fn build_silence_audio() -> Vec<u8> {
+    Vec::new()
+}
+
+/// Parse a raw RTMP audio-message payload into an [`AudioMessage`].
+///
+/// A zero-length payload lifts to [`AudioMessage::Silence`]
+/// (`enhanced-rtmp-v2.pdf` §"ExAudioTagHeader"); any non-empty payload
+/// is decoded through [`parse_audio`] and wrapped in
+/// [`AudioMessage::Tag`]. Errors flow through from [`parse_audio`] on
+/// a malformed non-empty payload.
+pub fn parse_audio_message(payload: &[u8]) -> Result<AudioMessage> {
+    if is_silence_payload(payload) {
+        Ok(AudioMessage::Silence)
+    } else {
+        Ok(AudioMessage::Tag(parse_audio(payload)?))
+    }
+}
+
+/// Serialise an [`AudioMessage`] back to its raw audio-message
+/// payload — [`build_silence_audio`] for [`AudioMessage::Silence`]
+/// (an empty payload) and [`build_audio`] for [`AudioMessage::Tag`].
+/// The exact inverse of [`parse_audio_message`].
+pub fn build_audio_message(msg: &AudioMessage) -> Vec<u8> {
+    match msg {
+        AudioMessage::Silence => build_silence_audio(),
+        AudioMessage::Tag(tag) => build_audio(tag),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4199,5 +4290,76 @@ mod tests {
         let bytes = mt.encode();
         let back = Multitrack::parse(&bytes, 4).unwrap();
         assert_eq!(back, mt);
+    }
+
+    // --- Audio silence message (enhanced-rtmp-v2 §"ExAudioTagHeader") ---
+
+    #[test]
+    fn empty_audio_payload_is_silence_message() {
+        // "an empty audio message without an AudioTagHeader, indicating
+        // a period of silence." A zero-length payload lifts to Silence.
+        assert!(is_silence_payload(&[]));
+        let msg = parse_audio_message(&[]).unwrap();
+        assert_eq!(msg, AudioMessage::Silence);
+        assert!(msg.is_silence());
+        assert!(msg.as_tag().is_none());
+    }
+
+    #[test]
+    fn silence_message_builds_to_empty_payload() {
+        assert!(build_silence_audio().is_empty());
+        assert_eq!(
+            build_audio_message(&AudioMessage::Silence),
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn silence_message_round_trips() {
+        let wire = build_audio_message(&AudioMessage::Silence);
+        let back = parse_audio_message(&wire).unwrap();
+        assert_eq!(back, AudioMessage::Silence);
+    }
+
+    #[test]
+    fn non_empty_audio_payload_is_a_tag_not_silence() {
+        // A legacy AAC raw frame is a real tag, never silence.
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_AAC,
+            sound_rate: 3,
+            sound_size_16bit: true,
+            stereo: true,
+            aac_packet_type: Some(AAC_PACKET_TYPE_RAW),
+            ex_packet_type: None,
+            audio_fourcc: None,
+            body: vec![0xAB, 0xCD],
+            mod_ex: Vec::new(),
+            multitrack: None,
+        };
+        let wire = build_audio(&tag);
+        assert!(!is_silence_payload(&wire));
+        let msg = parse_audio_message(&wire).unwrap();
+        assert!(!msg.is_silence());
+        assert_eq!(msg, AudioMessage::Tag(tag));
+    }
+
+    #[test]
+    fn audio_message_round_trips_a_tag() {
+        // Enhanced-RTMP Opus CodedFrames tag wrapped as a message.
+        let tag = AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(AUDIO_PACKET_TYPE_CODED_FRAMES),
+            audio_fourcc: Some(FOURCC_OPUS),
+            body: vec![0x01, 0x02, 0x03],
+            mod_ex: Vec::new(),
+            multitrack: None,
+        };
+        let wire = build_audio_message(&AudioMessage::Tag(tag.clone()));
+        let back = parse_audio_message(&wire).unwrap();
+        assert_eq!(back, AudioMessage::Tag(tag));
     }
 }

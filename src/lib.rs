@@ -74,7 +74,8 @@ pub use chunk::{Message, MessageStreamKind};
 pub use client::{resolve_tc_url, ClientEvent, RtmpClient, RtmpUrl};
 pub use error::{Error, Result};
 pub use flv::{
-    AudioTag, ColorConfig, ColorInfo, HdrCll, HdrMdcv, ModEx, MultichannelConfig,
+    build_audio_message, build_silence_audio, is_silence_payload, parse_audio_message,
+    AudioMessage, AudioTag, ColorConfig, ColorInfo, HdrCll, HdrMdcv, ModEx, MultichannelConfig,
     MultichannelConfigOrder, Multitrack, MultitrackTrack, OnMetaData, VideoTag,
 };
 pub use flv_crypt::{

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- audio silence message (Enhanced RTMP v2 §"ExAudioTagHeader"): a zero-length audio payload is now recognised as the spec-defined silence signal via the new AudioMessage enum + parse_audio_message / build_audio_message / is_silence_payload / build_silence_audio helpers (parse_audio still rejects an empty slice since silence carries no AudioTagHeader)
 - typed OnMetaData view (Enhanced RTMP v2 §"Enhancing onMetaData"): OnMetaData::from_amf0 / to_amf0 lift the spec's typical-properties table (audiocodecid, videocodecid, duration, width/height, framerate, stereo, …) into named fields, preserve unknowns verbatim in `extra`, re-encode as the mandated ECMA array, and decode the codec-id FourCC note ("Opus" == 0x4F707573) via audio_fourcc / video_fourcc; the v2 audioTrackIdInfoMap / videoTrackIdInfoMap per-track maps round-trip verbatim
 - typed VideoFrameType.Command (StartSeek/EndSeek) for both legacy FLV §E.4.3.1 and Enhanced-RTMP v2 framing: VideoTag::video_command / is_command accessors + command_tag / command_tag_ex builders; the command byte (no AVC packet-type, no SI24 CTS) round-trips
 - parse FLV Encryption envelope (Annex F.3.1/F.3.2): FlvReader surfaces a Filter=1 tag as FlvTag::Encrypted (EncryptionTagHeader + FilterParams + ciphered body) instead of failing; FlvWriter::write_encrypted_tag inverse; both "Encryption" and Selective-Encryption ("SE") filters round-trip
