@@ -1390,6 +1390,58 @@ impl VideoTag {
     pub fn is_ex_sequence_header(&self) -> bool {
         self.fourcc.is_some() && self.ex_packet_type == Some(EX_PACKET_TYPE_SEQUENCE_START)
     }
+
+    /// True when this tag is the FourCC-mode
+    /// `VideoPacketType.MPEG2TSSequenceStart` (= 5) — the
+    /// MPEG-2 TS carriage sequence-start variant
+    /// (`enhanced-rtmp-v2.pdf` §"ExVideoTagBody"). Per spec
+    /// `PacketTypeSequenceStart` and `PacketTypeMPEG2TSSequenceStart`
+    /// are mutually exclusive: this one signals that the codec
+    /// bitstream is carried in MPEG-2 TS format. The only FourCc the
+    /// spec defines a body for so far is `av01`, whose
+    /// [`body`][VideoTag::body] is an `AV1VideoDescriptor`. Lift the
+    /// descriptor bytes via [`VideoTag::mpeg2ts_video_descriptor`].
+    pub fn is_ex_mpeg2ts_sequence_start(&self) -> bool {
+        self.fourcc.is_some() && self.ex_packet_type == Some(EX_PACKET_TYPE_MPEG2TS_SEQUENCE_START)
+    }
+
+    /// Borrow the MPEG-2 TS sequence-start descriptor body when this
+    /// tag is a [`MPEG2TSSequenceStart`][Self::is_ex_mpeg2ts_sequence_start]
+    /// for `av01` (the body is an `AV1VideoDescriptor` per
+    /// `enhanced-rtmp-v2.pdf` §"ExVideoTagBody"). Returns `None` for
+    /// any other tag — including an MPEG2TSSequenceStart for a FourCc
+    /// the spec has not yet assigned a descriptor body, so a caller
+    /// only acts on a descriptor it can interpret.
+    pub fn mpeg2ts_video_descriptor(&self) -> Option<&[u8]> {
+        if self.is_ex_mpeg2ts_sequence_start() && self.fourcc == Some(FOURCC_AV1) {
+            Some(&self.body)
+        } else {
+            None
+        }
+    }
+
+    /// Build a FourCC-mode `VideoPacketType.MPEG2TSSequenceStart` tag
+    /// (`enhanced-rtmp-v2.pdf` §"ExVideoTagBody") carrying the given
+    /// descriptor `body` for `av01` (an `AV1VideoDescriptor`). The
+    /// FrameType is stamped [`VIDEO_FRAME_KEYFRAME`] (a sequence start
+    /// begins a decodable run); no SI24 CTS is emitted (only
+    /// `CodedFrames` for NALU FourCCs carries one). Round-trips through
+    /// [`build_video`] / [`parse_video`] back to the same body and
+    /// [`is_ex_mpeg2ts_sequence_start`][Self::is_ex_mpeg2ts_sequence_start].
+    pub fn mpeg2ts_sequence_start_tag(fourcc: [u8; 4], body: Vec<u8>) -> VideoTag {
+        VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body,
+            ex_packet_type: Some(EX_PACKET_TYPE_MPEG2TS_SEQUENCE_START),
+            fourcc: Some(fourcc),
+            mod_ex: Vec::new(),
+            multitrack: None,
+        }
+    }
+
     /// True when this tag carries an Enhanced-RTMP
     /// `PacketTypeMetadata` body (HDR `colorInfo` and the like).
     /// Per Enhanced RTMP v1 the `FrameType` flags above the
@@ -4290,6 +4342,56 @@ mod tests {
         let bytes = mt.encode();
         let back = Multitrack::parse(&bytes, 4).unwrap();
         assert_eq!(back, mt);
+    }
+
+    // --- MPEG2TSSequenceStart video (enhanced-rtmp-v2 §"ExVideoTagBody") ---
+
+    #[test]
+    fn mpeg2ts_sequence_start_av1_round_trips() {
+        let descriptor = vec![0x80, 0x04, 0x81, 0x0D, 0x00, 0x00];
+        let tag = VideoTag::mpeg2ts_sequence_start_tag(FOURCC_AV1, descriptor.clone());
+        assert!(tag.is_ex_mpeg2ts_sequence_start());
+        assert!(!tag.is_ex_sequence_header()); // mutually exclusive
+        assert_eq!(tag.mpeg2ts_video_descriptor(), Some(&descriptor[..]));
+
+        let wire = build_video(&tag);
+        // Header byte: IsExHeader(0x80) | FrameType keyframe(1<<4) |
+        // MPEG2TSSequenceStart(5).
+        assert_eq!(
+            wire[0],
+            0x80 | (1 << 4) | EX_PACKET_TYPE_MPEG2TS_SEQUENCE_START
+        );
+        assert_eq!(&wire[1..5], &FOURCC_AV1); // no CTS for this packet type
+        assert_eq!(&wire[5..], &descriptor[..]);
+
+        let back = parse_video(&wire).unwrap();
+        assert_eq!(back, tag);
+        assert!(back.is_ex_mpeg2ts_sequence_start());
+        assert_eq!(back.mpeg2ts_video_descriptor(), Some(&descriptor[..]));
+    }
+
+    #[test]
+    fn mpeg2ts_descriptor_is_none_for_non_mpeg2ts_tags() {
+        // A regular SequenceStart is not an MPEG2TS sequence start.
+        let seq = VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: 0,
+            body: vec![0x01, 0x02],
+            ex_packet_type: Some(EX_PACKET_TYPE_SEQUENCE_START),
+            fourcc: Some(FOURCC_AV1),
+            mod_ex: Vec::new(),
+            multitrack: None,
+        };
+        assert!(!seq.is_ex_mpeg2ts_sequence_start());
+        assert_eq!(seq.mpeg2ts_video_descriptor(), None);
+
+        // An MPEG2TSSequenceStart for a FourCc with no spec-defined
+        // descriptor body yields None from the descriptor accessor.
+        let hvc = VideoTag::mpeg2ts_sequence_start_tag(FOURCC_HEVC, vec![0xAA]);
+        assert!(hvc.is_ex_mpeg2ts_sequence_start());
+        assert_eq!(hvc.mpeg2ts_video_descriptor(), None);
     }
 
     // --- Audio silence message (enhanced-rtmp-v2 §"ExAudioTagHeader") ---
