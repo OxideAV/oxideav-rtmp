@@ -6,11 +6,14 @@
 //! strict array, Date, long string, Unsupported (0x0D), XML Document
 //! (0x0F), Typed Object (0x10), and the end-of-object sentinel. The two
 //! deliberately-unserializable markers (Movieclip 0x04, RecordSet 0x0E,
-//! per spec §2.6 / §2.16) are rejected as unknown on decode. We never
-//! emit nor consume AMF3 — RTMP occasionally upgrades a channel to AMF3
-//! via the `avmplus` marker (0x11), but we simply keep the channel on
-//! AMF0; every commodity client / server we have interoperated with
-//! stays in AMF0 for publish flows.
+//! per spec §2.6 / §2.16) are rejected as unknown on decode. On *decode*
+//! we also honour the `avmplus-object-marker` (0x11, §3.1): a value
+//! introduced by that marker is decoded as a self-contained AMF3 value
+//! and bridged back onto an `Amf0Value`, so a mixed AMF0/AMF3 packet
+//! (which Flash players emit once a channel negotiates AMF3) parses
+//! transparently. We never *emit* the 0x11 switch — every command we
+//! send stays in pure AMF0; senders wanting AMF3 on the wire use the
+//! dedicated [`crate::amf3`] encoder.
 //!
 //! AMF0 object references (marker 0x07) are **dereferenced
 //! transparently** on decode: a reference resolves to a clone of the
@@ -230,6 +233,19 @@ fn decode_at_depth(
                 millis: f64::from_bits(bits),
                 timezone: tz,
             })
+        }
+        crate::amf3::AVMPLUS_OBJECT_MARKER => {
+            // §3.1: the avmplus-object-marker (0x11) switches the encoding
+            // context to AMF3 for the single value that follows. Per the
+            // spec the marker introduces "the following Object" as an
+            // AMF3-formatted value with its own (fresh) reference tables,
+            // so we hand the cursor to a self-contained AMF3 decode and
+            // bridge the result back onto the AMF0 value graph. The AMF0
+            // reference table is left untouched — an AMF0 reference cannot
+            // point into an AMF3 sub-context and vice versa.
+            let v = crate::amf3::decode(buf, pos)
+                .map_err(|e| Error::InvalidAmf0(format!("embedded AMF3 value: {e}")))?;
+            Ok(v.to_amf0())
         }
         M_UNSUPPORTED => Ok(Amf0Value::Unsupported),
         M_XML_DOCUMENT => {
@@ -741,6 +757,52 @@ mod tests {
             Amf0Value::XmlDocument(s) => assert_eq!(s, "<x/>"),
             other => panic!("expected XmlDocument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn avmplus_marker_bridges_embedded_amf3_value() {
+        // §3.1: an avmplus-object-marker (0x11) inside an AMF0 stream
+        // switches to AMF3 for the value that follows. Encode an AMF3
+        // integer, prefix the switch marker, and confirm AMF0 decode
+        // bridges it onto an Amf0Value::Number.
+        let mut amf3_body = Vec::new();
+        let mut p3 = 0;
+        // Build via the amf3 encoder to avoid hand-rolling U29.
+        let iv = crate::amf3::Amf3Value::Integer(258);
+        crate::amf3::encode(&mut amf3_body, &iv);
+        // sanity: amf3 alone round-trips
+        let back = crate::amf3::decode(&amf3_body, &mut p3).unwrap();
+        assert_eq!(back, iv);
+
+        let mut frame = vec![crate::amf3::AVMPLUS_OBJECT_MARKER];
+        frame.extend_from_slice(&amf3_body);
+        let mut p = 0;
+        let v = decode(&frame, &mut p).unwrap();
+        assert_eq!(v, Amf0Value::Number(258.0));
+        assert_eq!(p, frame.len());
+    }
+
+    #[test]
+    fn avmplus_marker_inside_mixed_packet() {
+        // A packet whose first value is plain AMF0 and whose second is an
+        // AMF3-switched value — decode_all walks both transparently.
+        let mut frame = Vec::new();
+        encode(&mut frame, &Amf0Value::String("onStatus".into()));
+        frame.push(crate::amf3::AVMPLUS_OBJECT_MARKER);
+        crate::amf3::encode(&mut frame, &crate::amf3::Amf3Value::Boolean(true));
+
+        let values = decode_all(&frame).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_str(), Some("onStatus"));
+        assert_eq!(values[1], Amf0Value::Boolean(true));
+    }
+
+    #[test]
+    fn avmplus_marker_with_truncated_amf3_is_clean_error() {
+        // Switch marker present but no AMF3 byte follows → clean error.
+        let frame = [crate::amf3::AVMPLUS_OBJECT_MARKER];
+        let mut p = 0;
+        assert!(matches!(decode(&frame, &mut p), Err(Error::InvalidAmf0(_))));
     }
 
     #[test]

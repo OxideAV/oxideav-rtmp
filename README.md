@@ -84,7 +84,11 @@ client.close()?;
   bridged onto `Amf0Value`, and surfaced through the same
   `StreamPacket::Metadata` path; type-17 AMF3 commands feed the same
   stream-teardown detection. `RtmpClient::send_metadata_amf3` emits the
-  AMF3-encoded form. Externalizable objects are decodable via
+  AMF3-encoded form. The AMF0 decoder also honours an inline
+  `avmplus-object-marker` (`0x11`) mid-stream (§3.1): the following value
+  is decoded as a self-contained AMF3 value and bridged back onto
+  `Amf0Value`, so a mixed AMF0/AMF3 packet parses through the ordinary
+  `amf::decode_all` path. Externalizable objects are decodable via
   `Decoder::register_externalizable` (the caller supplies a body-length
   resolver for a known class; an unregistered class is refused, not
   guessed). Shared objects, RTMFP, and the Adobe digest-verified
