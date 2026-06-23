@@ -1,11 +1,14 @@
 //! AMF0 (Action Message Format 0) value encoder + decoder.
 //!
-//! RTMP command / data messages are AMF0-encoded. This module implements
-//! the subset of markers that real RTMP traffic uses in practice:
-//! Number, Boolean, String, Object, Null, Undefined, Reference, ECMA
-//! array, strict array, date, long string, end-of-object sentinel. We
-//! never emit nor consume AMF3 — RTMP occasionally upgrades a channel to
-//! AMF3 via the `avmplus` command, but we simply keep the channel on
+//! RTMP command / data messages are AMF0-encoded. This module covers
+//! every serializable AMF0 marker from Table (§2) of the spec: Number,
+//! Boolean, String, Object, Null, Undefined, Reference, ECMA array,
+//! strict array, Date, long string, Unsupported (0x0D), XML Document
+//! (0x0F), Typed Object (0x10), and the end-of-object sentinel. The two
+//! deliberately-unserializable markers (Movieclip 0x04, RecordSet 0x0E,
+//! per spec §2.6 / §2.16) are rejected as unknown on decode. We never
+//! emit nor consume AMF3 — RTMP occasionally upgrades a channel to AMF3
+//! via the `avmplus` marker (0x11), but we simply keep the channel on
 //! AMF0; every commodity client / server we have interoperated with
 //! stays in AMF0 for publish flows.
 //!
@@ -37,6 +40,9 @@ const M_OBJECT_END: u8 = 0x09;
 const M_STRICT_ARRAY: u8 = 0x0A;
 const M_DATE: u8 = 0x0B;
 const M_LONG_STRING: u8 = 0x0C;
+const M_UNSUPPORTED: u8 = 0x0D;
+const M_XML_DOCUMENT: u8 = 0x0F;
+const M_TYPED_OBJECT: u8 = 0x10;
 
 /// One AMF0 value. Ordered-object semantics are preserved through the
 /// `Vec<(key, value)>` — RTMP command handlers sometimes care about
@@ -64,6 +70,23 @@ pub enum Amf0Value {
         millis: f64,
         timezone: i16,
     },
+    /// AMF0 Unsupported (marker 0x0D, spec §2.15). Emitted in place of a
+    /// value the producer could not serialize. No payload is carried;
+    /// some endpoints throw on receipt, so we surface it as a distinct
+    /// variant rather than collapsing it into `Undefined`.
+    Unsupported,
+    /// AMF0 XML Document (marker 0x0F, spec §2.17). On the wire this is a
+    /// long UTF-8 string holding the serialized DOM; we keep it as a
+    /// dedicated variant so a decode→encode round-trip preserves the
+    /// marker (rather than re-emitting a bare `String`/long-string).
+    XmlDocument(String),
+    /// AMF0 Typed Object (marker 0x10, spec §2.18): a class-name string
+    /// followed by the same property/object-end body as an anonymous
+    /// object. Typed objects are complex types and can be referenced.
+    TypedObject {
+        class_name: String,
+        properties: Vec<(String, Amf0Value)>,
+    },
 }
 
 impl Amf0Value {
@@ -72,6 +95,9 @@ impl Amf0Value {
         match self {
             Amf0Value::Object(v) | Amf0Value::EcmaArray(v) => {
                 v.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+            }
+            Amf0Value::TypedObject { properties, .. } => {
+                properties.iter().find(|(k, _)| k == key).map(|(_, v)| v)
             }
             _ => None,
         }
@@ -204,6 +230,34 @@ fn decode_at_depth(
                 millis: f64::from_bits(bits),
                 timezone: tz,
             })
+        }
+        M_UNSUPPORTED => Ok(Amf0Value::Unsupported),
+        M_XML_DOCUMENT => {
+            // §2.17: an XML document is always encoded as a long UTF-8
+            // string (32-bit length prefix), same body shape as a
+            // long-string but a distinct marker.
+            Ok(Amf0Value::XmlDocument(read_utf8_long(buf, pos)?))
+        }
+        M_TYPED_OBJECT => {
+            // §2.18: `object-marker class-name *(object-property)`. The
+            // class name is a short UTF-8 string preceding the same
+            // property/OBJECT_END body as an anonymous object. Typed
+            // objects are complex types, so reserve the ref-table slot
+            // before decoding the body (mirrors M_OBJECT) so an inner
+            // reference can point back at this instance.
+            let class_name = read_utf8_short(buf, pos)?;
+            let slot = refs.len();
+            refs.push(Amf0Value::TypedObject {
+                class_name: class_name.clone(),
+                properties: Vec::new(),
+            });
+            let body = read_object_body_at_depth(buf, pos, depth + 1, refs)?;
+            let v = Amf0Value::TypedObject {
+                class_name,
+                properties: body,
+            };
+            refs[slot] = v.clone();
+            Ok(v)
         }
         M_REFERENCE => {
             // §E.4.4.2: `IF Type == 7 { UI16 }` — a 16-bit big-endian
@@ -391,6 +445,22 @@ pub fn encode(out: &mut Vec<u8>, v: &Amf0Value) {
             out.push(M_DATE);
             out.extend_from_slice(&millis.to_bits().to_be_bytes());
             out.extend_from_slice(&timezone.to_be_bytes());
+        }
+        Amf0Value::Unsupported => out.push(M_UNSUPPORTED),
+        Amf0Value::XmlDocument(s) => {
+            // §2.17: always a long UTF-8 string (32-bit length prefix).
+            out.push(M_XML_DOCUMENT);
+            out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        Amf0Value::TypedObject {
+            class_name,
+            properties,
+        } => {
+            out.push(M_TYPED_OBJECT);
+            out.extend_from_slice(&(class_name.len() as u16).to_be_bytes());
+            out.extend_from_slice(class_name.as_bytes());
+            write_object_body(out, properties);
         }
     }
 }
@@ -583,6 +653,94 @@ mod tests {
         let b = [M_REFERENCE, 0x00];
         let mut p = 0;
         assert!(matches!(decode(&b, &mut p), Err(Error::InvalidAmf0(_))));
+    }
+
+    #[test]
+    fn roundtrip_unsupported() {
+        // §2.15: marker-only, no payload.
+        let v = Amf0Value::Unsupported;
+        let mut b = Vec::new();
+        encode(&mut b, &v);
+        assert_eq!(b, [M_UNSUPPORTED]);
+        let mut p = 0;
+        assert_eq!(decode(&b, &mut p).unwrap(), v);
+        assert_eq!(p, 1);
+    }
+
+    #[test]
+    fn roundtrip_xml_document() {
+        // §2.17: always a long UTF-8 string (32-bit length prefix).
+        let v = Amf0Value::XmlDocument("<root><a/></root>".into());
+        let mut b = Vec::new();
+        encode(&mut b, &v);
+        assert_eq!(b[0], M_XML_DOCUMENT);
+        // 32-bit length prefix, not 16-bit.
+        assert_eq!(&b[1..5], &(17u32).to_be_bytes());
+        let mut p = 0;
+        assert_eq!(decode(&b, &mut p).unwrap(), v);
+    }
+
+    #[test]
+    fn roundtrip_typed_object() {
+        // §2.18: class-name (short UTF-8) then property/OBJECT_END body.
+        let v = Amf0Value::TypedObject {
+            class_name: "com.example.Point".into(),
+            properties: vec![
+                ("x".into(), Amf0Value::Number(3.0)),
+                ("y".into(), Amf0Value::Number(4.0)),
+            ],
+        };
+        let mut b = Vec::new();
+        encode(&mut b, &v);
+        assert_eq!(b[0], M_TYPED_OBJECT);
+        // class-name length prefix is a UI16 (short string).
+        assert_eq!(&b[1..3], &(17u16).to_be_bytes());
+        let mut p = 0;
+        let decoded = decode(&b, &mut p).unwrap();
+        assert_eq!(decoded, v);
+        // get() reaches into typed-object properties.
+        assert_eq!(decoded.get("y").and_then(Amf0Value::as_f64), Some(4.0));
+    }
+
+    #[test]
+    fn typed_object_is_reference_eligible() {
+        // §2.18: "reoccurring instances can be sent by reference." A
+        // typed object occupies a ref-table slot like any complex value.
+        let to = Amf0Value::TypedObject {
+            class_name: "Foo".into(),
+            properties: vec![("a".into(), Amf0Value::Number(1.0))],
+        };
+        let mut b = Vec::new();
+        encode(&mut b, &to);
+        b.push(M_REFERENCE);
+        b.extend_from_slice(&0u16.to_be_bytes());
+
+        let values = decode_all(&b).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], to);
+        assert_eq!(values[1], to);
+    }
+
+    #[test]
+    fn typed_object_truncated_class_name_is_clean_error() {
+        // Marker + a class-name length claiming 4 bytes but none present.
+        let b = [M_TYPED_OBJECT, 0x00, 0x04];
+        let mut p = 0;
+        assert!(matches!(decode(&b, &mut p), Err(Error::InvalidAmf0(_))));
+    }
+
+    #[test]
+    fn xml_document_distinct_from_long_string_on_wire() {
+        // An XmlDocument must NOT decode as a plain String, and vice
+        // versa — the marker byte distinguishes them.
+        let xml = Amf0Value::XmlDocument("<x/>".into());
+        let mut b = Vec::new();
+        encode(&mut b, &xml);
+        let mut p = 0;
+        match decode(&b, &mut p).unwrap() {
+            Amf0Value::XmlDocument(s) => assert_eq!(s, "<x/>"),
+            other => panic!("expected XmlDocument, got {other:?}"),
+        }
     }
 
     #[test]
