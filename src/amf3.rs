@@ -224,7 +224,11 @@ impl Amf3Value {
             Amf3Value::Integer(n) => A0::Number(f64::from(*n)),
             Amf3Value::Double(n) => A0::Number(*n),
             Amf3Value::String(s) => A0::String(s.clone()),
-            Amf3Value::XmlDocument(s) | Amf3Value::Xml(s) => A0::String(s.clone()),
+            // A `flash.xml.XMLDocument` bridges to AMF0's dedicated XML
+            // Document type (marker 0x0F); E4X `flash.xml.XML` has no
+            // distinct AMF0 marker, so it falls back to a plain string.
+            Amf3Value::XmlDocument(s) => A0::XmlDocument(s.clone()),
+            Amf3Value::Xml(s) => A0::String(s.clone()),
             Amf3Value::Date(ms) => A0::Date {
                 millis: *ms,
                 timezone: 0,
@@ -244,6 +248,7 @@ impl Amf3Value {
                 A0::EcmaArray(pairs)
             }
             Amf3Value::Object {
+                class_name,
                 sealed,
                 dynamic_members,
                 ..
@@ -252,7 +257,17 @@ impl Amf3Value {
                 for (k, v) in sealed.iter().chain(dynamic_members.iter()) {
                     pairs.push((k.clone(), v.to_amf0()));
                 }
-                A0::Object(pairs)
+                // A named AMF3 class bridges to an AMF0 typed object
+                // (marker 0x10), preserving the registered class alias;
+                // an anonymous class (empty name) stays a plain object.
+                if class_name.is_empty() {
+                    A0::Object(pairs)
+                } else {
+                    A0::TypedObject {
+                        class_name: class_name.clone(),
+                        pairs,
+                    }
+                }
             }
             Amf3Value::ByteArray(bytes) => {
                 A0::StrictArray(bytes.iter().map(|b| A0::Number(f64::from(*b))).collect())
@@ -1927,13 +1942,17 @@ mod tests {
             dynamic_members: vec![("b".into(), Amf3Value::String("two".into()))],
             externalizable_body: None,
         };
-        // Class name is dropped; sealed then dynamic members, in order.
+        // A named class bridges to an AMF0 typed object (class alias
+        // preserved); members appear sealed-then-dynamic, in order.
         assert_eq!(
             obj.to_amf0(),
-            A0::Object(vec![
-                ("a".into(), A0::Number(1.0)),
-                ("b".into(), A0::String("two".into())),
-            ])
+            A0::TypedObject {
+                class_name: "Some.Class".into(),
+                pairs: vec![
+                    ("a".into(), A0::Number(1.0)),
+                    ("b".into(), A0::String("two".into())),
+                ],
+            }
         );
     }
 
@@ -1996,5 +2015,45 @@ mod tests {
         assert_eq!(obj.get("height").and_then(A0::as_f64), Some(720.0));
         assert_eq!(obj.get("framerate").and_then(A0::as_f64), Some(29.97));
         assert_eq!(obj.get("videocodecid").and_then(A0::as_str), Some("avc1"));
+    }
+
+    #[test]
+    fn bridge_xml_document_to_amf0_xml_document() {
+        use crate::amf::Amf0Value as A0;
+        // A `flash.xml.XMLDocument` bridges onto AMF0's dedicated XML
+        // Document marker (0x0F), not a plain string; E4X `flash.xml.XML`
+        // has no AMF0 equivalent and falls back to a string.
+        assert_eq!(
+            Amf3Value::XmlDocument("<a/>".into()).to_amf0(),
+            A0::XmlDocument("<a/>".into())
+        );
+        assert_eq!(
+            Amf3Value::Xml("<b/>".into()).to_amf0(),
+            A0::String("<b/>".into())
+        );
+    }
+
+    #[test]
+    fn bridge_named_amf3_class_to_amf0_typed_object() {
+        use crate::amf::Amf0Value as A0;
+        // A named (typed) AMF3 class bridges to an AMF0 typed object,
+        // preserving the class alias; an anonymous class stays a plain
+        // AMF0 object.
+        let named = Amf3Value::Object {
+            class_name: "com.example.Point".into(),
+            dynamic: false,
+            sealed: vec![
+                ("x".into(), Amf3Value::Integer(3)),
+                ("y".into(), Amf3Value::Integer(4)),
+            ],
+            dynamic_members: Vec::new(),
+            externalizable_body: None,
+        };
+        let bridged = named.to_amf0();
+        assert_eq!(bridged.class_name(), Some("com.example.Point"));
+        assert_eq!(bridged.get("x").and_then(A0::as_f64), Some(3.0));
+
+        let anon = dynamic_object([("z", Amf3Value::Integer(9))]);
+        assert!(matches!(anon.to_amf0(), A0::Object(_)));
     }
 }

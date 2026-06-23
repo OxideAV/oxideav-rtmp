@@ -37,6 +37,9 @@ const M_OBJECT_END: u8 = 0x09;
 const M_STRICT_ARRAY: u8 = 0x0A;
 const M_DATE: u8 = 0x0B;
 const M_LONG_STRING: u8 = 0x0C;
+const M_UNSUPPORTED: u8 = 0x0D;
+const M_XML_DOCUMENT: u8 = 0x0F;
+const M_TYPED_OBJECT: u8 = 0x10;
 
 /// One AMF0 value. Ordered-object semantics are preserved through the
 /// `Vec<(key, value)>` — RTMP command handlers sometimes care about
@@ -64,15 +67,48 @@ pub enum Amf0Value {
         millis: f64,
         timezone: i16,
     },
+    /// AMF0 §2.17 XML Document (marker `0x0F`). On the wire an XML
+    /// document is always a *long* UTF-8 string (a `UTF-8-long`, i.e. a
+    /// 32-bit length prefix), regardless of length. Kept distinct from
+    /// [`Amf0Value::String`] so the marker round-trips byte-for-byte:
+    /// re-encoding a decoded XML document re-emits `0x0F` + a long
+    /// string, not a short-string `0x02`.
+    XmlDocument(String),
+    /// AMF0 §2.18 Typed Object (marker `0x10`): an object preceded by a
+    /// registered class-name (a short `UTF-8` string), followed by the
+    /// same key/value/OBJECT_END body as a plain anonymous object. Like
+    /// anonymous objects, a typed object is a complex type and so
+    /// participates in the AMF0 reference table.
+    TypedObject {
+        class_name: String,
+        pairs: Vec<(String, Amf0Value)>,
+    },
+    /// AMF0 §2.15 Unsupported (marker `0x0D`): a placeholder a peer
+    /// emits when a value cannot be serialized. No payload follows the
+    /// marker. Some endpoints throw on encountering it; we surface it as
+    /// a first-class value so a caller can decide.
+    Unsupported,
 }
 
 impl Amf0Value {
     /// Look up a direct child of an Object / EcmaArray by name.
     pub fn get(&self, key: &str) -> Option<&Amf0Value> {
         match self {
-            Amf0Value::Object(v) | Amf0Value::EcmaArray(v) => {
+            Amf0Value::Object(v)
+            | Amf0Value::EcmaArray(v)
+            | Amf0Value::TypedObject { pairs: v, .. } => {
                 v.iter().find(|(k, _)| k == key).map(|(_, v)| v)
             }
+            _ => None,
+        }
+    }
+
+    /// The registered class alias of a [`Amf0Value::TypedObject`], if
+    /// this value is one. `None` for every other variant (including a
+    /// plain anonymous [`Amf0Value::Object`]).
+    pub fn class_name(&self) -> Option<&str> {
+        match self {
+            Amf0Value::TypedObject { class_name, .. } => Some(class_name),
             _ => None,
         }
     }
@@ -204,6 +240,33 @@ fn decode_at_depth(
                 millis: f64::from_bits(bits),
                 timezone: tz,
             })
+        }
+        M_UNSUPPORTED => Ok(Amf0Value::Unsupported),
+        M_XML_DOCUMENT => {
+            // §2.17: an XML document is always serialized as a UTF-8-long
+            // (32-bit length prefix), never the short form.
+            Ok(Amf0Value::XmlDocument(read_utf8_long(buf, pos)?))
+        }
+        M_TYPED_OBJECT => {
+            // §2.18: `object-marker class-name *(object-property)`. The
+            // class-name is a short UTF-8 string; the body is the same
+            // key/value/OBJECT_END terminator sequence as an anonymous
+            // object. Like anonymous objects, a typed object is a complex
+            // type, so reserve its reference-table slot before decoding
+            // the body (so an inner reference back to it resolves).
+            let class_name = read_utf8_short(buf, pos)?;
+            let slot = refs.len();
+            refs.push(Amf0Value::TypedObject {
+                class_name: class_name.clone(),
+                pairs: Vec::new(),
+            });
+            let body = read_object_body_at_depth(buf, pos, depth + 1, refs)?;
+            let v = Amf0Value::TypedObject {
+                class_name,
+                pairs: body,
+            };
+            refs[slot] = v.clone();
+            Ok(v)
         }
         M_REFERENCE => {
             // §E.4.4.2: `IF Type == 7 { UI16 }` — a 16-bit big-endian
@@ -392,6 +455,21 @@ pub fn encode(out: &mut Vec<u8>, v: &Amf0Value) {
             out.extend_from_slice(&millis.to_bits().to_be_bytes());
             out.extend_from_slice(&timezone.to_be_bytes());
         }
+        Amf0Value::XmlDocument(s) => {
+            // §2.17: always the long-string framing, regardless of length.
+            out.push(M_XML_DOCUMENT);
+            out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        Amf0Value::TypedObject { class_name, pairs } => {
+            out.push(M_TYPED_OBJECT);
+            // class-name: a bare short UTF-8 string (no marker byte),
+            // exactly like an object-property key.
+            out.extend_from_slice(&(class_name.len() as u16).to_be_bytes());
+            out.extend_from_slice(class_name.as_bytes());
+            write_object_body(out, pairs);
+        }
+        Amf0Value::Unsupported => out.push(M_UNSUPPORTED),
     }
 }
 
@@ -592,5 +670,105 @@ mod tests {
         let b = [M_REFERENCE, 0x00, 0x00];
         let mut p = 0;
         assert!(matches!(decode(&b, &mut p), Err(Error::InvalidAmf0(_))));
+    }
+
+    #[test]
+    fn roundtrip_xml_document() {
+        // §2.17: an XML document is always the long-string framing
+        // (marker 0x0F + UI32 length), even for a short document.
+        let v = Amf0Value::XmlDocument("<a>hi</a>".into());
+        let mut b = Vec::new();
+        encode(&mut b, &v);
+        assert_eq!(b[0], M_XML_DOCUMENT);
+        // 1 marker + 4 length bytes + 9 payload bytes.
+        assert_eq!(b.len(), 1 + 4 + 9);
+        assert_eq!(&b[1..5], &(9u32).to_be_bytes());
+        let mut p = 0;
+        assert_eq!(decode(&b, &mut p).unwrap(), v);
+        assert_eq!(p, b.len());
+    }
+
+    #[test]
+    fn xml_document_is_distinct_from_string() {
+        // A decoded XML document must NOT collapse into a plain String,
+        // so the 0x0F marker survives a decode→encode round-trip.
+        let v = Amf0Value::XmlDocument("<x/>".into());
+        let mut b = Vec::new();
+        encode(&mut b, &v);
+        let mut p = 0;
+        let back = decode(&b, &mut p).unwrap();
+        assert!(matches!(back, Amf0Value::XmlDocument(_)));
+        assert_ne!(back, Amf0Value::String("<x/>".into()));
+    }
+
+    #[test]
+    fn truncated_xml_document_is_clean_error() {
+        // Marker + a length claiming 8 bytes but no payload.
+        let mut b = vec![M_XML_DOCUMENT];
+        b.extend_from_slice(&8u32.to_be_bytes());
+        let mut p = 0;
+        assert!(matches!(decode(&b, &mut p), Err(Error::InvalidAmf0(_))));
+    }
+
+    #[test]
+    fn roundtrip_typed_object() {
+        // §2.18: marker 0x10 + class-name (short UTF-8) + object body.
+        let v = Amf0Value::TypedObject {
+            class_name: "com.example.User".into(),
+            pairs: vec![
+                ("id".into(), Amf0Value::Number(7.0)),
+                ("name".into(), Amf0Value::String("ada".into())),
+            ],
+        };
+        let mut b = Vec::new();
+        encode(&mut b, &v);
+        assert_eq!(b[0], M_TYPED_OBJECT);
+        // class-name length prefix is a UI16 (short string), not UI32.
+        assert_eq!(&b[1..3], &("com.example.User".len() as u16).to_be_bytes());
+        let mut p = 0;
+        let back = decode(&b, &mut p).unwrap();
+        assert_eq!(back, v);
+        assert_eq!(p, b.len());
+        // The class alias + `get` accessor both work on a typed object.
+        assert_eq!(back.class_name(), Some("com.example.User"));
+        assert_eq!(back.get("name").and_then(Amf0Value::as_str), Some("ada"));
+    }
+
+    #[test]
+    fn typed_object_participates_in_reference_table() {
+        // A typed object is a complex value: a later reference (index 0)
+        // resolves to it across a packet, exactly like an anonymous
+        // object does.
+        let to = Amf0Value::TypedObject {
+            class_name: "T".into(),
+            pairs: vec![("a".into(), Amf0Value::Number(1.0))],
+        };
+        let mut b = Vec::new();
+        encode(&mut b, &to);
+        b.push(M_REFERENCE);
+        b.extend_from_slice(&0u16.to_be_bytes());
+        let values = decode_all(&b).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], to);
+        assert_eq!(values[1], to);
+    }
+
+    #[test]
+    fn roundtrip_unsupported() {
+        // §2.15: marker 0x0D carries no payload.
+        let v = Amf0Value::Unsupported;
+        let mut b = Vec::new();
+        encode(&mut b, &v);
+        assert_eq!(b, vec![M_UNSUPPORTED]);
+        let mut p = 0;
+        assert_eq!(decode(&b, &mut p).unwrap(), v);
+        assert_eq!(p, 1);
+    }
+
+    #[test]
+    fn class_name_is_none_for_anonymous_object() {
+        let o = Amf0Value::Object(vec![("a".into(), Amf0Value::Number(1.0))]);
+        assert_eq!(o.class_name(), None);
+        assert_eq!(Amf0Value::Number(1.0).class_name(), None);
     }
 }
