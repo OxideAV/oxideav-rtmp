@@ -67,10 +67,17 @@ client.close()?;
 - **Direction.** Publish only: the server accepts incoming publishers;
   the client pushes to remote servers. RTMP play (subscribe / pull) is
   a follow-up.
-- **AMF0 + AMF3 command flow.** The AMF0 decoder handles every marker
-  real RTMP traffic uses, including object references (marker `0x07`):
-  a reference is dereferenced transparently to a clone of its target,
-  so a reference-deduplicated `onMetaData` decodes correctly. The
+- **AMF0 + AMF3 command flow.** The AMF0 decoder covers the complete
+  serializable marker set — number, boolean, (short + long) string,
+  object, ECMA / strict array, date, `null`, `undefined`, object
+  references (marker `0x07`), the XML Document (`0x0F`), the Typed
+  Object (`0x10`, with its registered class alias surfaced via
+  `Amf0Value::class_name()`), and the `unsupported` placeholder
+  (`0x0D`). XML documents and typed objects keep their own variants so
+  the marker round-trips byte-for-byte rather than collapsing into a
+  plain string / anonymous object. An object reference is dereferenced
+  transparently to a clone of its target, so a reference-deduplicated
+  `onMetaData` decodes correctly. The
   [`amf3`] module ships a complete AMF3 encoder + decoder (all thirteen
   markers plus the three reference tables), and AMF3 data / command
   messages route end-to-end: a type-15 AMF3 data message (an AMF0 frame

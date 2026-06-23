@@ -184,6 +184,45 @@ fn amf0_string_with_oversize_length_returns_truncated_error() {
     assert!(result.is_err());
 }
 
+/// `M_XML_DOCUMENT` (0x0F) reads a `u32`-prefixed long string. A forged
+/// length far past the buffer must surface a clean truncated error and
+/// not allocate the claimed bytes up front.
+#[test]
+fn amf0_xml_document_with_oversize_length_errors_fast() {
+    // 0x0F marker, then 4-byte BE length = u32::MAX, then nothing.
+    let mut buf = vec![0x0Fu8];
+    buf.extend_from_slice(&u32::MAX.to_be_bytes());
+    let start = std::time::Instant::now();
+    let result = amf0_decode_all(&buf);
+    assert!(result.is_err());
+    assert!(
+        start.elapsed().as_millis() < 100,
+        "oversize XML-document length should fail-fast"
+    );
+}
+
+/// `M_TYPED_OBJECT` (0x10) reads a `u16`-prefixed class-name then an
+/// object body. A marker with no class-name bytes at all must error
+/// cleanly, never panic.
+#[test]
+fn amf0_typed_object_truncated_class_name_is_clean_error() {
+    // 0x10 marker, then a class-name length of 5 but no name bytes.
+    let buf = [0x10u8, 0x00, 0x05];
+    assert!(amf0_decode_all(&buf).is_err());
+    // Bare marker with nothing following also errors, no panic.
+    assert!(amf0_decode_all(&[0x10u8]).is_err());
+}
+
+/// `M_UNSUPPORTED` (0x0D) carries no payload, so a lone marker decodes
+/// successfully to the Unsupported value — the one new marker that is
+/// *not* an error on a minimal buffer.
+#[test]
+fn amf0_unsupported_lone_marker_decodes() {
+    let values = amf0_decode_all(&[0x0Du8]).expect("lone unsupported marker");
+    assert_eq!(values.len(), 1);
+    assert!(matches!(values[0], Amf0Value::Unsupported));
+}
+
 // ---------------------------------------------------------------------------
 // AMF3 fuzz — same shape, exercises a wider marker set + reference tables
 // ---------------------------------------------------------------------------
