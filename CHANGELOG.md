@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.6...v0.0.7) - 2026-06-23
+
+### Other
+
+- injection tests + README for the new AMF0 markers
+- complete AMF0 marker set (XML Document, Typed Object, Unsupported)
+- typed SequenceEnd surface + crate README round-up (Enhanced RTMP v2)
+- typed VideoPacketType.MPEG2TSSequenceStart (Enhanced RTMP v2 §"ExVideoTagBody")
+- audio silence message (Enhanced RTMP v2 §"ExAudioTagHeader")
+- typed OnMetaData view (Enhanced RTMP v2 §"Enhancing onMetaData")
+- typed VideoFrameType.Command (StartSeek/EndSeek) seek-command frames
+- fix EncryptionTagHeader rustdoc link to EncryptedTag
+- parse FLV Encryption envelope (Annex F.3.1/F.3.2)
+- typed NetStreamCommand (RTMP 1.0 §4.2) parser + builder; surface inbound on server
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - complete the AMF0 marker set: XML Document (marker 0x0F, §2.17 — always the long-string framing), Typed Object (marker 0x10, §2.18 — registered class alias + object body, participates in the reference table), and Unsupported (marker 0x0D, §2.15 — payload-free placeholder). New Amf0Value variants XmlDocument / TypedObject / Unsupported plus an Amf0Value::class_name() accessor; all three round-trip through encode/decode. The AMF3→AMF0 bridge now maps flash.xml.XMLDocument onto the AMF0 XML Document marker (E4X flash.xml.XML still falls back to a string, having no AMF0 equivalent) and a named AMF3 class onto an AMF0 typed object preserving the class alias
