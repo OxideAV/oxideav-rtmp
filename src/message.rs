@@ -649,6 +649,40 @@ pub fn build_publish(
     }
 }
 
+// ---------------------------------------------------------------------------
+// NetStream onStatus code strings (RTMP 1.0 Commands-Messages §4.2)
+// ---------------------------------------------------------------------------
+
+/// `NetStream.Play.Start` — §4.2.1: "If the play command is
+/// successful, the client receives OnStatus message from server which
+/// is NetStream.Play.Start."
+pub const STATUS_PLAY_START: &str = "NetStream.Play.Start";
+/// `NetStream.Play.Reset` — §4.2.1 message flow: "NetStream.Play.Reset
+/// is sent by the server only if the play command sent by the client
+/// has set the reset flag."
+pub const STATUS_PLAY_RESET: &str = "NetStream.Play.Reset";
+/// `NetStream.Play.StreamNotFound` — §4.2.1: "If the specified stream
+/// is not found, NetStream.Play.StreamNotFound is received."
+pub const STATUS_PLAY_STREAM_NOT_FOUND: &str = "NetStream.Play.StreamNotFound";
+/// `NetStream.Seek.Notify` — §4.2.7: "The server sends a status message
+/// NetStream.Seek.Notify when seek is successful."
+pub const STATUS_SEEK_NOTIFY: &str = "NetStream.Seek.Notify";
+/// `NetStream.Pause.Notify` — §4.2.8: "The server sends a status
+/// message NetStream.Pause.Notify when the stream is paused."
+pub const STATUS_PAUSE_NOTIFY: &str = "NetStream.Pause.Notify";
+/// `NetStream.Unpause.Notify` — §4.2.8: "NetStream.Unpause.Notify is
+/// sent when a stream in un-paused."
+pub const STATUS_UNPAUSE_NOTIFY: &str = "NetStream.Unpause.Notify";
+/// `NetStream.Publish.Start` — §4.2.6: "The server responds with the
+/// OnStatus command to mark the beginning of publish."
+pub const STATUS_PUBLISH_START: &str = "NetStream.Publish.Start";
+/// `NetStream.Unpublish.Success` — the unpublish notification the
+/// server emits on the NetStream when a publish is torn down cleanly.
+pub const STATUS_UNPUBLISH_SUCCESS: &str = "NetStream.Unpublish.Success";
+/// `NetStream.Publish.BadName` — refusal code emitted when a publish
+/// attempt is rejected (stream key denied / name already in use).
+pub const STATUS_PUBLISH_BAD_NAME: &str = "NetStream.Publish.BadName";
+
 /// `onStatus` — server pushes this on the NetStream to signal state
 /// changes (e.g. `NetStream.Publish.Start`). `code` / `description`
 /// vary per event.
@@ -734,6 +768,27 @@ pub fn build_set_data_frame(stream_id: u32, metadata: Amf0Value) -> Message {
     crate::amf::encode(&mut payload, &Amf0Value::String("@setDataFrame".into()));
     crate::amf::encode(&mut payload, &Amf0Value::String("onMetaData".into()));
     crate::amf::encode(&mut payload, &metadata);
+    Message {
+        msg_type_id: MSG_DATA_AMF0,
+        msg_stream_id: stream_id,
+        timestamp: 0,
+        payload,
+    }
+}
+
+/// `onMetaData` data message — the shape a **server** sends to a
+/// subscriber on a play stream.
+///
+/// The publish direction wraps metadata as
+/// `@setDataFrame("onMetaData", meta)` ([`build_set_data_frame`]);
+/// when the server relays it down to a playing client the
+/// `@setDataFrame` RPC prefix is dropped and the data message body is
+/// just the `["onMetaData", meta]` pair — the same §E.4.4 name+value
+/// layout an FLV script-data tag carries.
+pub fn build_on_meta_data(stream_id: u32, metadata: &Amf0Value) -> Message {
+    let mut payload = Vec::new();
+    crate::amf::encode(&mut payload, &Amf0Value::String("onMetaData".into()));
+    crate::amf::encode(&mut payload, metadata);
     Message {
         msg_type_id: MSG_DATA_AMF0,
         msg_stream_id: stream_id,

@@ -1,4 +1,5 @@
-//! RTMP server: accepts an incoming publisher.
+//! RTMP server: accepts incoming publishers (§4.2.6 `publish`) and
+//! subscribers (§4.2.1 `play`).
 //!
 //! The exposed flow is intentionally two-phase so consumers can
 //! verify stream keys / auth:
@@ -90,14 +91,43 @@ impl RtmpServer {
     /// Accept one connection, run the handshake + connect + publish
     /// setup, and return the first point where the consumer gets to
     /// decide whether to take the stream.
+    ///
+    /// This is the publish-only entry point: a connection that issues
+    /// a §4.2.1 `play` instead of `publish` is politely refused with
+    /// `onStatus(NetStream.Play.StreamNotFound)` (the spec's
+    /// stream-not-found refusal) and the server keeps listening for a
+    /// publisher. Use [`accept_any`](Self::accept_any) to serve both
+    /// directions.
     pub fn accept(&self) -> Result<PublishRequest> {
+        loop {
+            match self.accept_any()? {
+                SessionRequest::Publish(req) => return Ok(req),
+                SessionRequest::Play(req) => {
+                    // A publish-only endpoint has no streams to serve:
+                    // per §4.2.1 "if the stream to be played is not
+                    // found, the Server sends the onStatus message
+                    // NetStream.Play.StreamNotFound."
+                    let peer = req.peer_addr;
+                    let _ = req.reject("publish-only endpoint");
+                    eprintln!("oxideav-rtmp: refused play request from {peer}");
+                }
+            }
+        }
+    }
+
+    /// Accept one connection and drive it until the peer announces its
+    /// direction: `publish` (it wants to send us a stream) or `play`
+    /// (it wants to receive one). Returns the matching request so the
+    /// consumer can authenticate, then [`PublishRequest::accept`] /
+    /// [`PlayRequest::accept`] or `reject` it.
+    pub fn accept_any(&self) -> Result<SessionRequest> {
         loop {
             let (stream, peer_addr) = self.listener.accept()?;
             // Individual parse failures shouldn't bring down the
             // server — log via Err(...) once, then keep listening. A
             // caller that wants fine-grained control uses `incoming()`
             // plus their own handshake.
-            match drive_until_publish(stream, peer_addr, &self.capabilities) {
+            match drive_until_request(stream, peer_addr, &self.capabilities) {
                 Ok(req) => return Ok(req),
                 Err(e) => {
                     eprintln!("oxideav-rtmp: dropped connection from {peer_addr}: {e}");
@@ -115,9 +145,36 @@ impl RtmpServer {
     /// [`RtmpSession`] (call `next_packet` until it returns `None`,
     /// then drop). Panics in the handler are caught by the per-thread
     /// panic boundary.
+    ///
+    /// Publish-only: a play connection is refused with
+    /// `onStatus(NetStream.Play.StreamNotFound)` before the handler is
+    /// ever called. Use [`serve_sessions`](Self::serve_sessions) to
+    /// handle both directions.
     pub fn serve<F>(&self, handler: F) -> Result<()>
     where
         F: Fn(PublishRequest) + Send + Sync + 'static,
+    {
+        self.serve_sessions(move |req| match req {
+            SessionRequest::Publish(req) => handler(req),
+            SessionRequest::Play(req) => {
+                let peer = req.peer_addr;
+                let _ = req.reject("publish-only endpoint");
+                eprintln!("oxideav-rtmp: refused play request from {peer}");
+            }
+        })
+    }
+
+    /// Loop forever, spawning one thread per accepted connection, and
+    /// hand each fully-negotiated [`SessionRequest`] — publish *or*
+    /// play — to `handler`.
+    ///
+    /// A broadcast-style application typically routes
+    /// [`SessionRequest::Publish`] into an ingest queue and serves each
+    /// [`SessionRequest::Play`] subscriber a copy of the matching
+    /// publisher's packets via [`PlaySession::forward`].
+    pub fn serve_sessions<F>(&self, handler: F) -> Result<()>
+    where
+        F: Fn(SessionRequest) + Send + Sync + 'static,
     {
         use std::sync::Arc;
         let handler = Arc::new(handler);
@@ -138,7 +195,7 @@ impl RtmpServer {
             let c = caps.clone();
             thread::Builder::new()
                 .name(format!("oxideav-rtmp-session-{peer_addr}"))
-                .spawn(move || match drive_until_publish(stream, peer_addr, &c) {
+                .spawn(move || match drive_until_request(stream, peer_addr, &c) {
                     Ok(req) => h(req),
                     Err(e) => {
                         eprintln!("oxideav-rtmp: dropped connection from {peer_addr}: {e}");
@@ -148,6 +205,21 @@ impl RtmpServer {
         }
         Ok(())
     }
+}
+
+/// A fully-negotiated inbound connection, classified by the direction
+/// the peer announced after `createStream`:
+///
+/// * [`Publish`](Self::Publish) — the peer issued a §4.2.6 `publish`
+///   command; it wants to *send* us a stream.
+/// * [`Play`](Self::Play) — the peer issued a §4.2.1 `play` command;
+///   it wants to *receive* one.
+#[allow(clippy::large_enum_variant)]
+pub enum SessionRequest {
+    /// Incoming publisher (§4.2.6) — accept to pump packets *in*.
+    Publish(PublishRequest),
+    /// Incoming subscriber (§4.2.1) — accept to send packets *out*.
+    Play(PlayRequest),
 }
 
 /// The protocol has gotten through `publish` — we know which app the
@@ -214,7 +286,7 @@ impl PublishRequest {
             &build_on_status(
                 stream_id,
                 "status",
-                "NetStream.Publish.Start",
+                STATUS_PUBLISH_START,
                 &format!("Started publishing {stream_name}"),
             ),
         )?;
@@ -246,11 +318,470 @@ impl PublishRequest {
         } = pending;
         let _ = writer.write_message(
             CSID_COMMAND,
-            &build_on_status(stream_id, "error", "NetStream.Publish.BadName", reason),
+            &build_on_status(stream_id, "error", STATUS_PUBLISH_BAD_NAME, reason),
         );
         let _ = writer.flush();
         let _ = stream.shutdown(Shutdown::Both);
         Err(Error::Rejected(reason.to_string()))
+    }
+}
+
+/// The protocol has gotten through a §4.2.1 `play` command — the peer
+/// is a subscriber asking to *receive* the named stream. Consumer
+/// decides whether to serve it.
+pub struct PlayRequest {
+    /// Application name from the peer's `connect` command.
+    pub app: String,
+    /// §4.2.1 Stream Name argument (may carry an `mp3:` / `mp4:`
+    /// prefix per the spec's naming table).
+    pub stream_name: String,
+    /// §4.2.1 optional Start argument in seconds. Spec default −2
+    /// ("first try the live stream, then the recorded one"); −1 means
+    /// live only; ≥ 0 seeks a recorded stream. `None` when omitted.
+    pub start: Option<f64>,
+    /// §4.2.1 optional Duration argument in seconds (default −1 =
+    /// until the stream ends). `None` when omitted.
+    pub duration: Option<f64>,
+    /// §4.2.1 optional Reset flag — flush any queued playlist first.
+    /// Drives whether [`accept`](Self::accept) emits
+    /// `NetStream.Play.Reset` ("sent by the server only if the play
+    /// command sent by the client has set the reset flag").
+    pub reset: Option<bool>,
+    /// §3.7 `SetBufferLength` observed before the `play` command, in
+    /// milliseconds — the subscriber's requested buffer depth. `None`
+    /// when the peer never sent one.
+    pub buffer_length_ms: Option<u32>,
+    pub peer_addr: SocketAddr,
+    /// The `tcUrl` field from the subscriber's connect command.
+    pub tc_url: String,
+    /// Enhanced RTMP v1+v2 capability block from the subscriber's
+    /// `connect` Command Object. Empty for legacy players.
+    pub capabilities: ConnectCapabilities,
+    pending: PendingSession,
+}
+
+impl PlayRequest {
+    /// Serve the subscriber a **live** stream: run the §4.2.1
+    /// Figure 5 acceptance sequence — `UserControl StreamBegin`,
+    /// `onStatus(NetStream.Play.Reset)` (only when the peer's play
+    /// command set the reset flag, per spec), then
+    /// `onStatus(NetStream.Play.Start)` — and return the
+    /// [`PlaySession`] to feed via `send_audio` / `send_video` /
+    /// [`forward`](PlaySession::forward).
+    ///
+    /// The Figure 5 `SetChunkSize` step was already performed right
+    /// after `connect` (chunk size is connection-level state), and
+    /// `StreamIsRecorded` is skipped for a live stream — use
+    /// [`accept_recorded`](Self::accept_recorded) when serving
+    /// recorded / seekable content.
+    pub fn accept(self) -> Result<PlaySession> {
+        self.accept_mode(false)
+    }
+
+    /// Same as [`accept`](Self::accept) but announces the stream as
+    /// recorded: the Figure 5 `UserControl StreamIsRecorded` event is
+    /// emitted ahead of `StreamBegin`, matching the spec's flow ("the
+    /// server sends this event to notify the client that the stream
+    /// is a recorded stream").
+    pub fn accept_recorded(self) -> Result<PlaySession> {
+        self.accept_mode(true)
+    }
+
+    fn accept_mode(self, recorded: bool) -> Result<PlaySession> {
+        let PlayRequest {
+            app,
+            stream_name,
+            reset,
+            peer_addr,
+            pending,
+            ..
+        } = self;
+        let PendingSession {
+            stream,
+            reader,
+            mut writer,
+            stream_id,
+            publish_tx_id: _,
+        } = pending;
+
+        if recorded {
+            writer.write_message(
+                CSID_PROTOCOL_CONTROL,
+                &build_user_control_stream_is_recorded(stream_id),
+            )?;
+        }
+        writer.write_message(
+            CSID_PROTOCOL_CONTROL,
+            &build_user_control_stream_begin(stream_id),
+        )?;
+        if reset == Some(true) {
+            // "NetStream.Play.Reset is sent by the server only if the
+            // play command sent by the client has set the reset flag."
+            writer.write_message(
+                CSID_COMMAND,
+                &build_on_status(
+                    stream_id,
+                    "status",
+                    STATUS_PLAY_RESET,
+                    &format!("Playing and resetting {stream_name}"),
+                ),
+            )?;
+        }
+        writer.write_message(
+            CSID_COMMAND,
+            &build_on_status(
+                stream_id,
+                "status",
+                STATUS_PLAY_START,
+                &format!("Started playing {stream_name}"),
+            ),
+        )?;
+        writer.flush()?;
+
+        Ok(PlaySession {
+            stream,
+            reader,
+            writer,
+            app,
+            stream_name,
+            peer_addr,
+            stream_id,
+            ended: false,
+            pending_subs: VecDeque::new(),
+        })
+    }
+
+    /// Refuse the play request: emit the §4.2.1
+    /// `onStatus(NetStream.Play.StreamNotFound)` error ("if the stream
+    /// to be played is not found") with `reason` as the description,
+    /// then drop the connection.
+    pub fn reject(self, reason: &str) -> Result<()> {
+        let PlayRequest { pending, .. } = self;
+        let PendingSession {
+            stream,
+            mut writer,
+            stream_id,
+            ..
+        } = pending;
+        let _ = writer.write_message(
+            CSID_COMMAND,
+            &build_on_status(stream_id, "error", STATUS_PLAY_STREAM_NOT_FOUND, reason),
+        );
+        let _ = writer.flush();
+        let _ = stream.shutdown(Shutdown::Both);
+        Err(Error::Rejected(reason.to_string()))
+    }
+}
+
+/// Subscriber-originated event observed by a [`PlaySession`] while
+/// serving a play stream.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlaySessionEvent {
+    /// A §4.2 NetStream control command — `pause`, `seek`,
+    /// `receiveAudio`, `receiveVideo`, or a further `play` / `play2`
+    /// (playlist switch). The session does not act on these itself;
+    /// the application decides (and typically answers `pause` / `seek`
+    /// with [`PlaySession::notify_pause`] /
+    /// [`PlaySession::notify_seek`] per §4.2.7 / §4.2.8).
+    Command(NetStreamCommand),
+    /// §3.7 `SetBufferLength` — the subscriber (re-)announced how many
+    /// milliseconds of buffer it keeps filled. May arrive at any time
+    /// (e.g. after a pause).
+    SetBufferLength { buffer_ms: u32 },
+}
+
+/// Active play (subscriber) session after [`PlayRequest::accept`].
+///
+/// The server side of RTMP's subscribe direction: push tags out with
+/// [`send_audio`](Self::send_audio) / [`send_video`](Self::send_video)
+/// / [`send_metadata`](Self::send_metadata) (or relay a whole
+/// [`StreamPacket`] with [`forward`](Self::forward)), and pump
+/// [`next_event`](Self::next_event) — typically from a companion
+/// thread, or between sends with a read timeout — to observe the
+/// subscriber's §4.2 control commands and detect teardown.
+pub struct PlaySession {
+    stream: TcpStream,
+    reader: ChunkReader<TcpStream>,
+    writer: ChunkWriter<TcpStream>,
+    app: String,
+    stream_name: String,
+    peer_addr: SocketAddr,
+    stream_id: u32,
+    ended: bool,
+    /// Sub-messages decomposed out of an Aggregate Message (type 22)
+    /// per RTMP 1.0 §7.1.6 but not yet dispatched.
+    pending_subs: VecDeque<Message>,
+}
+
+impl PlaySession {
+    pub fn app(&self) -> &str {
+        &self.app
+    }
+    pub fn stream_name(&self) -> &str {
+        &self.stream_name
+    }
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+    /// NetStream message stream id this session sends A/V on (the id
+    /// returned to the subscriber from `_result(createStream)`).
+    pub fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+
+    /// Configure a read timeout on the socket clone
+    /// [`next_event`](Self::next_event) blocks on, so a send loop can
+    /// poll for subscriber commands between frames.
+    pub fn set_read_timeout(&mut self, d: Option<Duration>) -> Result<()> {
+        self.reader.inner_mut().set_read_timeout(d)?;
+        let _ = self.stream.set_read_timeout(d);
+        Ok(())
+    }
+
+    /// Send one audio tag at `timestamp_ms` on the play stream.
+    pub fn send_audio(&mut self, timestamp_ms: u32, tag: &AudioTag) -> Result<()> {
+        let payload = crate::flv::build_audio(tag);
+        self.send_media(MSG_AUDIO, CSID_AUDIO, timestamp_ms, payload)
+    }
+
+    /// Send one video tag at `timestamp_ms` on the play stream.
+    pub fn send_video(&mut self, timestamp_ms: u32, tag: &VideoTag) -> Result<()> {
+        let payload = crate::flv::build_video(tag);
+        self.send_media(MSG_VIDEO, CSID_VIDEO, timestamp_ms, payload)
+    }
+
+    fn send_media(&mut self, type_id: u8, csid: u32, ts: u32, payload: Vec<u8>) -> Result<()> {
+        self.writer.write_message(
+            csid,
+            &Message {
+                msg_type_id: type_id,
+                msg_stream_id: self.stream_id,
+                timestamp: ts,
+                payload,
+            },
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Send an `onMetaData` data message to the subscriber. Unlike the
+    /// publish direction there is no `@setDataFrame` RPC prefix — the
+    /// server relays the bare `["onMetaData", meta]` pair.
+    pub fn send_metadata(&mut self, metadata: &Amf0Value) -> Result<()> {
+        self.writer
+            .write_message(CSID_DATA, &build_on_meta_data(self.stream_id, metadata))?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Relay one publisher-side [`StreamPacket`] to this subscriber —
+    /// the core of an RTMP fan-out: `Audio` / `Video` re-frame on this
+    /// session's stream id at the packet's original timestamp,
+    /// `Metadata` re-frames as a bare `onMetaData` data message, and a
+    /// publisher-side `Command` is not forwarded (control commands are
+    /// per-connection, not stream content).
+    pub fn forward(&mut self, packet: &StreamPacket) -> Result<()> {
+        match packet {
+            StreamPacket::Audio { timestamp, tag } => self.send_audio(*timestamp, tag),
+            StreamPacket::Video { timestamp, tag } => self.send_video(*timestamp, tag),
+            StreamPacket::Metadata(meta) => self.send_metadata(meta),
+            StreamPacket::Command(_) => Ok(()),
+        }
+    }
+
+    /// Emit `onStatus(NetStream.Pause.Notify)` /
+    /// `onStatus(NetStream.Unpause.Notify)` — the §4.2.8 replies to a
+    /// subscriber's `pause` command ("the server sends a status
+    /// message NetStream.Pause.Notify when the stream is paused.
+    /// NetStream.Unpause.Notify is sent when a stream in un-paused").
+    /// Call after honouring a [`NetStreamCommand::Pause`] event.
+    pub fn notify_pause(&mut self, paused: bool) -> Result<()> {
+        let (code, desc) = if paused {
+            (STATUS_PAUSE_NOTIFY, "Pausing")
+        } else {
+            (STATUS_UNPAUSE_NOTIFY, "Unpausing")
+        };
+        self.send_status(code, desc)
+    }
+
+    /// Emit `onStatus(NetStream.Seek.Notify)` — the §4.2.7 reply to a
+    /// subscriber's `seek` command ("the server sends a status message
+    /// NetStream.Seek.Notify when seek is successful").
+    pub fn notify_seek(&mut self) -> Result<()> {
+        self.send_status(STATUS_SEEK_NOTIFY, "Seeking")
+    }
+
+    /// Emit an arbitrary `onStatus` on the play stream with
+    /// `level = "status"`.
+    pub fn send_status(&mut self, code: &str, description: &str) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_on_status(self.stream_id, "status", code, description),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Emit a `UserControl StreamDry(stream_id)` (§3.7 UCM 2) — "no
+    /// more data on the stream" right now; typically sent when the
+    /// upstream publisher stalls but the session should stay up.
+    pub fn send_stream_dry(&mut self) -> Result<()> {
+        self.writer.write_message(
+            CSID_PROTOCOL_CONTROL,
+            &build_user_control_stream_dry(self.stream_id),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Emit a `UserControl PingRequest(timestamp_ms)` (§3.7 UCM 6) to
+    /// probe subscriber liveness; the peer echoes a `PingResponse`.
+    pub fn send_ping_request(&mut self, timestamp_ms: u32) -> Result<()> {
+        self.writer.write_message(
+            CSID_PROTOCOL_CONTROL,
+            &build_user_control_ping_request(timestamp_ms),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Read the next subscriber-originated event.
+    ///
+    /// Protocol control (Set Chunk Size / Window Ack Size / Set Peer
+    /// Bandwidth / Acknowledgement) and §5.3 ack emission are handled
+    /// internally; a §4.2 NetStream control command or a
+    /// `SetBufferLength` surfaces as a [`PlaySessionEvent`]. Returns
+    /// `Ok(None)` once the subscriber tears the stream down
+    /// (`closeStream` / `deleteStream` per §4.2.3, or TCP EOF) —
+    /// after which the session should be dropped or [`close`](Self::close)d.
+    pub fn next_event(&mut self) -> Result<Option<PlaySessionEvent>> {
+        while !self.ended {
+            if let Some(sub) = self.pending_subs.pop_front() {
+                if let Some(ev) = self.handle_event_message(sub)? {
+                    return Ok(Some(ev));
+                }
+                continue;
+            }
+            let msg = match self.reader.read_message() {
+                Ok(m) => m,
+                Err(Error::Io(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    self.ended = true;
+                    return Ok(None);
+                }
+                Err(Error::UnexpectedEof) => {
+                    self.ended = true;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
+            self.maybe_send_ack()?;
+            if let Some(ev) = self.handle_event_message(msg)? {
+                return Ok(Some(ev));
+            }
+        }
+        Ok(None)
+    }
+
+    fn handle_event_message(&mut self, msg: Message) -> Result<Option<PlaySessionEvent>> {
+        match msg.msg_type_id {
+            MSG_COMMAND_AMF0 => {
+                let values = amf::decode_all(&msg.payload)?;
+                self.classify_command_values(&values)
+            }
+            MSG_COMMAND_AMF3 => {
+                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
+                    .iter()
+                    .map(amf3::Amf3Value::to_amf0)
+                    .collect();
+                self.classify_command_values(&values)
+            }
+            MSG_USER_CONTROL => {
+                match UserControlEvent::parse(&msg.payload)? {
+                    UserControlEvent::SetBufferLength { buffer_ms, .. } => {
+                        Ok(Some(PlaySessionEvent::SetBufferLength { buffer_ms }))
+                    }
+                    UserControlEvent::PingRequest { timestamp_ms } => {
+                        // Answer the liveness probe transparently.
+                        self.writer.write_message(
+                            CSID_PROTOCOL_CONTROL,
+                            &build_user_control_ping_response(timestamp_ms),
+                        )?;
+                        self.writer.flush()?;
+                        Ok(None)
+                    }
+                    _ => Ok(None),
+                }
+            }
+            MSG_SET_CHUNK_SIZE => {
+                let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
+                self.reader.set_chunk_size(size as usize);
+                Ok(None)
+            }
+            MSG_WINDOW_ACK_SIZE => {
+                let size = read_u32_be(&msg.payload)?;
+                self.reader.set_window_ack_size(size);
+                Ok(None)
+            }
+            MSG_SET_PEER_BANDWIDTH => {
+                if msg.payload.len() >= 4 {
+                    let size = read_u32_be(&msg.payload[..4])?;
+                    self.reader.set_window_ack_size(size);
+                }
+                Ok(None)
+            }
+            MSG_AGGREGATE => {
+                let subs = parse_aggregate(&msg)?;
+                self.pending_subs.extend(subs);
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn classify_command_values(
+        &mut self,
+        values: &[Amf0Value],
+    ) -> Result<Option<PlaySessionEvent>> {
+        if let Some(name) = values.first().and_then(Amf0Value::as_str) {
+            if matches!(name, "closeStream" | "deleteStream") {
+                // §4.2.3: "NetStream sends the deleteStream command
+                // when the NetStream object is getting destroyed. …
+                // The server does not send any response."
+                self.ended = true;
+                return Ok(None);
+            }
+        }
+        Ok(NetStreamCommand::parse(values)?.map(PlaySessionEvent::Command))
+    }
+
+    fn maybe_send_ack(&mut self) -> Result<()> {
+        if let Some(seq) = self.reader.ack_due() {
+            self.writer
+                .write_message(CSID_PROTOCOL_CONTROL, &build_ack(seq))?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// End the play stream politely: emit `UserControl
+    /// StreamEOF(stream_id)` — §7.1.7: "the server sends this event to
+    /// notify the client that the playback of data is over as
+    /// requested on this stream" — flush every buffered chunk, and
+    /// half-close the write side so the subscriber drains everything
+    /// before observing EOF.
+    pub fn close(mut self) -> Result<()> {
+        let _ = self.writer.write_message(
+            CSID_PROTOCOL_CONTROL,
+            &build_user_control_stream_eof(self.stream_id),
+        );
+        let _ = self.writer.flush();
+        let _ = self.stream.shutdown(Shutdown::Write);
+        Ok(())
     }
 }
 
@@ -460,7 +991,7 @@ impl RtmpSession {
             &build_on_status(
                 self.stream_id,
                 "status",
-                "NetStream.Unpublish.Success",
+                STATUS_UNPUBLISH_SUCCESS,
                 "Stream closed.",
             ),
         );
@@ -654,14 +1185,14 @@ impl RtmpSession {
 }
 
 // ---------------------------------------------------------------------------
-// Protocol driver: handshake → connect → createStream → publish
+// Protocol driver: handshake → connect → createStream → publish | play
 // ---------------------------------------------------------------------------
 
-fn drive_until_publish(
+fn drive_until_request(
     stream: TcpStream,
     peer_addr: SocketAddr,
     server_caps: &ConnectCapabilities,
-) -> Result<PublishRequest> {
+) -> Result<SessionRequest> {
     // TCP-level defaults: nodelay (RTMP is command-heavy during setup),
     // keepalive so idle publishers are detected.
     let _ = stream.set_nodelay(true);
@@ -760,9 +1291,13 @@ fn drive_until_publish(
         }
     }
 
-    // Handle releaseStream / FCPublish / createStream / publish until
-    // we see publish.
+    // Handle releaseStream / FCPublish / createStream until the peer
+    // announces its direction with publish (§4.2.6) or play (§4.2.1).
     let mut next_stream_id: u32 = 1;
+    // §3.7 SetBufferLength: "this event is sent before the server
+    // starts processing the stream" — capture it so a play consumer
+    // can honour the subscriber's requested buffer depth.
+    let mut buffer_length_ms: Option<u32> = None;
     loop {
         let msg = reader.read_message()?;
         match msg.msg_type_id {
@@ -779,6 +1314,14 @@ fn drive_until_publish(
             MSG_SET_PEER_BANDWIDTH if msg.payload.len() >= 4 => {
                 let size = read_u32_be(&msg.payload[..4])?;
                 reader.set_window_ack_size(size);
+                continue;
+            }
+            MSG_USER_CONTROL => {
+                if let Ok(UserControlEvent::SetBufferLength { buffer_ms, .. }) =
+                    UserControlEvent::parse(&msg.payload)
+                {
+                    buffer_length_ms = Some(buffer_ms);
+                }
                 continue;
             }
             MSG_COMMAND_AMF0 => {
@@ -832,7 +1375,7 @@ fn drive_until_publish(
                             .and_then(Amf0Value::as_str)
                             .unwrap_or("live")
                             .to_owned();
-                        return Ok(PublishRequest {
+                        return Ok(SessionRequest::Publish(PublishRequest {
                             app,
                             stream_name,
                             publish_type,
@@ -846,7 +1389,43 @@ fn drive_until_publish(
                                 stream_id: msg.msg_stream_id.max(1),
                                 publish_tx_id: tx_id,
                             },
-                        });
+                        }));
+                    }
+                    "play" => {
+                        // §4.2.1: [stream_name, start?, duration?,
+                        // reset?] after the Null Command Object.
+                        // NetStreamCommand::parse implements exactly
+                        // that argument table.
+                        let cmd = NetStreamCommand::parse(&values)?;
+                        let Some(NetStreamCommand::Play {
+                            stream_name,
+                            start,
+                            duration,
+                            reset,
+                        }) = cmd
+                        else {
+                            return Err(Error::InvalidCommand(
+                                "`play` did not parse as a NetStream play command".into(),
+                            ));
+                        };
+                        return Ok(SessionRequest::Play(PlayRequest {
+                            app,
+                            stream_name,
+                            start,
+                            duration,
+                            reset,
+                            buffer_length_ms,
+                            peer_addr,
+                            tc_url,
+                            capabilities: client_capabilities,
+                            pending: PendingSession {
+                                stream,
+                                reader,
+                                writer,
+                                stream_id: msg.msg_stream_id.max(1),
+                                publish_tx_id: tx_id,
+                            },
+                        }));
                     }
                     _ => {
                         // Unknown command — keep listening.

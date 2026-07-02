@@ -84,4 +84,7 @@ pub use flv_crypt::{
 };
 pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
 pub use message::{NetStreamCommand, UserControlEvent, RECONNECT_REQUEST_CODE};
-pub use server::{PublishRequest, RtmpServer, RtmpSession, StreamPacket};
+pub use server::{
+    PlayRequest, PlaySession, PlaySessionEvent, PublishRequest, RtmpServer, RtmpSession,
+    SessionRequest, StreamPacket,
+};
