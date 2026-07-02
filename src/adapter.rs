@@ -98,6 +98,7 @@ use crate::flv::{
     AUDIO_FORMAT_PCM_LE, AUDIO_FORMAT_PCM_LE_8BIT, AUDIO_FORMAT_SPEEX, VIDEO_CODEC_AVC,
     VIDEO_CODEC_H263, VIDEO_CODEC_SCREEN, VIDEO_CODEC_SCREEN_V2, VIDEO_CODEC_VP6, VIDEO_CODEC_VP6A,
 };
+use crate::player::{PlayOptions, PlayerPacket, RtmpPlayer};
 use crate::server::{RtmpServer, RtmpSession, StreamPacket};
 
 /// Stream index for the audio output of an [`RtmpPacketSource`].
@@ -136,6 +137,231 @@ struct BufferedPacket {
     /// Kept as a flag to keep [`Packet`] free of out-of-band info.
     #[allow(dead_code)]
     is_audio: bool,
+}
+
+/// Unified media event shared by the two protocol pumps — the
+/// server-side [`RtmpSession`] (accepted publisher) and the
+/// client-side [`RtmpPlayer`] (pulled play stream) both reduce to
+/// this shape for the `PacketSource` bridge.
+enum MediaSourceEvent {
+    Audio {
+        timestamp: u32,
+        tag: AudioTag,
+    },
+    Video {
+        timestamp: u32,
+        tag: VideoTag,
+    },
+    Metadata(Amf0Value),
+    /// Non-media event consumed by the bridge (NetStream control
+    /// command, onStatus, user-control notification, …).
+    Skip,
+    /// Clean end of stream.
+    End,
+}
+
+/// Internal abstraction over "something that yields RTMP media
+/// events" so the probing loop and the steady-state `next_packet`
+/// pump are written once for both directions.
+trait MediaSource {
+    fn next_media(&mut self) -> RtmpResult<MediaSourceEvent>;
+    fn set_timeout(&mut self, d: Option<Duration>);
+}
+
+impl MediaSource for RtmpSession {
+    fn next_media(&mut self) -> RtmpResult<MediaSourceEvent> {
+        Ok(match self.next_packet()? {
+            Some(StreamPacket::Audio { timestamp, tag }) => {
+                MediaSourceEvent::Audio { timestamp, tag }
+            }
+            Some(StreamPacket::Video { timestamp, tag }) => {
+                MediaSourceEvent::Video { timestamp, tag }
+            }
+            Some(StreamPacket::Metadata(value)) => MediaSourceEvent::Metadata(value),
+            // NetStream control commands aren't media packets.
+            Some(StreamPacket::Command(_)) => MediaSourceEvent::Skip,
+            None => MediaSourceEvent::End,
+        })
+    }
+
+    fn set_timeout(&mut self, d: Option<Duration>) {
+        let _ = self.set_read_timeout(d);
+    }
+}
+
+impl MediaSource for RtmpPlayer {
+    fn next_media(&mut self) -> RtmpResult<MediaSourceEvent> {
+        Ok(match self.next_packet()? {
+            Some(PlayerPacket::Audio { timestamp, tag }) => {
+                MediaSourceEvent::Audio { timestamp, tag }
+            }
+            Some(PlayerPacket::Video { timestamp, tag }) => {
+                MediaSourceEvent::Video { timestamp, tag }
+            }
+            Some(PlayerPacket::Metadata(value)) => MediaSourceEvent::Metadata(value),
+            // onStatus / user-control notifications aren't media.
+            Some(PlayerPacket::Status { .. }) | Some(PlayerPacket::Control(_)) => {
+                MediaSourceEvent::Skip
+            }
+            None => MediaSourceEvent::End,
+        })
+    }
+
+    fn set_timeout(&mut self, d: Option<Duration>) {
+        let _ = self.set_read_timeout(d);
+    }
+}
+
+/// Result of the shared probing phase.
+struct ProbeState {
+    streams: Vec<StreamInfo>,
+    metadata: Vec<(String, String)>,
+    buffered: VecDeque<BufferedPacket>,
+    ended: bool,
+}
+
+/// Shared probe loop: read up to [`PROBE_LIMIT`] events, note the
+/// first audio + video codec parameters, and buffer every media
+/// packet for in-order replay. A read timeout bounds each read so a
+/// peer that only ever sends one stream type doesn't stall the
+/// opener; on `WouldBlock` / `TimedOut` we accept whatever was
+/// observed so far.
+fn probe_source<S: MediaSource>(
+    src: &mut S,
+    read_timeout: Option<Duration>,
+) -> RtmpResult<ProbeState> {
+    if read_timeout.is_some() {
+        src.set_timeout(read_timeout);
+    }
+    let mut state = ProbeState {
+        streams: Vec::new(),
+        metadata: Vec::new(),
+        buffered: VecDeque::new(),
+        ended: false,
+    };
+    let mut have_audio = false;
+    let mut have_video = false;
+
+    for _ in 0..PROBE_LIMIT {
+        if have_audio && have_video {
+            break;
+        }
+        let next = match src.next_media() {
+            Ok(ev) => ev,
+            Err(RtmpError::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // No more packets within the deadline — accept
+                // whatever we have and bail out of probing.
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        match next {
+            MediaSourceEvent::Audio { timestamp, tag } => {
+                if !have_audio {
+                    state.streams.push(StreamInfo {
+                        index: AUDIO_STREAM_INDEX,
+                        time_base: RTMP_TIME_BASE,
+                        duration: None,
+                        start_time: None,
+                        params: audio_codec_params(&tag),
+                    });
+                    have_audio = true;
+                }
+                state.buffered.push_back(BufferedPacket {
+                    packet: audio_to_packet(timestamp, &tag),
+                    is_audio: true,
+                });
+            }
+            MediaSourceEvent::Video { timestamp, tag } => {
+                if !have_video {
+                    state.streams.push(StreamInfo {
+                        index: VIDEO_STREAM_INDEX,
+                        time_base: RTMP_TIME_BASE,
+                        duration: None,
+                        start_time: None,
+                        params: video_codec_params(&tag),
+                    });
+                    have_video = true;
+                }
+                state.buffered.push_back(BufferedPacket {
+                    packet: video_to_packet(timestamp, &tag),
+                    is_audio: false,
+                });
+            }
+            MediaSourceEvent::Metadata(value) => {
+                flatten_metadata(&value, &mut state.metadata);
+            }
+            MediaSourceEvent::Skip => {}
+            MediaSourceEvent::End => {
+                state.ended = true;
+                break;
+            }
+        }
+    }
+
+    // Restore blocking mode for the steady-state phase: we want
+    // long-lived peers to block on read, not poll.
+    src.set_timeout(None);
+
+    // Stable order: audio (index 0) before video (index 1).
+    state.streams.sort_by_key(|s| s.index);
+    Ok(state)
+}
+
+/// Shared steady-state pump: read media events until one converts to
+/// a [`Packet`], lazily registering a stream the probe phase never
+/// observed, recording metadata, and latching `ended` on clean EOS.
+fn steady_next<S: MediaSource>(
+    src: &mut S,
+    streams: &mut Vec<StreamInfo>,
+    metadata: &mut Vec<(String, String)>,
+    ended: &mut bool,
+) -> CoreResult<Packet> {
+    loop {
+        let event = src.next_media().map_err(rtmp_to_core_err)?;
+        match event {
+            MediaSourceEvent::Audio { timestamp, tag } => {
+                if streams.iter().all(|s| s.index != AUDIO_STREAM_INDEX) {
+                    streams.push(StreamInfo {
+                        index: AUDIO_STREAM_INDEX,
+                        time_base: RTMP_TIME_BASE,
+                        duration: None,
+                        start_time: None,
+                        params: audio_codec_params(&tag),
+                    });
+                    streams.sort_by_key(|s| s.index);
+                }
+                return Ok(audio_to_packet(timestamp, &tag));
+            }
+            MediaSourceEvent::Video { timestamp, tag } => {
+                if streams.iter().all(|s| s.index != VIDEO_STREAM_INDEX) {
+                    streams.push(StreamInfo {
+                        index: VIDEO_STREAM_INDEX,
+                        time_base: RTMP_TIME_BASE,
+                        duration: None,
+                        start_time: None,
+                        params: video_codec_params(&tag),
+                    });
+                    streams.sort_by_key(|s| s.index);
+                }
+                return Ok(video_to_packet(timestamp, &tag));
+            }
+            MediaSourceEvent::Metadata(value) => {
+                flatten_metadata(&value, metadata);
+                // Loop again — metadata isn't a media packet.
+            }
+            MediaSourceEvent::Skip => {}
+            MediaSourceEvent::End => {
+                *ended = true;
+                return Err(CoreError::Eof);
+            }
+        }
+    }
 }
 
 /// `PacketSource` wrapping an [`RtmpSession`].
@@ -186,99 +412,13 @@ impl RtmpPacketSource {
         mut session: RtmpSession,
         read_timeout: Option<Duration>,
     ) -> RtmpResult<Self> {
-        if let Some(d) = read_timeout {
-            // Best-effort — failure here is informational, not fatal.
-            let _ = session.set_read_timeout(Some(d));
-        }
-        let mut streams: Vec<StreamInfo> = Vec::new();
-        let mut metadata: Vec<(String, String)> = Vec::new();
-        let mut buffered: VecDeque<BufferedPacket> = VecDeque::new();
-        let mut have_audio = false;
-        let mut have_video = false;
-        let mut ended = false;
-
-        for _ in 0..PROBE_LIMIT {
-            if have_audio && have_video {
-                break;
-            }
-            let next = match session.next_packet() {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    ended = true;
-                    break;
-                }
-                Err(RtmpError::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    // No more packets within the deadline — accept
-                    // whatever we have and bail out of probing.
-                    break;
-                }
-                Err(e) => return Err(e),
-            };
-            match next {
-                StreamPacket::Audio { timestamp, tag } => {
-                    if !have_audio {
-                        let params = audio_codec_params(&tag);
-                        streams.push(StreamInfo {
-                            index: AUDIO_STREAM_INDEX,
-                            time_base: RTMP_TIME_BASE,
-                            duration: None,
-                            start_time: None,
-                            params,
-                        });
-                        have_audio = true;
-                    }
-                    let pkt = audio_to_packet(timestamp, &tag);
-                    buffered.push_back(BufferedPacket {
-                        packet: pkt,
-                        is_audio: true,
-                    });
-                }
-                StreamPacket::Video { timestamp, tag } => {
-                    if !have_video {
-                        let params = video_codec_params(&tag);
-                        streams.push(StreamInfo {
-                            index: VIDEO_STREAM_INDEX,
-                            time_base: RTMP_TIME_BASE,
-                            duration: None,
-                            start_time: None,
-                            params,
-                        });
-                        have_video = true;
-                    }
-                    let pkt = video_to_packet(timestamp, &tag);
-                    buffered.push_back(BufferedPacket {
-                        packet: pkt,
-                        is_audio: false,
-                    });
-                }
-                StreamPacket::Metadata(value) => {
-                    flatten_metadata(&value, &mut metadata);
-                }
-                // NetStream control commands (play / pause / seek /
-                // receiveAudio / receiveVideo) aren't media packets; the
-                // PacketSource bridge ignores them.
-                StreamPacket::Command(_) => {}
-            }
-        }
-
-        // Restore blocking mode for the steady-state phase: we
-        // want long-lived publishers to block on read, not poll.
-        let _ = session.set_read_timeout(None);
-
-        // Stable order: audio (index 0) before video (index 1).
-        streams.sort_by_key(|s| s.index);
-
+        let state = probe_source(&mut session, read_timeout)?;
         Ok(Self {
             session,
-            streams,
-            metadata,
-            buffered,
-            ended,
+            streams: state.streams,
+            metadata: state.metadata,
+            buffered: state.buffered,
+            ended: state.ended,
         })
     }
 
@@ -303,52 +443,12 @@ impl PacketSource for RtmpPacketSource {
         if self.ended {
             return Err(CoreError::Eof);
         }
-        loop {
-            let event = self.session.next_packet().map_err(rtmp_to_core_err)?;
-            match event {
-                Some(StreamPacket::Audio { timestamp, tag }) => {
-                    if self.streams.iter().all(|s| s.index != AUDIO_STREAM_INDEX) {
-                        let params = audio_codec_params(&tag);
-                        self.streams.push(StreamInfo {
-                            index: AUDIO_STREAM_INDEX,
-                            time_base: RTMP_TIME_BASE,
-                            duration: None,
-                            start_time: None,
-                            params,
-                        });
-                        self.streams.sort_by_key(|s| s.index);
-                    }
-                    return Ok(audio_to_packet(timestamp, &tag));
-                }
-                Some(StreamPacket::Video { timestamp, tag }) => {
-                    if self.streams.iter().all(|s| s.index != VIDEO_STREAM_INDEX) {
-                        let params = video_codec_params(&tag);
-                        self.streams.push(StreamInfo {
-                            index: VIDEO_STREAM_INDEX,
-                            time_base: RTMP_TIME_BASE,
-                            duration: None,
-                            start_time: None,
-                            params,
-                        });
-                        self.streams.sort_by_key(|s| s.index);
-                    }
-                    return Ok(video_to_packet(timestamp, &tag));
-                }
-                Some(StreamPacket::Metadata(value)) => {
-                    flatten_metadata(&value, &mut self.metadata);
-                    // Loop again — metadata isn't a media packet.
-                    continue;
-                }
-                Some(StreamPacket::Command(_)) => {
-                    // NetStream control command — not a media packet.
-                    continue;
-                }
-                None => {
-                    self.ended = true;
-                    return Err(CoreError::Eof);
-                }
-            }
-        }
+        steady_next(
+            &mut self.session,
+            &mut self.streams,
+            &mut self.metadata,
+            &mut self.ended,
+        )
     }
 
     fn metadata(&self) -> &[(String, String)] {
@@ -357,6 +457,99 @@ impl PacketSource for RtmpPacketSource {
 
     fn duration_micros(&self) -> Option<i64> {
         // Live RTMP push has no a-priori duration.
+        None
+    }
+}
+
+/// `PacketSource` wrapping an [`RtmpPlayer`] — the pull (subscribe)
+/// counterpart of [`RtmpPacketSource`].
+///
+/// Constructed by [`open_rtmp_play`] (the `rtmp-play://` registry
+/// opener) or directly from a connected player via
+/// [`RtmpPlayerPacketSource::from_player`] /
+/// [`from_player_with_probe`](Self::from_player_with_probe). Stream
+/// layout, time base, and timestamp folding match
+/// [`RtmpPacketSource`] exactly — a downstream consumer cannot tell
+/// whether the packets were pushed by a publisher or pulled from a
+/// remote server.
+pub struct RtmpPlayerPacketSource {
+    player: RtmpPlayer,
+    streams: Vec<StreamInfo>,
+    metadata: Vec<(String, String)>,
+    buffered: VecDeque<BufferedPacket>,
+    /// True when the server ended playback (`UserControl StreamEOF`
+    /// per §7.1.7, or TCP EOF). After this `next_packet` keeps
+    /// returning [`CoreError::Eof`].
+    ended: bool,
+}
+
+impl RtmpPlayerPacketSource {
+    /// Wrap a connected [`RtmpPlayer`] without probing — `streams()`
+    /// stays empty until the first audio / video packet flows.
+    pub fn from_player(player: RtmpPlayer) -> Self {
+        Self {
+            player,
+            streams: Vec::new(),
+            metadata: Vec::new(),
+            buffered: VecDeque::new(),
+            ended: false,
+        }
+    }
+
+    /// Wrap a player and probe now: read up to [`PROBE_LIMIT`]
+    /// packets, populate `streams()` with the observed audio + video
+    /// codec ids, and buffer those packets for later
+    /// [`next_packet`](PacketSource::next_packet) calls. Semantics
+    /// mirror [`RtmpPacketSource::from_session_with_probe`].
+    pub fn from_player_with_probe(
+        mut player: RtmpPlayer,
+        read_timeout: Option<Duration>,
+    ) -> RtmpResult<Self> {
+        let state = probe_source(&mut player, read_timeout)?;
+        Ok(Self {
+            player,
+            streams: state.streams,
+            metadata: state.metadata,
+            buffered: state.buffered,
+            ended: state.ended,
+        })
+    }
+
+    /// Borrow the wrapped player for inspection (`stream_id`,
+    /// `is_recorded`, `server_capabilities`, …).
+    pub fn player(&self) -> &RtmpPlayer {
+        &self.player
+    }
+}
+
+impl PacketSource for RtmpPlayerPacketSource {
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn next_packet(&mut self) -> CoreResult<Packet> {
+        if let Some(buf) = self.buffered.pop_front() {
+            return Ok(buf.packet);
+        }
+        if self.ended {
+            return Err(CoreError::Eof);
+        }
+        steady_next(
+            &mut self.player,
+            &mut self.streams,
+            &mut self.metadata,
+            &mut self.ended,
+        )
+    }
+
+    fn metadata(&self) -> &[(String, String)] {
+        &self.metadata
+    }
+
+    fn duration_micros(&self) -> Option<i64> {
+        // A pulled RTMP stream reports no a-priori duration either
+        // (a recorded stream's duration arrives via onMetaData,
+        // surfaced through `metadata()` as a flat string).
         None
     }
 }
@@ -801,14 +994,44 @@ pub fn open_rtmp(uri: &str) -> CoreResult<Box<dyn PacketSource>> {
     Ok(Box::new(source))
 }
 
-/// Install the `rtmp://` scheme on the given [`SourceRegistry`].
-/// Every URL of the form `rtmp://host:port/app/stream-name` opens
-/// a one-shot listener that accepts a single publisher and feeds
-/// its packets through the registry's [`PacketSource`] dispatch.
+/// `SourceRegistry` opener for the `rtmp-play://` scheme — the
+/// **pull** direction.
 ///
-/// Idempotent: re-registering replaces the prior opener.
+/// Where [`open_rtmp`] listens for an incoming publisher,
+/// `open_rtmp_play` dials the named remote server as a §4.2.1 play
+/// client (`rtmp-play://host[:port]/app/stream-name` →
+/// `rtmp://host[:port]/app/stream-name` on the wire), waits for
+/// `onStatus(NetStream.Play.Start)`, probes the stream shape, and
+/// returns the same two-stream [`PacketSource`] layout as the listen
+/// flow. The distinct scheme keeps the two opposite network roles —
+/// bind-and-accept vs. connect-and-request — unambiguous at the URI
+/// level.
+pub fn open_rtmp_play(uri: &str) -> CoreResult<Box<dyn PacketSource>> {
+    let rest = uri
+        .strip_prefix("rtmp-play://")
+        .ok_or_else(|| CoreError::InvalidData(format!("not an rtmp-play:// URL: {uri}")))?;
+    let dial = format!("rtmp://{rest}");
+    let player = RtmpPlayer::connect_with_options(&dial, &PlayOptions::default())
+        .map_err(rtmp_to_core_err)?;
+    let source = RtmpPlayerPacketSource::from_player_with_probe(player, Some(PROBE_READ_TIMEOUT))
+        .map_err(rtmp_to_core_err)?;
+    Ok(Box::new(source))
+}
+
+/// Install the `rtmp://` (listen / accept-a-publisher) and
+/// `rtmp-play://` (dial / pull-a-stream) schemes on the given
+/// [`SourceRegistry`].
+///
+/// * `rtmp://host:port/app/stream-name` — one-shot listener that
+///   accepts a single publisher ([`open_rtmp`]).
+/// * `rtmp-play://host:port/app/stream-name` — §4.2.1 play client
+///   that pulls the named stream from a remote server
+///   ([`open_rtmp_play`]).
+///
+/// Idempotent: re-registering replaces the prior openers.
 pub fn register(registry: &mut SourceRegistry) {
     registry.register_packets("rtmp", open_rtmp);
+    registry.register_packets("rtmp-play", open_rtmp_play);
 }
 
 // Suppress dead_code on the BytesSource re-export — it's needed
