@@ -1447,7 +1447,7 @@ fn drive_until_request(
 /// some clients omit the leading `@setDataFrame` and send just
 /// `["onMetaData", <meta>]`. Either way the payload object is the last
 /// Object / ECMA-array value in the list, so search from the back.
-fn metadata_object(values: &[Amf0Value]) -> Option<Amf0Value> {
+pub(crate) fn metadata_object(values: &[Amf0Value]) -> Option<Amf0Value> {
     values
         .iter()
         .rev()

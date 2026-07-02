@@ -55,6 +55,7 @@ pub mod flv_crypt;
 pub mod flv_file;
 pub mod handshake;
 pub mod message;
+pub mod player;
 pub mod server;
 
 pub use adapter::{
@@ -84,6 +85,7 @@ pub use flv_crypt::{
 };
 pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
 pub use message::{NetStreamCommand, UserControlEvent, RECONNECT_REQUEST_CODE};
+pub use player::{PlayOptions, PlayerPacket, RtmpPlayer};
 pub use server::{
     PlayRequest, PlaySession, PlaySessionEvent, PublishRequest, RtmpServer, RtmpSession,
     SessionRequest, StreamPacket,

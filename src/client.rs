@@ -132,8 +132,8 @@ pub enum ClientEvent {
     Other,
 }
 
-const CLIENT_CHUNK_SIZE: u32 = 4096;
-const FLASH_VER: &str = "FMLE/3.0 (compatible; oxideav-rtmp)";
+pub(crate) const CLIENT_CHUNK_SIZE: u32 = 4096;
+pub(crate) const FLASH_VER: &str = "FMLE/3.0 (compatible; oxideav-rtmp)";
 
 pub struct RtmpClient {
     stream: TcpStream,
@@ -922,7 +922,7 @@ impl RtmpClient {
 /// Consume messages from `reader` until we see a command named
 /// `_result` for `expected_tx`. Forward relevant protocol-control
 /// updates (SetChunkSize) to the reader.
-fn wait_for_result<R: Read, W: Write>(
+pub(crate) fn wait_for_result<R: Read, W: Write>(
     reader: &mut ChunkReader<R>,
     _writer: &mut ChunkWriter<W>,
     expected_tx: f64,
@@ -967,7 +967,7 @@ fn wait_for_result<R: Read, W: Write>(
     }
 }
 
-fn wait_for_create_stream_result<R: Read, W: Write>(
+pub(crate) fn wait_for_create_stream_result<R: Read, W: Write>(
     reader: &mut ChunkReader<R>,
     writer: &mut ChunkWriter<W>,
     expected_tx: f64,
@@ -1024,7 +1024,7 @@ fn wait_for_publish_start<R: Read, W: Write>(
     Ok(())
 }
 
-fn read_u32_be(buf: &[u8]) -> Result<u32> {
+pub(crate) fn read_u32_be(buf: &[u8]) -> Result<u32> {
     if buf.len() < 4 {
         return Err(Error::ProtocolViolation("need 4 bytes for u32be".into()));
     }
@@ -1049,7 +1049,7 @@ fn read_u32_be(buf: &[u8]) -> Result<u32> {
 /// `NetConnection.Connect.Success` shape, so picking that up would make
 /// every legacy server look like a v2 advertisement. A fully-legacy
 /// server therefore returns the empty capability block.
-fn extract_server_caps(values: &[Amf0Value]) -> ConnectCapabilities {
+pub(crate) fn extract_server_caps(values: &[Amf0Value]) -> ConnectCapabilities {
     for v in values {
         if matches!(v, Amf0Value::Object(_) | Amf0Value::EcmaArray(_)) {
             let caps = ConnectCapabilities::from_amf0(v);
