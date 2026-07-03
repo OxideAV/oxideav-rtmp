@@ -23,7 +23,12 @@ fn publisher_to_subscriber_relay_preserves_stream() {
     let addr = server.local_addr().expect("local_addr");
 
     // Relay thread: accept the publisher first, then the subscriber,
-    // then pump every publisher packet into the play session.
+    // then pump every publisher packet into the play session. Once all
+    // 7 expected packets have been forwarded, signal the main thread —
+    // the publisher must not close (and drop its socket) until the
+    // ingest has drained everything, or the close-time RST can discard
+    // the server's still-unread receive queue on some platforms.
+    let (drained_tx, drained_rx) = std::sync::mpsc::channel::<()>();
     let relay_thread = thread::spawn(move || {
         let mut publish = match server.accept_any().expect("accept publisher") {
             SessionRequest::Publish(req) => {
@@ -51,6 +56,11 @@ fn publisher_to_subscriber_relay_preserves_stream() {
             play.forward(&pkt).expect("forward");
             if !matches!(pkt, StreamPacket::Command(_)) {
                 forwarded += 1;
+                if forwarded == 7 {
+                    // Everything the publisher pushed has been read off
+                    // the ingest socket — it is now safe to close.
+                    let _ = drained_tx.send(());
+                }
             }
         }
         play.close().expect("close play");
@@ -89,8 +99,12 @@ fn publisher_to_subscriber_relay_preserves_stream() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("player timeout");
 
-    // Now finish the publish; the relay forwards everything and then
-    // closes the play session.
+    // Wait until the relay has drained all 7 packets off the ingest
+    // socket, then finish the publish; the relay observes the clean
+    // teardown and closes the play session.
+    drained_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("relay must drain the published packets");
     publisher.close().expect("close publisher");
 
     let mut metadata = None;
