@@ -1,5 +1,7 @@
 # oxideav-rtmp
 
+[![CI](https://github.com/OxideAV/oxideav-rtmp/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-rtmp/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-rtmp.svg)](https://crates.io/crates/oxideav-rtmp) [![docs.rs](https://docs.rs/oxideav-rtmp/badge.svg)](https://docs.rs/oxideav-rtmp) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **RTMP** for the
 [`oxideav`](https://github.com/OxideAV/oxideav) framework — all four
 network roles: accept an incoming publisher (ingest), push your own
