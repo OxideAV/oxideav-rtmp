@@ -1,4 +1,4 @@
-//! Pure-Rust RTMP for oxideav — ingest + push.
+//! Pure-Rust RTMP for oxideav — ingest, push, serve, and pull.
 //!
 //! This crate lets callers:
 //!
@@ -16,6 +16,22 @@
 //!   URL, run the client-side publish handshake, then call
 //!   `send_video` / `send_audio` / `send_metadata` with H.264 /
 //!   AAC payloads.
+//!
+//! * **Serve** subscribers (RTMP 1.0 §4.2.1 `play`).
+//!   [`RtmpServer::accept_any`] classifies each connection as a
+//!   [`SessionRequest::Publish`] or [`SessionRequest::Play`]; an
+//!   accepted [`PlayRequest`] becomes a [`PlaySession`] the caller
+//!   feeds with `send_audio` / `send_video` / `send_metadata` (or a
+//!   whole-packet [`PlaySession::forward`] relay), while
+//!   [`PlaySession::next_event`] surfaces the subscriber's §4.2
+//!   pause / seek / receiveAudio / receiveVideo commands.
+//!
+//! * **Pull** (subscribe to) a remote stream ([`RtmpPlayer`]). Dial
+//!   an `rtmp://host[:port]/app/stream_name` URL, run the §4.2.1
+//!   play handshake, then pump [`RtmpPlayer::next_packet`] for
+//!   audio / video / metadata / status events; `pause` / `resume` /
+//!   `seek` / dynamic-playlist `play` / `play2` drive the §4.2
+//!   control surface.
 //!
 //! The protocol pieces are reusable on their own —
 //! [`amf`], [`chunk`], [`flv`], [`message`], [`handshake`] — for
@@ -37,8 +53,6 @@
 //!
 //! * RTMPS (TLS). Consumers who need it can wrap our `Read + Write`
 //!   with rustls. We may add an `rtmps` feature later.
-//! * RTMP play (downstream subscriber / upstream pull). Only publish
-//!   direction is implemented.
 //! * Shared objects, RTMFP, RTMP Encrypted, and the Adobe
 //!   digest-verified handshake variant.
 

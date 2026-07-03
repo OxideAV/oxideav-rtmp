@@ -1,10 +1,11 @@
 # oxideav-rtmp
 
 Pure-Rust **RTMP** for the
-[`oxideav`](https://github.com/OxideAV/oxideav) framework — accept an
-incoming publisher (server / source) or push your own stream to a
-remote RTMP server (client / sink). Zero external dependencies,
-blocking-thread-per-connection.
+[`oxideav`](https://github.com/OxideAV/oxideav) framework — all four
+network roles: accept an incoming publisher (ingest), push your own
+stream to a remote server (publish client), serve subscribers
+(§4.2.1 `play`), and pull a remote stream (play client). Zero
+external dependencies, blocking-thread-per-connection.
 
 ## Server (accept a publisher)
 
@@ -42,6 +43,68 @@ server.serve(|req| {
 })?;
 ```
 
+## Server (serve subscribers / relay)
+
+The same listener accepts both directions —
+`RtmpServer::accept_any` classifies each connection by the command
+the peer issues after `createStream` (`publish` or `play`):
+
+```rust
+use oxideav_rtmp::{RtmpServer, SessionRequest};
+
+let server = RtmpServer::bind("0.0.0.0:1935")?;
+match server.accept_any()? {
+    SessionRequest::Publish(req) => { /* ingest as before */ }
+    SessionRequest::Play(req) => {
+        // §4.2.1 play: stream_name + optional Start/Duration/Reset
+        // (and any §3.7 SetBufferLength sent ahead of the play).
+        let mut session = req.accept()?;   // StreamBegin → Play.Reset? → Play.Start
+        session.send_metadata(&meta)?;
+        session.send_video(ts, &video_tag)?;
+        session.send_audio(ts, &audio_tag)?;
+        // …or relay a whole publisher packet: session.forward(&pkt)?
+        // Subscriber commands (pause / seek / receiveAudio /
+        // receiveVideo / playlist play / play2) surface as events:
+        while let Some(ev) = session.next_event()? { /* … */ }
+        session.close()?;                  // UserControl StreamEOF
+    }
+}
+```
+
+`accept_recorded()` announces `StreamIsRecorded` first (recorded /
+seekable content); `reject()` refuses with
+`NetStream.Play.StreamNotFound`. `notify_pause` / `notify_seek` emit
+the §4.2.7 / §4.2.8 status replies. `serve_sessions` is the
+thread-per-connection loop over both directions; the publish-only
+`accept` / `serve` politely refuse play connections.
+
+## Client (pull / play a remote stream)
+
+```rust
+use oxideav_rtmp::{RtmpPlayer, PlayerPacket};
+
+let mut player = RtmpPlayer::connect("rtmp://origin.example.com/vod/clip")?;
+while let Some(pkt) = player.next_packet()? {
+    match pkt {
+        PlayerPacket::Video { timestamp, tag } => { /* coded frames */ }
+        PlayerPacket::Audio { timestamp, tag } => { /* coded frames */ }
+        PlayerPacket::Metadata(meta)           => { /* onMetaData */ }
+        PlayerPacket::Status { code, .. }      => { /* NetStream.* */ }
+        PlayerPacket::Control(_)               => { /* UCM events */ }
+    }
+}
+player.close()?; // deleteStream
+```
+
+`connect_with_options` exposes the §4.2.1 Start / Duration / Reset
+arguments, a pre-play §3.7 `SetBufferLength`, and the Enhanced-RTMP
+capability block. Mid-stream: `pause(ms)` / `resume(ms)` (§4.2.8),
+`seek(ms)` (§4.2.7), `set_receive_audio` / `set_receive_video`
+(§4.2.4 / §4.2.5), dynamic-playlist `play(name, …)` (§4.2.1) and
+`play2(params)` (§4.2.2). `Ok(None)` marks the server's
+`StreamEOF`; a refused play surfaces as `Error::Rejected` carrying
+`NetStream.Play.StreamNotFound`.
+
 ## Client (push to a remote RTMP server)
 
 ```rust
@@ -64,9 +127,17 @@ client.close()?;
 
 - **Transport.** RTMP (`rtmp://`, plain TCP port 1935). No RTMPS yet —
   wrap our `Read + Write` with rustls if you need it.
-- **Direction.** Publish only: the server accepts incoming publishers;
-  the client pushes to remote servers. RTMP play (subscribe / pull) is
-  a follow-up.
+- **Direction.** Both. Publish: the server accepts incoming
+  publishers (`RtmpSession`) and the client pushes to remote servers
+  (`RtmpClient`). Play (RTMP 1.0 §4.2.1): the server serves
+  subscribers (`PlaySession` — §4.2.1 Figure 5 acceptance sequence,
+  typed pause / seek / receiveAudio / receiveVideo / playlist-play /
+  play2 events, §4.2.7 / §4.2.8 notify replies) and the client pulls
+  remote streams (`RtmpPlayer`, full §4.2 control surface). A
+  publisher → subscriber relay is one `session.forward(&pkt)` per
+  ingested packet. Graceful teardown on every path drains the socket
+  until the peer's FIN (bounded) so the close-time RST can never
+  discard in-flight final frames.
 - **AMF0 + AMF3 command flow.** The AMF0 codec covers every
   serializable marker from the spec — Number, Boolean, String, Object,
   Null, Undefined, Reference (`0x07`), ECMA array, strict array, Date,
@@ -235,6 +306,10 @@ oxideav_rtmp::register(&mut reg);
 // accepts a single publisher and surfaces it as a PacketSource
 // (audio = stream 0, video = stream 1, both time_base 1/1_000_000_000).
 let _src = reg.open("rtmp://0.0.0.0:1935/live/secret-key")?;
+// `rtmp-play://host:port/app/stream-name` is the pull direction:
+// dial the named remote server as a §4.2.1 play client and surface
+// the received stream through the identical PacketSource layout.
+let _pulled = reg.open("rtmp-play://origin.example.com:1935/vod/clip")?;
 ```
 
 Codec ids are auto-detected from the publisher's first audio + video
@@ -291,7 +366,10 @@ non-standard:
   spec leaves undefined — so the envelope is parsed but the body is
   preserved verbatim.
 - `message::build_*` — builders for every protocol-control / command
-  message we emit.
+  message we emit, plus the §4.2 `NetStream.*` onStatus code-string
+  constants (`STATUS_PLAY_START`, `STATUS_PAUSE_NOTIFY`, …) and
+  `build_on_meta_data` (the server→subscriber data-message shape,
+  without the publish-side `@setDataFrame` prefix).
 - `message::UserControlEvent` — typed view of a User Control Message
   body (§3.7 / §7.1.7). `parse(payload)` classifies the seven
   spec-defined variants or `Unknown` for reserved / future types;
