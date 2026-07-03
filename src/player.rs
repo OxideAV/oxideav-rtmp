@@ -426,6 +426,48 @@ impl RtmpPlayer {
         self.send_netstream(&NetStreamCommand::ReceiveVideo(flag))
     }
 
+    /// Issue a further §4.2.1 `play` on the same NetStream — the
+    /// spec's dynamic-playlist mechanism: "a playlist can also be
+    /// created using this command multiple times. If you want to
+    /// create a dynamic playlist that switches among different live
+    /// or recorded streams, call play more than once and pass false
+    /// for reset each time. Conversely, if you want to play the
+    /// specified stream immediately, clearing any other streams that
+    /// are queued for play, pass true for reset."
+    ///
+    /// Unlike the connect-time play this does not block waiting for a
+    /// status reply; the server's `NetStream.Play.*` notifications
+    /// surface through [`next_packet`](Self::next_packet) as
+    /// [`PlayerPacket::Status`]. The player's
+    /// [`stream_name`](Self::stream_name) is updated to the new name.
+    pub fn play(
+        &mut self,
+        stream_name: &str,
+        start: Option<f64>,
+        duration: Option<f64>,
+        reset: Option<bool>,
+    ) -> Result<()> {
+        self.send_netstream(&NetStreamCommand::Play {
+            stream_name: stream_name.to_owned(),
+            start,
+            duration,
+            reset,
+        })?;
+        self.stream_name = stream_name.to_owned();
+        Ok(())
+    }
+
+    /// §4.2.2 `play2` — "unlike the play command, play2 can switch to
+    /// a different bit rate stream without changing the timeline of
+    /// the content played." The single AMF parameter object is passed
+    /// through verbatim (typically carrying `streamName`, `start`,
+    /// `len`, `offset`, and `transition` properties); the server's
+    /// status replies surface through
+    /// [`next_packet`](Self::next_packet).
+    pub fn play2(&mut self, params: Amf0Value) -> Result<()> {
+        self.send_netstream(&NetStreamCommand::Play2(params))
+    }
+
     /// §3.7 `SetBufferLength` — (re-)announce the buffer depth in
     /// milliseconds this client keeps filled for the play stream. May
     /// be sent again mid-stream (e.g. after a pause).
@@ -467,6 +509,13 @@ impl RtmpPlayer {
         );
         let _ = self.writer.flush();
         let _ = self.stream.shutdown(Shutdown::Write);
+        // Drain the read half until the peer's FIN before `self` drops:
+        // if the peer's final messages (status replies, acks, mirrored
+        // teardown commands) were still unread when the descriptor
+        // closed, the kernel would answer them with an RST — and an
+        // RST may discard everything the peer has not yet read,
+        // including the goodbye flushed above.
+        crate::netutil::drain_until_fin(&self.stream, crate::netutil::DRAIN_BUDGET);
         Ok(())
     }
 

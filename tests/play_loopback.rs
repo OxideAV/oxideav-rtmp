@@ -19,7 +19,8 @@ use oxideav_rtmp::flv::{
     VIDEO_FRAME_KEYFRAME,
 };
 use oxideav_rtmp::message::{
-    NetStreamCommand, STATUS_PAUSE_NOTIFY, STATUS_SEEK_NOTIFY, STATUS_UNPAUSE_NOTIFY,
+    NetStreamCommand, STATUS_PAUSE_NOTIFY, STATUS_PLAY_START, STATUS_SEEK_NOTIFY,
+    STATUS_UNPAUSE_NOTIFY,
 };
 use oxideav_rtmp::{
     Amf0Value, Error, PlayOptions, PlaySessionEvent, PlayerPacket, RtmpPlayer, RtmpServer,
@@ -327,5 +328,103 @@ fn player_close_ends_server_session_via_delete_stream() {
 
     let ended_clean = rx.recv_timeout(Duration::from_secs(5)).expect("recv");
     assert!(ended_clean, "deleteStream must end the play session");
+    server_thread.join().expect("server thread");
+}
+
+/// §4.2.1 dynamic playlists + §4.2.2 play2: a mid-session `play`
+/// (reset = false) and a `play2` bitrate switch both surface
+/// server-side as typed commands with their arguments intact, and the
+/// server's `NetStream.Play.Start` for the queued entry reaches the
+/// player as a status event.
+#[test]
+fn player_playlist_switch_and_play2_round_trip() {
+    let server = RtmpServer::bind("127.0.0.1:0").expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+
+    let server_thread = thread::spawn(move || {
+        let req = match server.accept_any().expect("accept_any") {
+            SessionRequest::Play(req) => req,
+            SessionRequest::Publish(_) => panic!("expected play"),
+        };
+        assert_eq!(req.stream_name, "clip-1");
+        let mut session = req.accept().expect("accept");
+        session
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set_read_timeout");
+
+        // Playlist continuation: play("clip-2", reset = false).
+        match session.next_event().expect("event 1") {
+            Some(PlaySessionEvent::Command(NetStreamCommand::Play {
+                stream_name,
+                start,
+                duration,
+                reset,
+            })) => {
+                assert_eq!(stream_name, "clip-2");
+                // Omitted optionals materialise at spec defaults on
+                // the wire because `reset` forces the positions.
+                assert_eq!(start, Some(-2.0));
+                assert_eq!(duration, Some(-1.0));
+                assert_eq!(reset, Some(false));
+            }
+            other => panic!("expected play command, got {other:?}"),
+        }
+        session
+            .send_status(STATUS_PLAY_START, "Started playing clip-2")
+            .expect("Play.Start for clip-2");
+
+        // §4.2.2 play2 with the parameter object preserved verbatim.
+        match session.next_event().expect("event 2") {
+            Some(PlaySessionEvent::Command(NetStreamCommand::Play2(params))) => {
+                assert_eq!(
+                    params.get("streamName").and_then(Amf0Value::as_str),
+                    Some("clip-2-hi")
+                );
+                assert_eq!(
+                    params.get("transition").and_then(Amf0Value::as_str),
+                    Some("switch")
+                );
+                assert_eq!(params.get("start").and_then(Amf0Value::as_f64), Some(0.0));
+            }
+            other => panic!("expected play2 command, got {other:?}"),
+        }
+
+        session.close().expect("close");
+    });
+
+    let url = format!("rtmp://{addr}/vod/clip-1");
+    let mut player = RtmpPlayer::connect(&url).expect("connect play");
+    player
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set_read_timeout");
+
+    player
+        .play("clip-2", None, None, Some(false))
+        .expect("playlist play");
+    assert_eq!(player.stream_name(), "clip-2");
+    // The server's Play.Start for the queued entry surfaces as Status.
+    loop {
+        match player.next_packet().expect("next_packet") {
+            Some(PlayerPacket::Status { code, .. }) => {
+                assert_eq!(code, "NetStream.Play.Start");
+                break;
+            }
+            Some(_) => continue,
+            None => panic!("stream ended before Play.Start for clip-2"),
+        }
+    }
+
+    let params = Amf0Value::Object(vec![
+        ("len".into(), Amf0Value::Number(-1.0)),
+        ("offset".into(), Amf0Value::Number(0.0)),
+        ("start".into(), Amf0Value::Number(0.0)),
+        ("streamName".into(), Amf0Value::String("clip-2-hi".into())),
+        ("transition".into(), Amf0Value::String("switch".into())),
+    ]);
+    player.play2(params).expect("play2");
+
+    // Server closes with StreamEOF once satisfied.
+    assert!(player.next_packet().expect("final").is_none());
+    player.close().expect("close player");
     server_thread.join().expect("server thread");
 }
