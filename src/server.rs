@@ -611,6 +611,34 @@ impl PlaySession {
         self.send_status(STATUS_SEEK_NOTIFY, "Seeking")
     }
 
+    /// Emit the §4.2.4 / §4.2.5 reply to a `receiveAudio(true)` /
+    /// `receiveVideo(true)` command. Per spec, "the server does not
+    /// send any response, if the [receiveAudio / receiveVideo] command
+    /// is sent with the bool flag set as false. If this flag is set to
+    /// true, server responds with status messages NetStream.Seek.Notify
+    /// and NetStream.Play.Start" — this helper sends exactly those two
+    /// statuses, in that order. Call after honouring a
+    /// [`NetStreamCommand::ReceiveAudio`] /
+    /// [`NetStreamCommand::ReceiveVideo`] event carrying `true`; do
+    /// not reply to the `false` form.
+    pub fn notify_receive_resumed(&mut self) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_on_status(self.stream_id, "status", STATUS_SEEK_NOTIFY, "Seeking"),
+        )?;
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_on_status(
+                self.stream_id,
+                "status",
+                STATUS_PLAY_START,
+                &format!("Started playing {}", self.stream_name),
+            ),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Emit an arbitrary `onStatus` on the play stream with
     /// `level = "status"`.
     pub fn send_status(&mut self, code: &str, description: &str) -> Result<()> {

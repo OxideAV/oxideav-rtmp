@@ -230,6 +230,16 @@ fn player_pause_seek_resume_round_trip() {
             other => panic!("expected SetBufferLength, got {other:?}"),
         }
 
+        // receiveAudio(true): §4.2.4 mandates the two-status reply
+        // (Seek.Notify then Play.Start) — notify_receive_resumed.
+        match session.next_event().expect("event 7") {
+            Some(PlaySessionEvent::Command(NetStreamCommand::ReceiveAudio(true))) => {}
+            other => panic!("expected receiveAudio(true), got {other:?}"),
+        }
+        session
+            .notify_receive_resumed()
+            .expect("notify receive resumed");
+
         session.close().expect("close");
     });
 
@@ -261,6 +271,13 @@ fn player_pause_seek_resume_round_trip() {
     player.set_receive_audio(false).expect("receiveAudio");
     player.set_receive_video(false).expect("receiveVideo");
     player.set_buffer_length(7000).expect("set_buffer_length");
+
+    // receiveAudio(true) → §4.2.4: "server responds with status
+    // messages NetStream.Seek.Notify and NetStream.Play.Start", in
+    // that order.
+    player.set_receive_audio(true).expect("receiveAudio true");
+    expect_status(&mut player, STATUS_SEEK_NOTIFY);
+    expect_status(&mut player, STATUS_PLAY_START);
 
     // Server closes with StreamEOF → clean end.
     assert!(player.next_packet().expect("final").is_none());
