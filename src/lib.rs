@@ -55,6 +55,7 @@ pub mod flv_crypt;
 pub mod flv_file;
 pub mod handshake;
 pub mod message;
+mod netutil;
 pub mod player;
 pub mod server;
 

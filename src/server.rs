@@ -781,6 +781,13 @@ impl PlaySession {
         );
         let _ = self.writer.flush();
         let _ = self.stream.shutdown(Shutdown::Write);
+        // Drain the read half until the peer's FIN before `self` drops:
+        // if the peer's final messages (status replies, acks, mirrored
+        // teardown commands) were still unread when the descriptor
+        // closed, the kernel would answer them with an RST — and an
+        // RST may discard everything the peer has not yet read,
+        // including the goodbye flushed above.
+        crate::netutil::drain_until_fin(&self.stream, crate::netutil::DRAIN_BUDGET);
         Ok(())
     }
 }
@@ -997,6 +1004,13 @@ impl RtmpSession {
         );
         let _ = self.writer.flush();
         let _ = self.stream.shutdown(Shutdown::Write);
+        // Drain the read half until the peer's FIN before `self` drops:
+        // if the peer's final messages (status replies, acks, mirrored
+        // teardown commands) were still unread when the descriptor
+        // closed, the kernel would answer them with an RST — and an
+        // RST may discard everything the peer has not yet read,
+        // including the goodbye flushed above.
+        crate::netutil::drain_until_fin(&self.stream, crate::netutil::DRAIN_BUDGET);
         Ok(())
     }
 
