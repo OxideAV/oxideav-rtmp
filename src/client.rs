@@ -125,6 +125,13 @@ pub enum ClientEvent {
         transaction_id: f64,
         values: Vec<Amf0Value>,
     },
+    /// A §7.2.1.2 NetConnection `call` RPC issued *by the server* —
+    /// any command whose name is not a spec-defined built-in, since an
+    /// RPC's procedure name rides the command-name field. Answer with
+    /// [`RtmpClient::reply_call_result`] /
+    /// [`RtmpClient::reply_call_error`] when
+    /// [`CallCommand::expects_response`].
+    Call(CallCommand),
     /// Any other server-originated message (ping, ack, set-chunk-size,
     /// bandwidth — most of which the client handles transparently
     /// inside [`RtmpClient::poll_event`] before this variant ever fires).
@@ -862,6 +869,73 @@ impl RtmpClient {
         }
     }
 
+    /// Issue a §7.2.1.2 NetConnection `call` RPC: "The call method of
+    /// the NetConnection object runs remote procedure calls (RPC) at
+    /// the receiving end. The called RPC name is passed as a parameter
+    /// to the call command."
+    ///
+    /// With `expects_response`, a fresh non-zero transaction id is
+    /// allocated and returned — match it against the
+    /// [`ClientEvent::Result`] / [`ClientEvent::ErrorReply`] that
+    /// [`poll_event`](Self::poll_event) later surfaces. Without it the
+    /// spec's fire-and-forget transaction id 0 is used (and returned).
+    /// `command_object` is `Amf0Value::Null` when there is no command
+    /// info to attach.
+    pub fn call(
+        &mut self,
+        procedure: &str,
+        command_object: Amf0Value,
+        arguments: &[Amf0Value],
+        expects_response: bool,
+    ) -> Result<f64> {
+        let tx = if expects_response {
+            let t = self.next_tx;
+            self.next_tx += 1.0;
+            t
+        } else {
+            0.0
+        };
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call(procedure, tx, command_object, arguments),
+        )?;
+        self.writer.flush()?;
+        Ok(tx)
+    }
+
+    /// Answer a server-initiated [`ClientEvent::Call`] with the
+    /// §7.2.1.2 `_result(transaction_id, command_object, response)`
+    /// structure.
+    pub fn reply_call_result(
+        &mut self,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        response: Amf0Value,
+    ) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call_result(transaction_id, command_object, response),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Failure counterpart of
+    /// [`reply_call_result`](Self::reply_call_result).
+    pub fn reply_call_error(
+        &mut self,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        response: Amf0Value,
+    ) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call_error(transaction_id, command_object, response),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Send `closeStream` / `deleteStream` and shut the TCP socket.
     pub fn close(mut self) -> Result<()> {
         let tx = self.next_tx;
@@ -1222,7 +1296,17 @@ fn classify_command(values: Vec<Amf0Value>) -> ClientEvent {
                 values,
             }
         }
-        _ => ClientEvent::Other,
+        _ => {
+            // §7.2.1.2: a call RPC's procedure name rides the
+            // command-name field, so any non-built-in command from the
+            // server is an RPC aimed at this client.
+            if !crate::message::is_reserved_command_name(name) {
+                if let Some(call) = CallCommand::parse(&values) {
+                    return ClientEvent::Call(call);
+                }
+            }
+            ClientEvent::Other
+        }
     }
 }
 

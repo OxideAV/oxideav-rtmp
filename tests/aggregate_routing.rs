@@ -55,7 +55,7 @@ fn aggregate_publish_surfaces_three_subs_in_order() {
                 Ok(Some(StreamPacket::Metadata(_))) => {
                     tx.send(Received::Metadata).unwrap();
                 }
-                Ok(Some(StreamPacket::Command(_))) => {}
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     tx.send(Received::End).unwrap();
                     break;
@@ -171,7 +171,7 @@ fn aggregate_timestamp_renormalisation_reaches_session() {
                 Ok(Some(StreamPacket::Metadata(_))) => {
                     tx.send(Received::Metadata).unwrap();
                 }
-                Ok(Some(StreamPacket::Command(_))) => {}
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     tx.send(Received::End).unwrap();
                     break;
@@ -250,7 +250,7 @@ fn aggregate_command_subs_drive_teardown() {
                 Ok(Some(StreamPacket::Metadata(_))) => {
                     tx.send(Received::Metadata).unwrap();
                 }
-                Ok(Some(StreamPacket::Command(_))) => {}
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     tx.send(Received::End).unwrap();
                     break;

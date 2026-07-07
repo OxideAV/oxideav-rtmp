@@ -797,6 +797,157 @@ pub fn build_on_meta_data(stream_id: u32, metadata: &Amf0Value) -> Message {
     }
 }
 
+/// A §7.2.1.2 NetConnection `call` — a remote procedure call either
+/// peer may issue. On the wire the *command name field carries the
+/// procedure name* (the spec's command table opens with "Procedure
+/// Name — Name of the remote procedure that is called" where every
+/// other command's table opens with a fixed Command Name), so any
+/// command whose name is not one of the spec-defined built-ins is an
+/// RPC directed at the receiving application.
+///
+/// `transaction_id` is non-zero when the caller expects a response
+/// ("If a response is expected we give a transaction Id. Else we pass
+/// a value of 0"); answer with [`build_call_result`] /
+/// [`build_call_error`] echoing it. `command_object` is Null when the
+/// caller had no command info to attach.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallCommand {
+    /// Remote procedure name (the wire command-name field).
+    pub procedure: String,
+    /// Non-zero iff the caller expects a `_result` / `_error` reply.
+    pub transaction_id: f64,
+    /// The §7.2.1.2 Command Object ("If there exists any command info
+    /// this is set, else this is set to null type").
+    pub command_object: Amf0Value,
+    /// Optional Arguments, verbatim.
+    pub arguments: Vec<Amf0Value>,
+}
+
+impl CallCommand {
+    /// Interpret a decoded command frame as a `call` RPC. Returns
+    /// `None` when the frame is too short to be one (no name or no
+    /// transaction id) — the caller is responsible for first routing
+    /// spec-defined command names elsewhere
+    /// ([`is_reserved_command_name`]).
+    pub fn parse(values: &[Amf0Value]) -> Option<CallCommand> {
+        let procedure = values.first()?.as_str()?.to_owned();
+        let transaction_id = values.get(1)?.as_f64()?;
+        let command_object = values.get(2).cloned().unwrap_or(Amf0Value::Null);
+        let arguments = values.get(3..).unwrap_or(&[]).to_vec();
+        Some(CallCommand {
+            procedure,
+            transaction_id,
+            command_object,
+            arguments,
+        })
+    }
+
+    /// Byte-level inverse of [`parse`](Self::parse): the outbound
+    /// `call` command message (AMF0, on the NetConnection's message
+    /// stream 0 like every other NetConnection command).
+    pub fn to_message(&self) -> Message {
+        build_call(
+            &self.procedure,
+            self.transaction_id,
+            self.command_object.clone(),
+            &self.arguments,
+        )
+    }
+
+    /// Whether the caller expects a reply (§7.2.1.2: transaction id 0
+    /// means fire-and-forget).
+    pub fn expects_response(&self) -> bool {
+        self.transaction_id != 0.0
+    }
+}
+
+/// §7.2.1.2 `call` — the outbound RPC message. `procedure` rides the
+/// command-name field; pass `transaction_id` 0 when no response is
+/// expected.
+pub fn build_call(
+    procedure: &str,
+    transaction_id: f64,
+    command_object: Amf0Value,
+    arguments: &[Amf0Value],
+) -> Message {
+    let payload = crate::amf::encode_command(procedure, transaction_id, command_object, arguments);
+    Message {
+        msg_type_id: MSG_COMMAND_AMF0,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload,
+    }
+}
+
+/// §7.2.1.2 response frame: `_result(transaction_id, command_object,
+/// response)`. Echo the RPC's transaction id.
+pub fn build_call_result(
+    transaction_id: f64,
+    command_object: Amf0Value,
+    response: Amf0Value,
+) -> Message {
+    let payload =
+        crate::amf::encode_command("_result", transaction_id, command_object, &[response]);
+    Message {
+        msg_type_id: MSG_COMMAND_AMF0,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload,
+    }
+}
+
+/// Failure counterpart of [`build_call_result`] — same §7.2.1.2
+/// response structure under the `_error` command name.
+pub fn build_call_error(
+    transaction_id: f64,
+    command_object: Amf0Value,
+    response: Amf0Value,
+) -> Message {
+    let payload = crate::amf::encode_command("_error", transaction_id, command_object, &[response]);
+    Message {
+        msg_type_id: MSG_COMMAND_AMF0,
+        msg_stream_id: 0,
+        timestamp: 0,
+        payload,
+    }
+}
+
+/// The command names the RTMP 1.0 spec itself defines (§7.2.1
+/// NetConnection: `connect` / `call` / `close` / `createStream`; §7.2.2
+/// NetStream: `play` / `play2` / `deleteStream` / `closeStream` /
+/// `receiveAudio` / `receiveVideo` / `publish` / `seek` / `pause`; the
+/// §7.2 response names `_result` / `_error` / `onStatus`; plus the
+/// pre-publish advisories `releaseStream` / `FCPublish` / `FCUnpublish`
+/// that ride the same channel). A command whose name is NOT in this set
+/// is a §7.2.1.2 `call` RPC, whose procedure name rides the
+/// command-name field. (`call` itself is deliberately NOT matched:
+/// on the wire an RPC's name field carries the procedure name, so a
+/// literal "call" can only be a peer whose procedure is named "call" —
+/// it surfaces as an ordinary RPC.)
+pub fn is_reserved_command_name(name: &str) -> bool {
+    matches!(
+        name,
+        "connect"
+            | "close"
+            | "createStream"
+            | "play"
+            | "play2"
+            | "deleteStream"
+            | "closeStream"
+            | "receiveAudio"
+            | "receiveVideo"
+            | "publish"
+            | "seek"
+            | "pause"
+            | "_result"
+            | "_error"
+            | "onStatus"
+            | "releaseStream"
+            | "FCPublish"
+            | "FCUnpublish"
+    )
+}
+
 /// A NetStream control command sent **by a client to the server**,
 /// per RTMP 1.0 Commands-Messages §4.2. These are the subscriber-side
 /// (play) and shared control commands a server receives on a NetStream

@@ -178,8 +178,11 @@ impl MediaSource for RtmpSession {
                 MediaSourceEvent::Video { timestamp, tag }
             }
             Some(StreamPacket::Metadata(value)) => MediaSourceEvent::Metadata(value),
-            // NetStream control commands aren't media packets.
-            Some(StreamPacket::Command(_)) => MediaSourceEvent::Skip,
+            // NetStream control commands / NetConnection RPCs aren't
+            // media packets.
+            Some(StreamPacket::Command(_))
+            | Some(StreamPacket::Call(_))
+            | Some(StreamPacket::CallReply { .. }) => MediaSourceEvent::Skip,
             None => MediaSourceEvent::End,
         })
     }

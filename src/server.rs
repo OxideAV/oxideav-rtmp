@@ -488,6 +488,19 @@ pub enum PlaySessionEvent {
     /// milliseconds of buffer it keeps filled. May arrive at any time
     /// (e.g. after a pause).
     SetBufferLength { buffer_ms: u32 },
+    /// A §7.2.1.2 NetConnection `call` RPC from the subscriber. Reply
+    /// with [`PlaySession::reply_call_result`] /
+    /// [`PlaySession::reply_call_error`] when
+    /// [`CallCommand::expects_response`].
+    Call(CallCommand),
+    /// The subscriber answered a server-initiated
+    /// [`PlaySession::send_call`] with `_result` (`success == true`)
+    /// or `_error`; `values` is the whole decoded response frame.
+    CallReply {
+        success: bool,
+        transaction_id: f64,
+        values: Vec<Amf0Value>,
+    },
 }
 
 /// Active play (subscriber) session after [`PlayRequest::accept`].
@@ -578,14 +591,16 @@ impl PlaySession {
     /// the core of an RTMP fan-out: `Audio` / `Video` re-frame on this
     /// session's stream id at the packet's original timestamp,
     /// `Metadata` re-frames as a bare `onMetaData` data message, and a
-    /// publisher-side `Command` is not forwarded (control commands are
-    /// per-connection, not stream content).
+    /// publisher-side `Command` / `Call` is not forwarded (control
+    /// commands and RPCs are per-connection, not stream content).
     pub fn forward(&mut self, packet: &StreamPacket) -> Result<()> {
         match packet {
             StreamPacket::Audio { timestamp, tag } => self.send_audio(*timestamp, tag),
             StreamPacket::Video { timestamp, tag } => self.send_video(*timestamp, tag),
             StreamPacket::Metadata(meta) => self.send_metadata(meta),
-            StreamPacket::Command(_) => Ok(()),
+            StreamPacket::Command(_) | StreamPacket::Call(_) | StreamPacket::CallReply { .. } => {
+                Ok(())
+            }
         }
     }
 
@@ -773,15 +788,75 @@ impl PlaySession {
         values: &[Amf0Value],
     ) -> Result<Option<PlaySessionEvent>> {
         if let Some(name) = values.first().and_then(Amf0Value::as_str) {
-            if matches!(name, "closeStream" | "deleteStream") {
+            if matches!(name, "closeStream" | "deleteStream" | "close") {
                 // §4.2.3: "NetStream sends the deleteStream command
                 // when the NetStream object is getting destroyed. …
-                // The server does not send any response."
+                // The server does not send any response." The §7.2.1
+                // NetConnection `close` ends the session the same way.
                 self.ended = true;
                 return Ok(None);
             }
+            if let Some(cmd) = NetStreamCommand::parse(values)? {
+                return Ok(Some(PlaySessionEvent::Command(cmd)));
+            }
+            if matches!(name, "_result" | "_error") {
+                let transaction_id = values.get(1).and_then(Amf0Value::as_f64).unwrap_or(0.0);
+                return Ok(Some(PlaySessionEvent::CallReply {
+                    success: name == "_result",
+                    transaction_id,
+                    values: values.to_vec(),
+                }));
+            }
+            if !is_reserved_command_name(name) {
+                // §7.2.1.2 RPC — see StreamPacket::Call.
+                return Ok(CallCommand::parse(values).map(PlaySessionEvent::Call));
+            }
+            return Ok(None);
         }
         Ok(NetStreamCommand::parse(values)?.map(PlaySessionEvent::Command))
+    }
+
+    /// Issue a §7.2.1.2 NetConnection `call` RPC *to the subscriber*.
+    /// Non-zero `transaction_id` requests a response (surfaced as
+    /// [`PlaySessionEvent::CallReply`]); 0 is fire-and-forget.
+    pub fn send_call(&mut self, call: &CallCommand) -> Result<()> {
+        self.writer
+            .write_message(CSID_COMMAND, &call.to_message())?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Answer a subscriber [`PlaySessionEvent::Call`] with the
+    /// §7.2.1.2 `_result(transaction_id, command_object, response)`
+    /// structure.
+    pub fn reply_call_result(
+        &mut self,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        response: Amf0Value,
+    ) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call_result(transaction_id, command_object, response),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Failure counterpart of
+    /// [`reply_call_result`](Self::reply_call_result).
+    pub fn reply_call_error(
+        &mut self,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        response: Amf0Value,
+    ) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call_error(transaction_id, command_object, response),
+        )?;
+        self.writer.flush()?;
+        Ok(())
     }
 
     fn maybe_send_ack(&mut self) -> Result<()> {
@@ -865,6 +940,23 @@ pub enum StreamPacket {
     /// / `FCUnpublish`) are still consumed silently and end the
     /// session.
     Command(NetStreamCommand),
+    /// A §7.2.1.2 NetConnection `call` RPC from the peer — any command
+    /// whose name is not a spec-defined built-in, since the RPC's
+    /// procedure name rides the command-name field. Reply with
+    /// [`RtmpSession::reply_call_result`] /
+    /// [`RtmpSession::reply_call_error`] when
+    /// [`CallCommand::expects_response`].
+    Call(CallCommand),
+    /// The peer answered a server-initiated
+    /// [`RtmpSession::send_call`] with `_result` (`success == true`)
+    /// or `_error`. `values` is the whole decoded §7.2.1.2 response
+    /// frame (`[name, transaction_id, command_object, response]`);
+    /// match `transaction_id` against the id passed to `send_call`.
+    CallReply {
+        success: bool,
+        transaction_id: f64,
+        values: Vec<Amf0Value>,
+    },
 }
 
 impl RtmpSession {
@@ -1210,12 +1302,84 @@ impl RtmpSession {
     /// else is consumed silently.
     fn handle_command_values(&mut self, values: &[Amf0Value]) -> Result<Option<StreamPacket>> {
         if let Some(name) = values.first().and_then(Amf0Value::as_str) {
-            if matches!(name, "closeStream" | "deleteStream" | "FCUnpublish") {
+            if matches!(
+                name,
+                "closeStream" | "deleteStream" | "FCUnpublish" | "close"
+            ) {
+                // §4.2.3 deleteStream / closeStream and the §7.2.1
+                // NetConnection `close` all end the session; none get
+                // a response.
                 self.ended = true;
                 return Ok(None);
             }
+            if let Some(cmd) = NetStreamCommand::parse(values)? {
+                return Ok(Some(StreamPacket::Command(cmd)));
+            }
+            if matches!(name, "_result" | "_error") {
+                // §7.2.1.2 response to a server-initiated RPC
+                // ([`send_call`](Self::send_call)).
+                let transaction_id = values.get(1).and_then(Amf0Value::as_f64).unwrap_or(0.0);
+                return Ok(Some(StreamPacket::CallReply {
+                    success: name == "_result",
+                    transaction_id,
+                    values: values.to_vec(),
+                }));
+            }
+            if !is_reserved_command_name(name) {
+                // §7.2.1.2: an RPC's procedure name rides the
+                // command-name field, so any non-built-in command is a
+                // `call` aimed at the application.
+                return Ok(CallCommand::parse(values).map(StreamPacket::Call));
+            }
+            return Ok(None);
         }
         Ok(NetStreamCommand::parse(values)?.map(StreamPacket::Command))
+    }
+
+    /// Issue a §7.2.1.2 NetConnection `call` RPC *to the publisher* —
+    /// either peer may run RPCs at the other's end. Choose a non-zero
+    /// `transaction_id` to request a response (the peer's `_result` /
+    /// `_error` surfaces as [`StreamPacket::CallReply`]); pass 0 for
+    /// fire-and-forget.
+    pub fn send_call(&mut self, call: &CallCommand) -> Result<()> {
+        self.writer
+            .write_message(CSID_COMMAND, &call.to_message())?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Answer a peer [`StreamPacket::Call`] whose
+    /// [`CallCommand::expects_response`] with the §7.2.1.2 response
+    /// structure: `_result(transaction_id, command_object, response)`.
+    pub fn reply_call_result(
+        &mut self,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        response: Amf0Value,
+    ) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call_result(transaction_id, command_object, response),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Failure counterpart of
+    /// [`reply_call_result`](Self::reply_call_result) — `_error` with
+    /// the same §7.2.1.2 response structure.
+    pub fn reply_call_error(
+        &mut self,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        response: Amf0Value,
+    ) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call_error(transaction_id, command_object, response),
+        )?;
+        self.writer.flush()?;
+        Ok(())
     }
 }
 

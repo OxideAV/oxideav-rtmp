@@ -100,7 +100,7 @@ pub use flv_crypt::{
     FILTER_NAME_SELECTIVE, IV_LEN, NUM_FILTERS,
 };
 pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
-pub use message::{NetStreamCommand, UserControlEvent, RECONNECT_REQUEST_CODE};
+pub use message::{CallCommand, NetStreamCommand, UserControlEvent, RECONNECT_REQUEST_CODE};
 pub use player::{PlayOptions, PlayerPacket, RtmpPlayer};
 pub use server::{
     PlayRequest, PlaySession, PlaySessionEvent, PublishRequest, RtmpServer, RtmpSession,
