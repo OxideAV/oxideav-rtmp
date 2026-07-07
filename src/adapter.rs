@@ -120,6 +120,53 @@ pub const RTMP_TIME_BASE: TimeBase = TimeBase::new(1, 1_000_000_000);
 /// nanosecond [`RTMP_TIME_BASE`] timeline.
 pub const RTMP_MS_TO_NS: i64 = 1_000_000;
 
+/// Serial-number unwrapping of RTMP's 32-bit millisecond timestamps
+/// onto a monotonic 64-bit timeline.
+///
+/// Per the RTMP specification §4 (Definitions / byte order —
+/// December 2012): "Because timestamps are 32 bits long, they roll
+/// over every 49 days, 17 hours, 2 minutes and 47.296 seconds.
+/// Because streams are allowed to run continuously, potentially for
+/// years on end, an RTMP application SHOULD use serial number
+/// arithmetic [RFC1982] when processing timestamps, and SHOULD be
+/// capable of handling wraparound", with adjacent timestamps assumed
+/// within 2^31 − 1 ms of each other — "10000 comes after 4000000000,
+/// and 3000000000 comes before 4000000000".
+///
+/// [`unwrap_ms`](Self::unwrap_ms) interprets each successive raw
+/// timestamp's wrapping distance from the previous one as a signed
+/// 32-bit step and accumulates it, so the extended timeline keeps
+/// increasing across a rollover (and still follows legitimate small
+/// backward steps, e.g. B-frame-less dts jitter after a seek).
+#[derive(Debug, Default, Clone)]
+pub struct TimestampUnwrapper {
+    last: Option<(u32, i64)>,
+}
+
+impl TimestampUnwrapper {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold the next raw 32-bit timestamp onto the extended timeline
+    /// (milliseconds). The first observation anchors the timeline at
+    /// its own value.
+    pub fn unwrap_ms(&mut self, raw: u32) -> i64 {
+        let ext = match self.last {
+            None => raw as i64,
+            Some((prev_raw, prev_ext)) => {
+                // RFC 1982-style: the wrapping u32 difference,
+                // reinterpreted as i32, is the signed step. A forward
+                // step across 0xFFFFFFFF→0 stays positive; a small
+                // backward step stays negative.
+                prev_ext + (raw.wrapping_sub(prev_raw) as i32 as i64)
+            }
+        };
+        self.last = Some((raw, ext));
+        ext
+    }
+}
+
 /// Maximum number of packets to buffer during stream-codec probing
 /// before giving up and returning whatever we have.
 pub const PROBE_LIMIT: usize = 32;
@@ -222,6 +269,9 @@ struct ProbeState {
     metadata: Vec<(String, String)>,
     buffered: VecDeque<BufferedPacket>,
     ended: bool,
+    /// §4 timestamp unwrapping state, carried into the source so the
+    /// steady phase continues the probe phase's extended timeline.
+    ts: TimestampUnwrapper,
 }
 
 /// Shared probe loop: read up to [`PROBE_LIMIT`] events, note the
@@ -242,6 +292,7 @@ fn probe_source<S: MediaSource>(
         metadata: Vec::new(),
         buffered: VecDeque::new(),
         ended: false,
+        ts: TimestampUnwrapper::new(),
     };
     let mut have_audio = false;
     let mut have_video = false;
@@ -277,7 +328,7 @@ fn probe_source<S: MediaSource>(
                     have_audio = true;
                 }
                 state.buffered.push_back(BufferedPacket {
-                    packet: audio_to_packet(timestamp, &tag),
+                    packet: audio_to_packet(state.ts.unwrap_ms(timestamp), &tag),
                     is_audio: true,
                 });
             }
@@ -293,7 +344,7 @@ fn probe_source<S: MediaSource>(
                     have_video = true;
                 }
                 state.buffered.push_back(BufferedPacket {
-                    packet: video_to_packet(timestamp, &tag),
+                    packet: video_to_packet(state.ts.unwrap_ms(timestamp), &tag),
                     is_audio: false,
                 });
             }
@@ -325,6 +376,7 @@ fn steady_next<S: MediaSource>(
     streams: &mut Vec<StreamInfo>,
     metadata: &mut Vec<(String, String)>,
     ended: &mut bool,
+    ts: &mut TimestampUnwrapper,
 ) -> CoreResult<Packet> {
     loop {
         let event = src.next_media().map_err(rtmp_to_core_err)?;
@@ -340,7 +392,7 @@ fn steady_next<S: MediaSource>(
                     });
                     streams.sort_by_key(|s| s.index);
                 }
-                return Ok(audio_to_packet(timestamp, &tag));
+                return Ok(audio_to_packet(ts.unwrap_ms(timestamp), &tag));
             }
             MediaSourceEvent::Video { timestamp, tag } => {
                 if streams.iter().all(|s| s.index != VIDEO_STREAM_INDEX) {
@@ -353,7 +405,7 @@ fn steady_next<S: MediaSource>(
                     });
                     streams.sort_by_key(|s| s.index);
                 }
-                return Ok(video_to_packet(timestamp, &tag));
+                return Ok(video_to_packet(ts.unwrap_ms(timestamp), &tag));
             }
             MediaSourceEvent::Metadata(value) => {
                 flatten_metadata(&value, metadata);
@@ -385,6 +437,9 @@ pub struct RtmpPacketSource {
     /// or the TCP socket closed). After this `next_packet` keeps
     /// returning [`CoreError::Eof`].
     ended: bool,
+    /// §4 serial-number timestamp unwrapping across the 49.7-day
+    /// 32-bit rollover.
+    ts: TimestampUnwrapper,
 }
 
 impl RtmpPacketSource {
@@ -399,6 +454,7 @@ impl RtmpPacketSource {
             metadata: Vec::new(),
             buffered: VecDeque::new(),
             ended: false,
+            ts: TimestampUnwrapper::new(),
         }
     }
 
@@ -423,6 +479,7 @@ impl RtmpPacketSource {
             metadata: state.metadata,
             buffered: state.buffered,
             ended: state.ended,
+            ts: state.ts,
         })
     }
 
@@ -452,6 +509,7 @@ impl PacketSource for RtmpPacketSource {
             &mut self.streams,
             &mut self.metadata,
             &mut self.ended,
+            &mut self.ts,
         )
     }
 
@@ -485,6 +543,9 @@ pub struct RtmpPlayerPacketSource {
     /// per §7.1.7, or TCP EOF). After this `next_packet` keeps
     /// returning [`CoreError::Eof`].
     ended: bool,
+    /// §4 serial-number timestamp unwrapping across the 49.7-day
+    /// 32-bit rollover.
+    ts: TimestampUnwrapper,
 }
 
 impl RtmpPlayerPacketSource {
@@ -497,6 +558,7 @@ impl RtmpPlayerPacketSource {
             metadata: Vec::new(),
             buffered: VecDeque::new(),
             ended: false,
+            ts: TimestampUnwrapper::new(),
         }
     }
 
@@ -516,6 +578,7 @@ impl RtmpPlayerPacketSource {
             metadata: state.metadata,
             buffered: state.buffered,
             ended: state.ended,
+            ts: state.ts,
         })
     }
 
@@ -543,6 +606,7 @@ impl PacketSource for RtmpPlayerPacketSource {
             &mut self.streams,
             &mut self.metadata,
             &mut self.ended,
+            &mut self.ts,
         )
     }
 
@@ -585,8 +649,8 @@ impl PacketSource for RtmpPlayerPacketSource {
 /// [`AudioTag::timestamp_offset_nano`] folded onto the presentation
 /// time (audio has no separate decode time, so both `pts` and `dts`
 /// receive the offset).
-pub fn audio_to_packet(timestamp_ms: u32, tag: &AudioTag) -> Packet {
-    let ts_ns = (timestamp_ms as i64) * RTMP_MS_TO_NS;
+pub fn audio_to_packet(timestamp_ms: i64, tag: &AudioTag) -> Packet {
+    let ts_ns = timestamp_ms * RTMP_MS_TO_NS;
     let nano_offset = tag.timestamp_offset_nano() as i64;
     let presentation_ns = ts_ns + nano_offset;
     let (data, is_header) = if tag.audio_fourcc.is_some() {
@@ -643,8 +707,8 @@ pub fn audio_to_packet(timestamp_ms: u32, tag: &AudioTag) -> Packet {
 /// per `enhanced-rtmp-v2.pdf` the nanosecond offset adjusts the
 /// *presentation* time of the current media message without
 /// altering the core (decode) timestamp.
-pub fn video_to_packet(timestamp_ms: u32, tag: &VideoTag) -> Packet {
-    let dts_ns = (timestamp_ms as i64) * RTMP_MS_TO_NS;
+pub fn video_to_packet(timestamp_ms: i64, tag: &VideoTag) -> Packet {
+    let dts_ns = timestamp_ms * RTMP_MS_TO_NS;
     // CTS lives in two places on the wire — AVC's 3-byte
     // SI24 (legacy), and the three NALU-based Enhanced-RTMP
     // FourCC variants paired with `CodedFrames`: HEVC (v1),
@@ -1094,6 +1158,73 @@ mod tests {
         assert!(pkt.flags.header);
         // packet type byte (0 = seq header) + body
         assert_eq!(pkt.data, vec![0x00, 0x12, 0x10]);
+    }
+
+    #[test]
+    fn timestamp_unwrapper_anchors_at_first_value() {
+        let mut u = TimestampUnwrapper::new();
+        assert_eq!(u.unwrap_ms(5000), 5000);
+        assert_eq!(u.unwrap_ms(6000), 6000);
+    }
+
+    #[test]
+    fn timestamp_unwrapper_spec_examples() {
+        // §4: "10000 comes after 4000000000" — the step across the
+        // rollover is positive.
+        let mut u = TimestampUnwrapper::new();
+        let a = u.unwrap_ms(4_000_000_000);
+        let b = u.unwrap_ms(10_000);
+        assert!(b > a, "10000 must come after 4000000000 ({b} vs {a})");
+        // Exact step: (2^32 - 4000000000) + 10000.
+        assert_eq!(b - a, (1i64 << 32) - 4_000_000_000 + 10_000);
+
+        // "3000000000 comes before 4000000000" — a backward step.
+        let mut u = TimestampUnwrapper::new();
+        let a = u.unwrap_ms(4_000_000_000);
+        let b = u.unwrap_ms(3_000_000_000);
+        assert!(b < a);
+        assert_eq!(a - b, 1_000_000_000);
+    }
+
+    #[test]
+    fn timestamp_unwrapper_survives_multiple_rollovers() {
+        // A stream running for "years on end": step by 2^31 - 1 (the
+        // largest unambiguous forward step) repeatedly and confirm the
+        // extended timeline keeps growing past several 32-bit wraps.
+        let mut u = TimestampUnwrapper::new();
+        let step = (1u32 << 31) - 1;
+        let mut raw = 0u32;
+        let mut prev = u.unwrap_ms(raw);
+        for _ in 0..10 {
+            raw = raw.wrapping_add(step);
+            let ext = u.unwrap_ms(raw);
+            assert_eq!(ext - prev, step as i64);
+            prev = ext;
+        }
+        assert!(
+            prev > u64::from(u32::MAX) as i64,
+            "timeline must exceed 32 bits"
+        );
+    }
+
+    #[test]
+    fn unwrapped_timestamp_reaches_packet_timeline_past_32_bits() {
+        let tag = AudioTag {
+            mod_ex: Vec::new(),
+            sound_format: AUDIO_FORMAT_AAC,
+            sound_rate: 3,
+            sound_size_16bit: true,
+            stereo: true,
+            aac_packet_type: Some(AAC_PACKET_TYPE_RAW),
+            body: vec![0x01],
+            ex_packet_type: None,
+            audio_fourcc: None,
+            multitrack: None,
+        };
+        // 50 days in ms — beyond the u32 rollover point.
+        let fifty_days_ms: i64 = 50 * 24 * 3600 * 1000;
+        let pkt = audio_to_packet(fifty_days_ms, &tag);
+        assert_eq!(pkt.pts, Some(fifty_days_ms * RTMP_MS_TO_NS));
     }
 
     #[test]
