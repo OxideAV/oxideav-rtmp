@@ -1263,8 +1263,20 @@ fn drive_until_request(
                 let size = read_u32_be(&msg.payload[..4])?;
                 reader.set_window_ack_size(size);
             }
-            MSG_COMMAND_AMF0 => {
-                let values = amf::decode_all(&msg.payload)?;
+            MSG_COMMAND_AMF0 | MSG_COMMAND_AMF3 => {
+                // An objectEncoding-3 peer may issue its commands as
+                // type-17 (AMF3) messages — Enhanced RTMP v2 requires
+                // servers to accept them. `decode_message_to_amf0`
+                // handles both the v2 format-selector framing and the
+                // legacy AMF3 shapes, bridging onto the same AMF0
+                // command values. Replies stay AMF0 (type 20): AMF0
+                // support is mandatory for every peer, and only
+                // format 0 is defined for the AMF3 message types.
+                let values = if msg.msg_type_id == MSG_COMMAND_AMF3 {
+                    amf3::decode_message_to_amf0(&msg.payload)?
+                } else {
+                    amf::decode_all(&msg.payload)?
+                };
                 let name = values
                     .first()
                     .and_then(Amf0Value::as_str)
@@ -1359,8 +1371,13 @@ fn drive_until_request(
                 }
                 continue;
             }
-            MSG_COMMAND_AMF0 => {
-                let values = amf::decode_all(&msg.payload)?;
+            MSG_COMMAND_AMF0 | MSG_COMMAND_AMF3 => {
+                // Same AMF3 acceptance as the connect loop above.
+                let values = if msg.msg_type_id == MSG_COMMAND_AMF3 {
+                    amf3::decode_message_to_amf0(&msg.payload)?
+                } else {
+                    amf::decode_all(&msg.payload)?
+                };
                 let name = values
                     .first()
                     .and_then(Amf0Value::as_str)
