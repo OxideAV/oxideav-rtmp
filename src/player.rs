@@ -310,10 +310,7 @@ impl RtmpPlayer {
                 Ok(metadata_object(&values).map(PlayerPacket::Metadata))
             }
             MSG_DATA_AMF3 => {
-                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
-                    .iter()
-                    .map(amf3::Amf3Value::to_amf0)
-                    .collect();
+                let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 Ok(metadata_object(&values).map(PlayerPacket::Metadata))
             }
             MSG_COMMAND_AMF0 => {
@@ -321,10 +318,7 @@ impl RtmpPlayer {
                 Ok(classify_status(&values))
             }
             MSG_COMMAND_AMF3 => {
-                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
-                    .iter()
-                    .map(amf3::Amf3Value::to_amf0)
-                    .collect();
+                let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 Ok(classify_status(&values))
             }
             MSG_USER_CONTROL => match UserControlEvent::parse(&msg.payload)? {

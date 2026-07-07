@@ -509,14 +509,17 @@ impl RtmpClient {
     /// Send `onMetaData` as an AMF3-encoded data message (RTMP message
     /// type 15) instead of the AMF0 default.
     ///
-    /// The body is framed per AMF 3 spec §4.1 / AMF 0 spec §3.1: the
-    /// outer NetConnection message structure is AMF0, and each value
-    /// switches to AMF3 by prefixing it with the `avmplus-object-marker`
-    /// (`0x11`). Most ingest endpoints stay on AMF0, so prefer
+    /// The body is framed per the Enhanced RTMP v2 clarification of the
+    /// historical AMF 3 §4.1 / AMF 0 §3.1 rules: the payload leads with
+    /// a *format selector* byte ([`amf3::FORMAT_SELECTOR_AMF0`], the
+    /// only defined value), after which the message structure is AMF0
+    /// and each value switches to AMF3 by prefixing it with the
+    /// `avmplus-object-marker` (`0x11`) — the switch is not sticky.
+    /// Most ingest endpoints stay on AMF0, so prefer
     /// [`send_metadata`](Self::send_metadata); this exists for peers that
-    /// negotiated an AMF3 channel.
+    /// negotiated an AMF3 channel (`objectEncoding` 3).
     pub fn send_metadata_amf3(&mut self, metadata: amf3::Amf3Value) -> Result<()> {
-        let mut payload = Vec::new();
+        let mut payload = vec![amf3::FORMAT_SELECTOR_AMF0];
         payload.push(amf3::AVMPLUS_OBJECT_MARKER);
         amf3::encode(&mut payload, &amf3::Amf3Value::String("onMetaData".into()));
         payload.push(amf3::AVMPLUS_OBJECT_MARKER);
@@ -843,10 +846,7 @@ impl RtmpClient {
                 Ok(classify_command(values))
             }
             MSG_COMMAND_AMF3 => {
-                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
-                    .iter()
-                    .map(amf3::Amf3Value::to_amf0)
-                    .collect();
+                let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 Ok(classify_command(values))
             }
             MSG_AGGREGATE => {

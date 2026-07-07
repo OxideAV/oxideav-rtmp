@@ -722,10 +722,7 @@ impl PlaySession {
                 self.classify_command_values(&values)
             }
             MSG_COMMAND_AMF3 => {
-                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
-                    .iter()
-                    .map(amf3::Amf3Value::to_amf0)
-                    .collect();
+                let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 self.classify_command_values(&values)
             }
             MSG_USER_CONTROL => {
@@ -1130,15 +1127,14 @@ impl RtmpSession {
                 Ok(metadata_object(&values).map(StreamPacket::Metadata))
             }
             MSG_DATA_AMF3 => {
-                // AMF3-encoded data message (type 15). Per AMF3 §4.1
-                // the body is an AMF0 frame switching to AMF3 via the
-                // avmplus marker; decode it and bridge each value onto
-                // the AMF0 shape so metadata flows through the same
-                // path as MSG_DATA_AMF0.
-                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
-                    .iter()
-                    .map(amf3::Amf3Value::to_amf0)
-                    .collect();
+                // AMF3-encoded data message (type 15). Per the
+                // Enhanced RTMP v2 clarification the body starts with
+                // a format selector byte (0 = AMF0 values, each AMF3
+                // value introduced by the 0x11 avmplus marker); legacy
+                // selector-less frames are still accepted. Every value
+                // bridges onto the AMF0 shape so metadata flows
+                // through the same path as MSG_DATA_AMF0.
+                let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 Ok(metadata_object(&values).map(StreamPacket::Metadata))
             }
             MSG_COMMAND_AMF0 => {
@@ -1149,10 +1145,7 @@ impl RtmpSession {
                 // AMF3-encoded command (type 17). Bridge each value onto
                 // the AMF0 shape so the same dispatch handles teardown
                 // detection and §4.2 NetStream control commands.
-                let values: Vec<Amf0Value> = amf3::decode_data_message(&msg.payload)?
-                    .iter()
-                    .map(amf3::Amf3Value::to_amf0)
-                    .collect();
+                let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 self.handle_command_values(&values)
             }
             MSG_AGGREGATE => {

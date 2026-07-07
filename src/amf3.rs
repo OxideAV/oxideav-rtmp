@@ -834,6 +834,44 @@ pub fn decode_data_message(buf: &[u8]) -> Result<Vec<Amf3Value>> {
     Ok(out)
 }
 
+/// The Enhanced RTMP v2 *format selector* value for AMF0-encoded values
+/// — the only format currently defined. Per the v2 "Important
+/// AMF3-encoded Historical Specification Clarification", the message
+/// payload for message types 15, 16 and 17 starts with one format
+/// selector byte; format `0` indicates AMF0-encoded values follow, with
+/// any individual AMF3 value introduced by the AMF0
+/// `avmplus-object-marker` (`0x11`). The AMF3 switch is not sticky —
+/// parsing returns to AMF0 after each AMF3 value.
+pub const FORMAT_SELECTOR_AMF0: u8 = 0;
+
+/// Decode an RTMP type-15 / type-17 message body into AMF0-bridged
+/// values, honouring the Enhanced RTMP v2 clarified framing.
+///
+/// * A body starting with the [`FORMAT_SELECTOR_AMF0`] byte (`0x00`) is
+///   the v2-clarified form: the remainder is a sequence of AMF0 values,
+///   each AMF3 value prefixed with the `avmplus-object-marker`
+///   (`0x11`). This routes through [`crate::amf::decode_all`], which
+///   already bridges inline AMF3 values onto
+///   [`Amf0Value`](crate::amf::Amf0Value).
+/// * A body starting with any other byte is a legacy (pre-clarification)
+///   frame: a sequence of AMF3 values, each optionally introduced by
+///   `0x11`, decoded via [`decode_data_message`] and bridged with
+///   [`Amf3Value::to_amf0`].
+///
+/// The one collision the clarification creates: a legacy bare-AMF3 body
+/// whose first value is `undefined` (AMF3 marker `0x00`) now reads as a
+/// format selector. The spec-clarified framing wins — senders of such a
+/// frame predate the clarification and lead with `0x11` in practice.
+pub fn decode_message_to_amf0(buf: &[u8]) -> Result<Vec<crate::amf::Amf0Value>> {
+    if buf.first() == Some(&FORMAT_SELECTOR_AMF0) {
+        return crate::amf::decode_all(&buf[1..]);
+    }
+    Ok(decode_data_message(buf)?
+        .iter()
+        .map(Amf3Value::to_amf0)
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Encoder
 // ---------------------------------------------------------------------------
@@ -1996,5 +2034,96 @@ mod tests {
         assert_eq!(obj.get("height").and_then(A0::as_f64), Some(720.0));
         assert_eq!(obj.get("framerate").and_then(A0::as_f64), Some(29.97));
         assert_eq!(obj.get("videocodecid").and_then(A0::as_str), Some("avc1"));
+    }
+
+    // ----- Enhanced RTMP v2 format-selector framing -----
+
+    #[test]
+    fn selector_frame_pure_amf0_body() {
+        use crate::amf::Amf0Value as A0;
+        // v2-clarified frame: selector 0 then plain AMF0 values.
+        let mut body = vec![FORMAT_SELECTOR_AMF0];
+        crate::amf::encode(&mut body, &A0::String("onMetaData".into()));
+        crate::amf::encode(
+            &mut body,
+            &A0::Object(vec![("fps".into(), A0::Number(30.0))]),
+        );
+        let values = decode_message_to_amf0(&body).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_str(), Some("onMetaData"));
+        assert_eq!(values[1].get("fps").and_then(A0::as_f64), Some(30.0));
+    }
+
+    #[test]
+    fn selector_frame_amf3_values_via_avmplus_switch() {
+        use crate::amf::Amf0Value as A0;
+        // v2-clarified frame: selector 0, then AMF0 mode with each AMF3
+        // value introduced by the 0x11 avmplus marker (non-sticky).
+        let mut body = vec![FORMAT_SELECTOR_AMF0];
+        body.extend(avmplus_wrap(&Amf3Value::String("onMetaData".into())));
+        body.extend(avmplus_wrap(&dynamic_object([(
+            "width",
+            Amf3Value::Integer(640),
+        )])));
+        let values = decode_message_to_amf0(&body).unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].as_str(), Some("onMetaData"));
+        assert_eq!(values[1].get("width").and_then(A0::as_f64), Some(640.0));
+    }
+
+    #[test]
+    fn selector_frame_mixed_amf0_and_amf3_values() {
+        use crate::amf::Amf0Value as A0;
+        // AMF0 string, then a 0x11-switched AMF3 object, then back to
+        // AMF0 (the switch is not sticky per the v2 clarification).
+        let mut body = vec![FORMAT_SELECTOR_AMF0];
+        crate::amf::encode(&mut body, &A0::String("mixed".into()));
+        body.extend(avmplus_wrap(&Amf3Value::Integer(7)));
+        crate::amf::encode(&mut body, &A0::Boolean(true));
+        let values = decode_message_to_amf0(&body).unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].as_str(), Some("mixed"));
+        assert_eq!(values[1].as_f64(), Some(7.0));
+        assert_eq!(values[2], A0::Boolean(true));
+    }
+
+    #[test]
+    fn legacy_avmplus_frame_still_decodes() {
+        use crate::amf::Amf0Value as A0;
+        // Pre-clarification frame with no selector byte: leading 0x11.
+        let mut body = avmplus_wrap(&Amf3Value::String("onMetaData".into()));
+        body.extend(avmplus_wrap(&dynamic_object([(
+            "fps",
+            Amf3Value::Integer(25),
+        )])));
+        let values = decode_message_to_amf0(&body).unwrap();
+        assert_eq!(values[0].as_str(), Some("onMetaData"));
+        assert_eq!(values[1].get("fps").and_then(A0::as_f64), Some(25.0));
+    }
+
+    #[test]
+    fn legacy_bare_amf3_frame_still_decodes() {
+        // Selector-less body whose first byte is an AMF3 string marker
+        // (0x06) — the legacy bare-AMF3 shape.
+        let mut body = Vec::new();
+        encode(&mut body, &Amf3Value::String("onMetaData".into()));
+        let values = decode_message_to_amf0(&body).unwrap();
+        assert_eq!(values[0].as_str(), Some("onMetaData"));
+    }
+
+    #[test]
+    fn selector_frame_empty_body_is_empty() {
+        let values = decode_message_to_amf0(&[FORMAT_SELECTOR_AMF0]).unwrap();
+        assert!(values.is_empty());
+        let values = decode_message_to_amf0(&[]).unwrap();
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn selector_frame_truncated_value_errors() {
+        // Selector + AMF0 string marker with no length bytes.
+        assert!(decode_message_to_amf0(&[FORMAT_SELECTOR_AMF0, 0x02]).is_err());
+        // Selector + dangling avmplus switch.
+        assert!(decode_message_to_amf0(&[FORMAT_SELECTOR_AMF0, AVMPLUS_OBJECT_MARKER]).is_err());
     }
 }
