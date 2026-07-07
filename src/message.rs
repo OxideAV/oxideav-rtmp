@@ -86,6 +86,105 @@ pub fn build_window_ack_size(size: u32) -> Message {
     }
 }
 
+/// §5.4.5 Limit Type 0 — "Hard: The peer SHOULD limit its output
+/// bandwidth to the indicated window size."
+pub const PEER_BANDWIDTH_LIMIT_HARD: u8 = 0;
+/// §5.4.5 Limit Type 1 — "Soft: The peer SHOULD limit its output
+/// bandwidth to the the window indicated in this message or the limit
+/// already in effect, whichever is smaller."
+pub const PEER_BANDWIDTH_LIMIT_SOFT: u8 = 1;
+/// §5.4.5 Limit Type 2 — "Dynamic: If the previous Limit Type was
+/// Hard, treat this message as though it was marked Hard, otherwise
+/// ignore this message."
+pub const PEER_BANDWIDTH_LIMIT_DYNAMIC: u8 = 2;
+
+/// Split a §5.4.5 Set Peer Bandwidth payload into `(window, limit
+/// type)`. The payload is 5 bytes (4-byte Acknowledgement Window
+/// size + 1-byte Limit Type); a 4-byte payload with the limit byte
+/// missing is tolerated as Hard — the conservative reading that
+/// matches unconditional adoption.
+pub fn parse_set_peer_bandwidth(payload: &[u8]) -> crate::error::Result<(u32, u8)> {
+    if payload.len() < 4 {
+        return Err(crate::error::Error::InvalidChunk(format!(
+            "Set Peer Bandwidth payload too short: {} bytes",
+            payload.len()
+        )));
+    }
+    let mut w = [0u8; 4];
+    w.copy_from_slice(&payload[..4]);
+    let limit = payload.get(4).copied().unwrap_or(PEER_BANDWIDTH_LIMIT_HARD);
+    Ok((u32::from_be_bytes(w), limit))
+}
+
+/// §5.4.5 Set Peer Bandwidth limit-type state machine.
+///
+/// Tracks the effective output-bandwidth window across a sequence of
+/// Set Peer Bandwidth messages:
+///
+/// * **Hard (0)** — adopt the indicated window.
+/// * **Soft (1)** — adopt the smaller of the indicated window and the
+///   limit already in effect.
+/// * **Dynamic (2)** — "If the previous Limit Type was Hard, treat
+///   this message as though it was marked Hard, otherwise ignore this
+///   message."
+/// * Reserved limit types are ignored.
+///
+/// [`apply`](Self::apply) returns `Some(window)` only when the
+/// effective window *changed* — the moment the receiver "SHOULD
+/// respond with a Window Acknowledgement Size message if the window
+/// size is different from the last one sent".
+#[derive(Debug, Default, Clone)]
+pub struct PeerBandwidthLimiter {
+    window: Option<u32>,
+    last_was_hard: bool,
+}
+
+impl PeerBandwidthLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Currently effective output-bandwidth window, if any Set Peer
+    /// Bandwidth has been accepted yet.
+    pub fn window(&self) -> Option<u32> {
+        self.window
+    }
+
+    /// Apply one inbound Set Peer Bandwidth. Returns the new effective
+    /// window iff it changed.
+    pub fn apply(&mut self, window: u32, limit_type: u8) -> Option<u32> {
+        match limit_type {
+            PEER_BANDWIDTH_LIMIT_HARD => {
+                self.last_was_hard = true;
+                self.adopt(window)
+            }
+            PEER_BANDWIDTH_LIMIT_SOFT => {
+                self.last_was_hard = false;
+                let effective = self.window.map_or(window, |cur| cur.min(window));
+                self.adopt(effective)
+            }
+            PEER_BANDWIDTH_LIMIT_DYNAMIC => {
+                if self.last_was_hard {
+                    // "treat this message as though it was marked
+                    // Hard" — including for the next Dynamic in a row.
+                    self.adopt(window)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn adopt(&mut self, window: u32) -> Option<u32> {
+        if self.window == Some(window) {
+            return None;
+        }
+        self.window = Some(window);
+        Some(window)
+    }
+}
+
 pub fn build_set_peer_bandwidth(size: u32, limit_type: u8) -> Message {
     let mut p = Vec::with_capacity(5);
     p.extend_from_slice(&size.to_be_bytes());
@@ -1696,5 +1795,93 @@ mod tests {
     #[test]
     fn netstream_parse_empty_is_none() {
         assert!(NetStreamCommand::parse(&[]).unwrap().is_none());
+    }
+
+    // ----- §5.4.5 Set Peer Bandwidth limit types -----
+
+    #[test]
+    fn peer_bandwidth_hard_adopts_and_dedupes() {
+        let mut l = PeerBandwidthLimiter::new();
+        assert_eq!(
+            l.apply(2_500_000, PEER_BANDWIDTH_LIMIT_HARD),
+            Some(2_500_000)
+        );
+        // Same window again — no change, no reply owed.
+        assert_eq!(l.apply(2_500_000, PEER_BANDWIDTH_LIMIT_HARD), None);
+        assert_eq!(
+            l.apply(1_000_000, PEER_BANDWIDTH_LIMIT_HARD),
+            Some(1_000_000)
+        );
+        assert_eq!(l.window(), Some(1_000_000));
+    }
+
+    #[test]
+    fn peer_bandwidth_soft_takes_smaller_of_indicated_and_in_effect() {
+        let mut l = PeerBandwidthLimiter::new();
+        assert_eq!(
+            l.apply(1_000_000, PEER_BANDWIDTH_LIMIT_HARD),
+            Some(1_000_000)
+        );
+        // Soft with a larger window: the limit already in effect wins.
+        assert_eq!(l.apply(5_000_000, PEER_BANDWIDTH_LIMIT_SOFT), None);
+        assert_eq!(l.window(), Some(1_000_000));
+        // Soft with a smaller window: the indicated window wins.
+        assert_eq!(l.apply(500_000, PEER_BANDWIDTH_LIMIT_SOFT), Some(500_000));
+        // Soft with no limit in effect adopts the indicated window.
+        let mut fresh = PeerBandwidthLimiter::new();
+        assert_eq!(
+            fresh.apply(750_000, PEER_BANDWIDTH_LIMIT_SOFT),
+            Some(750_000)
+        );
+    }
+
+    #[test]
+    fn peer_bandwidth_dynamic_only_after_hard() {
+        // "If the previous Limit Type was Hard, treat this message as
+        // though it was marked Hard, otherwise ignore this message."
+        let mut l = PeerBandwidthLimiter::new();
+        // No previous type at all — ignored.
+        assert_eq!(l.apply(9_000_000, PEER_BANDWIDTH_LIMIT_DYNAMIC), None);
+        assert_eq!(l.window(), None);
+        // After Hard — treated as Hard.
+        l.apply(1_000_000, PEER_BANDWIDTH_LIMIT_HARD);
+        assert_eq!(
+            l.apply(2_000_000, PEER_BANDWIDTH_LIMIT_DYNAMIC),
+            Some(2_000_000)
+        );
+        // A Dynamic-as-Hard keeps the Hard latch for the next Dynamic.
+        assert_eq!(
+            l.apply(3_000_000, PEER_BANDWIDTH_LIMIT_DYNAMIC),
+            Some(3_000_000)
+        );
+        // After Soft — ignored.
+        l.apply(500_000, PEER_BANDWIDTH_LIMIT_SOFT);
+        assert_eq!(l.apply(9_000_000, PEER_BANDWIDTH_LIMIT_DYNAMIC), None);
+        assert_eq!(l.window(), Some(500_000));
+    }
+
+    #[test]
+    fn peer_bandwidth_reserved_limit_types_ignored() {
+        let mut l = PeerBandwidthLimiter::new();
+        assert_eq!(l.apply(1_000_000, 3), None);
+        assert_eq!(l.apply(1_000_000, 0xFF), None);
+        assert_eq!(l.window(), None);
+    }
+
+    #[test]
+    fn parse_set_peer_bandwidth_payload_shapes() {
+        // Spec 5-byte shape.
+        let msg = build_set_peer_bandwidth(2_500_000, PEER_BANDWIDTH_LIMIT_SOFT);
+        assert_eq!(
+            parse_set_peer_bandwidth(&msg.payload).unwrap(),
+            (2_500_000, PEER_BANDWIDTH_LIMIT_SOFT)
+        );
+        // Missing limit byte tolerated as Hard.
+        assert_eq!(
+            parse_set_peer_bandwidth(&2_500_000u32.to_be_bytes()).unwrap(),
+            (2_500_000, PEER_BANDWIDTH_LIMIT_HARD)
+        );
+        // Short payload is a clean error.
+        assert!(parse_set_peer_bandwidth(&[0, 1, 2]).is_err());
     }
 }

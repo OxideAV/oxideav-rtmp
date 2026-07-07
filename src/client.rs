@@ -182,6 +182,9 @@ pub struct RtmpClient {
     /// a peer reflecting its own ack stream as an aggregate) still
     /// sees the per-event classification.
     pending_subs: VecDeque<Message>,
+    /// §5.4.5 Set Peer Bandwidth limit-type state (Hard / Soft /
+    /// Dynamic) for the peer's output-bandwidth requests.
+    peer_bw: PeerBandwidthLimiter,
 }
 
 /// Parsed RTMP URL: `rtmp://host[:port]/app/stream_name`.
@@ -389,6 +392,7 @@ impl RtmpClient {
             server_caps,
             tc_url: u.tc_url.clone(),
             pending_subs: VecDeque::new(),
+            peer_bw: PeerBandwidthLimiter::new(),
         })
     }
 
@@ -729,13 +733,16 @@ impl RtmpClient {
                 Ok(ClientEvent::Other)
             }
             MSG_SET_PEER_BANDWIDTH => {
-                // §5.6: "The output bandwidth value is the same as the
-                // window size for the peer." Adopt the leading 4-byte
-                // window as our send-side ack window. (Trailing Limit
-                // type byte is advisory.)
-                if msg.payload.len() >= 4 {
-                    let size = read_u32_be(&msg.payload[..4])?;
-                    self.reader.set_window_ack_size(size);
+                // §5.4.5: run the Hard / Soft / Dynamic limit-type
+                // state machine; when the effective window changes,
+                // adopt it as our send-side ack window and answer with
+                // the SHOULD-mandated Window Acknowledgement Size.
+                let (window, limit) = parse_set_peer_bandwidth(&msg.payload)?;
+                if let Some(w) = self.peer_bw.apply(window, limit) {
+                    self.reader.set_window_ack_size(w);
+                    self.writer
+                        .write_message(CSID_PROTOCOL_CONTROL, &build_window_ack_size(w))?;
+                    self.writer.flush()?;
                 }
                 Ok(ClientEvent::Other)
             }

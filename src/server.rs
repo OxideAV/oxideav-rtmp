@@ -303,6 +303,7 @@ impl PublishRequest {
             stream_id,
             ended: false,
             pending_subs: VecDeque::new(),
+            peer_bw: PeerBandwidthLimiter::new(),
         })
     }
 
@@ -448,6 +449,7 @@ impl PlayRequest {
             stream_id,
             ended: false,
             pending_subs: VecDeque::new(),
+            peer_bw: PeerBandwidthLimiter::new(),
         })
     }
 
@@ -524,6 +526,9 @@ pub struct PlaySession {
     /// Sub-messages decomposed out of an Aggregate Message (type 22)
     /// per RTMP 1.0 §7.1.6 but not yet dispatched.
     pending_subs: VecDeque<Message>,
+    /// §5.4.5 Set Peer Bandwidth limit-type state (Hard / Soft /
+    /// Dynamic) for the peer's output-bandwidth requests.
+    peer_bw: PeerBandwidthLimiter,
 }
 
 impl PlaySession {
@@ -768,9 +773,16 @@ impl PlaySession {
                 Ok(None)
             }
             MSG_SET_PEER_BANDWIDTH => {
-                if msg.payload.len() >= 4 {
-                    let size = read_u32_be(&msg.payload[..4])?;
-                    self.reader.set_window_ack_size(size);
+                // §5.4.5: run the Hard / Soft / Dynamic limit-type
+                // state machine; when the effective window changes,
+                // adopt it as our send-side ack window and answer with
+                // the SHOULD-mandated Window Acknowledgement Size.
+                let (window, limit) = parse_set_peer_bandwidth(&msg.payload)?;
+                if let Some(w) = self.peer_bw.apply(window, limit) {
+                    self.reader.set_window_ack_size(w);
+                    self.writer
+                        .write_message(CSID_PROTOCOL_CONTROL, &build_window_ack_size(w))?;
+                    self.writer.flush()?;
                 }
                 Ok(None)
             }
@@ -914,6 +926,9 @@ pub struct RtmpSession {
     /// every subsequent wire read so the caller observes the
     /// per-sub packets in the order the publisher packed them.
     pending_subs: VecDeque<Message>,
+    /// §5.4.5 Set Peer Bandwidth limit-type state (Hard / Soft /
+    /// Dynamic) for the peer's output-bandwidth requests.
+    peer_bw: PeerBandwidthLimiter,
 }
 
 /// One media-layer event reported to the caller.
@@ -1270,14 +1285,16 @@ impl RtmpSession {
                 Ok(None)
             }
             MSG_SET_PEER_BANDWIDTH => {
-                // §5.6: "The output bandwidth value is the same as the
-                // window size for the peer." The first 4 bytes carry
-                // that window size; adopt it as our send-side ack
-                // window too. (The trailing Limit type byte is
-                // advisory and doesn't change our framing.)
-                if msg.payload.len() >= 4 {
-                    let size = read_u32_be(&msg.payload[..4])?;
-                    self.reader.set_window_ack_size(size);
+                // §5.4.5: run the Hard / Soft / Dynamic limit-type
+                // state machine; when the effective window changes,
+                // adopt it as our send-side ack window and answer with
+                // the SHOULD-mandated Window Acknowledgement Size.
+                let (window, limit) = parse_set_peer_bandwidth(&msg.payload)?;
+                if let Some(w) = self.peer_bw.apply(window, limit) {
+                    self.reader.set_window_ack_size(w);
+                    self.writer
+                        .write_message(CSID_PROTOCOL_CONTROL, &build_window_ack_size(w))?;
+                    self.writer.flush()?;
                 }
                 Ok(None)
             }

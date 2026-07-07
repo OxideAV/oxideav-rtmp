@@ -135,6 +135,9 @@ pub struct RtmpPlayer {
     /// Sub-messages decomposed out of a server-side Aggregate Message
     /// (RTMP 1.0 §7.1.6) awaiting dispatch.
     pending_subs: VecDeque<Message>,
+    /// §5.4.5 Set Peer Bandwidth limit-type state (Hard / Soft /
+    /// Dynamic) for the peer's output-bandwidth requests.
+    peer_bw: PeerBandwidthLimiter,
     /// Next transaction id for a response-expecting §7.2.1.2 `call`.
     /// connect used 1, createStream 2; RPCs start at 10 so log lines
     /// are visually distinct from the fixed setup ids.
@@ -226,6 +229,7 @@ impl RtmpPlayer {
             ended: false,
             is_recorded,
             pending_subs: VecDeque::new(),
+            peer_bw: PeerBandwidthLimiter::new(),
             next_tx: 10.0,
         })
     }
@@ -436,9 +440,16 @@ impl RtmpPlayer {
                 Ok(None)
             }
             MSG_SET_PEER_BANDWIDTH => {
-                if msg.payload.len() >= 4 {
-                    let size = read_u32_be(&msg.payload[..4])?;
-                    self.reader.set_window_ack_size(size);
+                // §5.4.5: run the Hard / Soft / Dynamic limit-type
+                // state machine; when the effective window changes,
+                // adopt it as our send-side ack window and answer with
+                // the SHOULD-mandated Window Acknowledgement Size.
+                let (window, limit) = parse_set_peer_bandwidth(&msg.payload)?;
+                if let Some(w) = self.peer_bw.apply(window, limit) {
+                    self.reader.set_window_ack_size(w);
+                    self.writer
+                        .write_message(CSID_PROTOCOL_CONTROL, &build_window_ack_size(w))?;
+                    self.writer.flush()?;
                 }
                 Ok(None)
             }
