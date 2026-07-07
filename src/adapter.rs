@@ -128,7 +128,7 @@ pub const RTMP_MS_TO_NS: i64 = 1_000_000;
 /// over every 49 days, 17 hours, 2 minutes and 47.296 seconds.
 /// Because streams are allowed to run continuously, potentially for
 /// years on end, an RTMP application SHOULD use serial number
-/// arithmetic [RFC1982] when processing timestamps, and SHOULD be
+/// arithmetic \[RFC1982\] when processing timestamps, and SHOULD be
 /// capable of handling wraparound", with adjacent timestamps assumed
 /// within 2^31 − 1 ms of each other — "10000 comes after 4000000000,
 /// and 3000000000 comes before 4000000000".
