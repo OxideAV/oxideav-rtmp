@@ -23,6 +23,7 @@ use oxideav_rtmp::aggregate::parse_aggregate;
 use oxideav_rtmp::amf::{decode as amf0_decode, decode_all as amf0_decode_all, Amf0Value};
 use oxideav_rtmp::amf3::{
     decode as amf3_decode, decode_all as amf3_decode_all, decode_data_message,
+    decode_message_to_amf0, FORMAT_SELECTOR_AMF0,
 };
 use oxideav_rtmp::chunk::{ChunkReader, ChunkWriter, Message};
 use oxideav_rtmp::flv::{parse_audio, parse_video};
@@ -239,6 +240,78 @@ fn amf3_decode_data_message_random_bytes_never_panics() {
             result.is_ok(),
             "decode_data_message panicked on iteration {iter}, input bytes: {buf:?}"
         );
+    }
+}
+
+/// Type-15/17 message-body decoder (Enhanced RTMP v2 format-selector
+/// framing + both legacy shapes) — random bytes route through either
+/// the AMF0-with-0x11-switch path or the raw-AMF3 path depending on
+/// the first byte; neither may panic.
+#[test]
+fn amf3_decode_message_to_amf0_random_bytes_never_panics() {
+    let mut rng = Xs64::new(0xA113_C0DE_0015);
+    for iter in 0..512 {
+        let len = (rng.next() as usize) % 257;
+        let mut buf = vec![0u8; len];
+        rng.fill(&mut buf);
+        let buf_copy = buf.clone();
+        let result = std::panic::catch_unwind(move || decode_message_to_amf0(&buf_copy));
+        assert!(
+            result.is_ok(),
+            "decode_message_to_amf0 panicked on iteration {iter}, input bytes: {buf:?}"
+        );
+    }
+}
+
+/// Same decoder with the format-selector byte pinned, forcing the
+/// selector-0 AMF0 path against adversarial remainders.
+#[test]
+fn amf3_decode_message_selector_path_random_bytes_never_panics() {
+    let mut rng = Xs64::new(0xA113_C0DE_0016);
+    for iter in 0..512 {
+        let len = (rng.next() as usize) % 257;
+        let mut buf = vec![0u8; len + 1];
+        rng.fill(&mut buf);
+        buf[0] = FORMAT_SELECTOR_AMF0;
+        let buf_copy = buf.clone();
+        let result = std::panic::catch_unwind(move || decode_message_to_amf0(&buf_copy));
+        assert!(
+            result.is_ok(),
+            "selector-path decode panicked on iteration {iter}, input bytes: {buf:?}"
+        );
+    }
+}
+
+/// §7.2.1.2 CallCommand::parse takes already-decoded AMF0 values —
+/// throw short / wrong-typed frames at it; it must return None (or a
+/// parsed call), never panic.
+#[test]
+fn call_command_parse_arbitrary_frames_never_panics() {
+    use oxideav_rtmp::CallCommand;
+    let frames: Vec<Vec<Amf0Value>> = vec![
+        vec![],
+        vec![Amf0Value::Null],
+        vec![Amf0Value::Number(1.0)],
+        vec![Amf0Value::String("proc".into())],
+        vec![
+            Amf0Value::String("proc".into()),
+            Amf0Value::String("not-a-number".into()),
+        ],
+        vec![
+            Amf0Value::String("proc".into()),
+            Amf0Value::Number(f64::NAN),
+        ],
+        vec![
+            Amf0Value::String("proc".into()),
+            Amf0Value::Number(2.0),
+            Amf0Value::Undefined,
+            Amf0Value::Null,
+            Amf0Value::Boolean(true),
+        ],
+    ];
+    for (i, frame) in frames.iter().enumerate() {
+        let result = std::panic::catch_unwind(|| CallCommand::parse(frame));
+        assert!(result.is_ok(), "CallCommand::parse panicked on frame {i}");
     }
 }
 
