@@ -157,7 +157,15 @@ client.close()?;
   bridged onto `Amf0Value`, and surfaced through the same
   `StreamPacket::Metadata` path; type-17 AMF3 commands feed the same
   stream-teardown detection. `RtmpClient::send_metadata_amf3` emits the
-  AMF3-encoded form. The AMF0 decoder also honours an inline
+  AMF3-encoded form in the Enhanced RTMP v2 clarified framing — the
+  type-15/16/17 payload starts with a one-byte *format selector* (only
+  format 0 = AMF0 values is defined; each AMF3 value is introduced by
+  the non-sticky `0x11` marker) — and `amf3::decode_message_to_amf0`
+  decodes that framing plus both legacy selector-less shapes on every
+  type-15/17 dispatch path, server and client. The server's
+  negotiation driver also accepts type-17 commands, so an
+  objectEncoding-3 peer can run its whole `connect` → `createStream` →
+  `publish` / `play` sequence in AMF3. The AMF0 decoder also honours an inline
   `avmplus-object-marker` (`0x11`) mid-stream (§3.1): the following value
   is decoded as a self-contained AMF3 value and bridged back onto
   `Amf0Value`, so a mixed AMF0/AMF3 packet parses through the ordinary
@@ -166,6 +174,29 @@ client.close()?;
   resolver for a known class; an unregistered class is refused, not
   guessed). Shared objects, RTMFP, and the Adobe digest-verified
   handshake remain unimplemented.
+- **NetConnection `call` (RPC).** §7.2.1.2 both ways on every
+  surface: an RPC's procedure name rides the wire command-name field,
+  so any non-built-in command is a call aimed at the application.
+  `RtmpClient::call` / `RtmpPlayer::call` issue RPCs (transaction id
+  allocated when a response is expected, the spec's 0 otherwise);
+  inbound RPCs surface as `ClientEvent::Call` / `PlayerPacket::Call` /
+  `StreamPacket::Call` / `PlaySessionEvent::Call` with
+  `reply_call_result` / `reply_call_error` helpers; server-initiated
+  `send_call` replies come back as the matching `CallReply` variants.
+  The §7.2.1 NetConnection `close` command tears the session down like
+  `closeStream` / `deleteStream`.
+- **Timestamp rollover.** RTMP timestamps are 32-bit milliseconds and
+  roll over every ~49.7 days; §4 mandates RFC 1982 serial-number
+  arithmetic. The public [`TimestampUnwrapper`] folds each raw
+  timestamp's wrapping signed step onto a monotonic 64-bit timeline,
+  and both `PacketSource` adapters use it so `pts`/`dts` keep growing
+  across rollovers.
+- **Peer bandwidth limit types.** §5.4.5's Hard / Soft / Dynamic
+  semantics run through [`PeerBandwidthLimiter`] on all four
+  steady-state paths (Hard adopts, Soft takes the smaller of the
+  indicated and in-effect windows, Dynamic acts as Hard only when the
+  previous type was Hard); when the effective window changes the peer
+  gets the SHOULD-mandated Window Acknowledgement Size reply.
 - **Codecs.** H.264 + AAC are the canonical legacy payloads, plus the
   Enhanced RTMP FourCC video codecs — `hvc1` (HEVC), `av01` (AV1),
   `vp09` (VP9), `vp08` (VP8), `avc1` (FourCC-mode AVC), `vvc1` (VVC) —
@@ -336,6 +367,12 @@ non-standard:
   `validate_protocol_control_invariants()` enforces the §5 rule that
   protocol-control messages carry stream id 0;
   `ChunkReader::abort_partial(csid)` applies an inbound Abort Message.
+  The writer implements the full §5.3.1.3 extended-timestamp matrix
+  (December 2012 revision): the ext field rides every fmt-3 chunk —
+  head or continuation — whose most recent fmt-0/1/2 chunk indicated
+  one, fmt-1/2 ext fields carry the 32-bit *delta*, and a fmt-3 head
+  chunk is only chosen when the message's delta equals the delta
+  registered on the csid (§5.3.1.2.4).
 - `aggregate::{parse_aggregate, build_aggregate}` — Aggregate Message
   (type 22) parser + builder with the §7.1.6 timestamp re-normalisation
   and stream-id override. Routed end-to-end: `next_packet` /
