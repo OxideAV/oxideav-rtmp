@@ -202,10 +202,11 @@ impl MediaSource for RtmpPlayer {
                 MediaSourceEvent::Video { timestamp, tag }
             }
             Some(PlayerPacket::Metadata(value)) => MediaSourceEvent::Metadata(value),
-            // onStatus / user-control notifications aren't media.
-            Some(PlayerPacket::Status { .. }) | Some(PlayerPacket::Control(_)) => {
-                MediaSourceEvent::Skip
-            }
+            // onStatus / user-control / RPC traffic isn't media.
+            Some(PlayerPacket::Status { .. })
+            | Some(PlayerPacket::Control(_))
+            | Some(PlayerPacket::Call(_))
+            | Some(PlayerPacket::CallReply { .. }) => MediaSourceEvent::Skip,
             None => MediaSourceEvent::End,
         })
     }

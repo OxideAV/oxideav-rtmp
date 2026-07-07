@@ -138,7 +138,7 @@ fn player_receives_full_stream_until_eof() {
             PlayerPacket::Metadata(meta) => metadata = Some(meta),
             PlayerPacket::Video { timestamp, tag } => video.push((timestamp, tag)),
             PlayerPacket::Audio { timestamp, tag } => audio.push((timestamp, tag)),
-            PlayerPacket::Status { .. } | PlayerPacket::Control(_) => {}
+            _ => {}
         }
     }
 

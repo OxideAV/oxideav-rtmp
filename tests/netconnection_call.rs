@@ -9,11 +9,12 @@
 //!    `ClientEvent::Call`), answered with
 //!    `RtmpClient::reply_call_result` → `StreamPacket::CallReply`;
 //! 4. the wire round-trip of the `CallCommand` frame itself
-//!    (`to_message` → `amf::decode_all` → `parse`).
-//!
-//! (`PlaySession` exposes the identical `send_call` /
-//! `PlaySessionEvent::Call` / `CallReply` surface through the same
-//! `classify_command_values` dispatch these tests exercise.)
+//!    (`to_message` → `amf::decode_all` → `parse`);
+//! 5. the play direction both ways (`PlaySession::send_call` →
+//!    `PlayerPacket::Call` → `RtmpPlayer::reply_call_result` →
+//!    `PlaySessionEvent::CallReply`, and `RtmpPlayer::call` →
+//!    `PlaySessionEvent::Call` → `PlaySession::reply_call_result` →
+//!    `PlayerPacket::CallReply`).
 //!
 //! Per spec: "The call method of the NetConnection object runs remote
 //! procedure calls (RPC) at the receiving end. The called RPC name is
@@ -229,4 +230,112 @@ fn call_command_round_trips_through_message() {
     let values = oxideav_rtmp::amf::decode_all(&msg.payload).expect("decode");
     let parsed = CallCommand::parse(&values).expect("parse");
     assert_eq!(parsed, call);
+}
+
+#[test]
+fn play_direction_rpc_both_ways() {
+    // Server → subscriber RPC (PlaySession::send_call →
+    // PlayerPacket::Call → RtmpPlayer::reply_call_result →
+    // PlaySessionEvent::CallReply), then subscriber → server RPC
+    // (RtmpPlayer::call → PlaySessionEvent::Call →
+    // PlaySession::reply_call_result → PlayerPacket::CallReply).
+    use oxideav_rtmp::{PlaySessionEvent, PlayerPacket, RtmpPlayer, SessionRequest};
+
+    let server = RtmpServer::bind("127.0.0.1:0").expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+    let url = format!("rtmp://{}:{}/vod/clip", addr.ip(), addr.port());
+
+    let (reply_tx, reply_rx) = mpsc::channel::<(bool, f64, Vec<Amf0Value>)>();
+
+    let server_thread = thread::spawn(move || {
+        let req = match server.accept_any().expect("accept_any") {
+            SessionRequest::Play(req) => req,
+            SessionRequest::Publish(_) => panic!("expected play"),
+        };
+        let mut session = req.accept().expect("accept");
+        session
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        // RPC at the subscriber.
+        session
+            .send_call(&CallCommand {
+                procedure: "onBWCheck".into(),
+                transaction_id: 31.0,
+                command_object: Amf0Value::Null,
+                arguments: vec![],
+            })
+            .expect("send_call");
+        // Pump subscriber events: expect our CallReply, then their
+        // RPC, then teardown.
+        loop {
+            match session.next_event() {
+                Ok(Some(PlaySessionEvent::CallReply {
+                    success,
+                    transaction_id,
+                    values,
+                })) => reply_tx.send((success, transaction_id, values)).unwrap(),
+                Ok(Some(PlaySessionEvent::Call(call))) => {
+                    assert_eq!(call.procedure, "getQuality");
+                    assert!(call.expects_response());
+                    session
+                        .reply_call_result(
+                            call.transaction_id,
+                            Amf0Value::Null,
+                            Amf0Value::String("hd".into()),
+                        )
+                        .expect("reply");
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
+
+    thread::sleep(Duration::from_millis(50));
+    let mut player = RtmpPlayer::connect(&url).expect("player connect");
+    player
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+
+    // Answer the server's RPC when it surfaces.
+    loop {
+        if let Some(PlayerPacket::Call(call)) = player.next_packet().expect("next_packet") {
+            assert_eq!(call.procedure, "onBWCheck");
+            assert_eq!(call.transaction_id, 31.0);
+            player
+                .reply_call_result(call.transaction_id, Amf0Value::Null, Amf0Value::Number(9.0))
+                .expect("reply");
+            break;
+        }
+    }
+
+    // Now issue our own RPC and wait for the matching reply.
+    let tx_id = player
+        .call("getQuality", Amf0Value::Null, &[], true)
+        .expect("call");
+    assert!(tx_id != 0.0);
+    let values = loop {
+        match player.next_packet().expect("next_packet") {
+            Some(PlayerPacket::CallReply {
+                success,
+                transaction_id,
+                values,
+            }) if transaction_id == tx_id => {
+                assert!(success);
+                break values;
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(values.get(3).and_then(Amf0Value::as_str), Some("hd"));
+
+    player.close().expect("close");
+    server_thread.join().expect("join");
+
+    let (success, tx, values) = reply_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server-side reply");
+    assert!(success);
+    assert_eq!(tx, 31.0);
+    assert_eq!(values.get(3).and_then(Amf0Value::as_f64), Some(9.0));
 }

@@ -115,7 +115,7 @@ fn publisher_to_subscriber_relay_preserves_stream() {
             PlayerPacket::Metadata(m) => metadata = Some(m),
             PlayerPacket::Video { timestamp, tag } => video.push((timestamp, tag.body)),
             PlayerPacket::Audio { timestamp, tag } => audio.push((timestamp, tag.body)),
-            PlayerPacket::Status { .. } | PlayerPacket::Control(_) => {}
+            _ => {}
         }
     }
 

@@ -97,6 +97,23 @@ pub enum PlayerPacket {
     /// (`PingRequest` is auto-replied; `StreamEOF` ends the stream and
     /// surfaces as `Ok(None)` instead.)
     Control(UserControlEvent),
+    /// A §7.2.1.2 NetConnection `call` RPC issued *by the server* at
+    /// this subscriber (e.g. the classic bandwidth-check shape) — any
+    /// command whose name is not a spec-defined built-in, since an
+    /// RPC's procedure name rides the command-name field. Answer with
+    /// [`RtmpPlayer::reply_call_result`] /
+    /// [`RtmpPlayer::reply_call_error`] when
+    /// [`CallCommand::expects_response`].
+    Call(CallCommand),
+    /// The server answered a player-issued [`RtmpPlayer::call`] with
+    /// `_result` (`success == true`) or `_error`; `values` is the
+    /// whole decoded §7.2.1.2 response frame — match `transaction_id`
+    /// against the id `call` returned.
+    CallReply {
+        success: bool,
+        transaction_id: f64,
+        values: Vec<Amf0Value>,
+    },
 }
 
 /// RTMP play (subscribe) client. See the [module docs](self) for the
@@ -118,6 +135,10 @@ pub struct RtmpPlayer {
     /// Sub-messages decomposed out of a server-side Aggregate Message
     /// (RTMP 1.0 §7.1.6) awaiting dispatch.
     pending_subs: VecDeque<Message>,
+    /// Next transaction id for a response-expecting §7.2.1.2 `call`.
+    /// connect used 1, createStream 2; RPCs start at 10 so log lines
+    /// are visually distinct from the fixed setup ids.
+    next_tx: f64,
 }
 
 impl RtmpPlayer {
@@ -205,7 +226,69 @@ impl RtmpPlayer {
             ended: false,
             is_recorded,
             pending_subs: VecDeque::new(),
+            next_tx: 10.0,
         })
+    }
+
+    /// Issue a §7.2.1.2 NetConnection `call` RPC at the server. With
+    /// `expects_response`, a fresh non-zero transaction id is allocated
+    /// and returned — match it against the
+    /// [`PlayerPacket::CallReply`] that
+    /// [`next_packet`](Self::next_packet) later surfaces. Without it
+    /// the spec's fire-and-forget transaction id 0 is used.
+    pub fn call(
+        &mut self,
+        procedure: &str,
+        command_object: Amf0Value,
+        arguments: &[Amf0Value],
+        expects_response: bool,
+    ) -> Result<f64> {
+        let tx = if expects_response {
+            let t = self.next_tx;
+            self.next_tx += 1.0;
+            t
+        } else {
+            0.0
+        };
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call(procedure, tx, command_object, arguments),
+        )?;
+        self.writer.flush()?;
+        Ok(tx)
+    }
+
+    /// Answer a server-initiated [`PlayerPacket::Call`] with the
+    /// §7.2.1.2 `_result(transaction_id, command_object, response)`
+    /// structure.
+    pub fn reply_call_result(
+        &mut self,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        response: Amf0Value,
+    ) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call_result(transaction_id, command_object, response),
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Failure counterpart of
+    /// [`reply_call_result`](Self::reply_call_result).
+    pub fn reply_call_error(
+        &mut self,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        response: Amf0Value,
+    ) -> Result<()> {
+        self.writer.write_message(
+            CSID_COMMAND,
+            &build_call_error(transaction_id, command_object, response),
+        )?;
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// NetStream message stream id the server allocated in
@@ -525,7 +608,24 @@ impl RtmpPlayer {
 /// 0 and expects onStatus replies, not `_result`).
 fn classify_status(values: &[Amf0Value]) -> Option<PlayerPacket> {
     let name = values.first().and_then(Amf0Value::as_str)?;
+    if matches!(name, "_result" | "_error") {
+        // §7.2.1.2 response to a player-issued RPC (`RtmpPlayer::call`;
+        // the connect / createStream transactions were consumed during
+        // setup).
+        let transaction_id = values.get(1).and_then(Amf0Value::as_f64).unwrap_or(0.0);
+        return Some(PlayerPacket::CallReply {
+            success: name == "_result",
+            transaction_id,
+            values: values.to_vec(),
+        });
+    }
     if name != "onStatus" {
+        // §7.2.1.2: an RPC's procedure name rides the command-name
+        // field, so a non-built-in command from the server is a call
+        // aimed at this subscriber.
+        if !crate::message::is_reserved_command_name(name) {
+            return CallCommand::parse(values).map(PlayerPacket::Call);
+        }
         return None;
     }
     let info = values.get(3)?;
