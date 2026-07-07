@@ -565,32 +565,58 @@ impl<W: Write> ChunkWriter<W> {
                 st.timestamp,
             )
         };
+        // Query the sticky "most recent fmt-0/1/2 chunk used an
+        // extended timestamp" bit and the last registered delta — a
+        // fmt-3 head chunk implicitly reuses both (§5.3.1.2.4).
+        let (prev_last_had_ext_ts, prev_last_delta) = self
+            .states
+            .get(&csid)
+            .map(|s| (s.last_had_ext_ts, s.last_delta))
+            .unwrap_or((false, 0));
 
+        let delta = msg.timestamp.wrapping_sub(prev_timestamp);
         // Pick the most compact fmt we can get away with.
-        let fmt = if !prev_primed || prev_stream_id != msg.msg_stream_id {
+        let fmt = if !prev_primed
+            || prev_stream_id != msg.msg_stream_id
+            || msg.timestamp < prev_timestamp
+        {
+            // First message on the csid, a different message stream, or
+            // a timestamp that went backwards (rare, e.g. seek in the
+            // source): re-prime with a full fmt 0 header.
             0
         } else if prev_type_id != msg.msg_type_id || prev_length != payload_len {
             1
-        } else if msg.timestamp < prev_timestamp {
-            // Timestamp went backwards (rare, e.g. seek in the source).
-            // Re-prime with fmt 0.
-            0
-        } else if msg.timestamp == prev_timestamp {
+        } else if delta == prev_last_delta {
+            // §5.3.1.2.4: a fmt-3 head chunk takes *every* value from
+            // the preceding chunk, including the timestamp delta — so
+            // it is only valid when this message's delta equals the
+            // one already registered on the csid. (The reader will add
+            // `last_delta` to its running timestamp.)
             3
         } else {
             2
         };
-        let delta = msg.timestamp.wrapping_sub(prev_timestamp);
         let ext_ts_needed = (fmt == 0 && msg.timestamp >= 0x00FF_FFFF)
-            || (fmt != 0 && fmt != 3 && delta >= 0x00FF_FFFF);
-
-        // Query the sticky "previous chunk used ext ts" bit we'll need
-        // to mirror on any fmt-3 continuation.
-        let prev_last_had_ext_ts = self
-            .states
-            .get(&csid)
-            .map(|s| s.last_had_ext_ts)
-            .unwrap_or(false);
+            || ((fmt == 1 || fmt == 2) && delta >= 0x00FF_FFFF);
+        // §5.3.1.3 (December 2012 revision): the extended-timestamp
+        // field is present in a Type 3 chunk when the most recent
+        // Type 0/1/2 chunk on the csid indicated one. That covers both
+        // a fmt-3 *head* chunk (inherits the previous chunk's ext bit)
+        // and every continuation chunk of a message whose own head
+        // chunk indicated ext.
+        let fmt3_ext = if fmt == 3 {
+            prev_last_had_ext_ts
+        } else {
+            ext_ts_needed
+        };
+        // Value carried by the ext field: the full 32-bit absolute
+        // timestamp for fmt 0, the full 32-bit delta for fmt 1/2, and
+        // the inherited delta for a fmt-3 head.
+        let ext_value = match fmt {
+            0 => msg.timestamp,
+            1 | 2 => delta,
+            _ => prev_last_delta,
+        };
 
         let chunk_size = self.chunk_size;
         let mut first_chunk_done = false;
@@ -619,29 +645,31 @@ impl<W: Write> ChunkWriter<W> {
                     self.write_u24_be(payload_len)?;
                     self.stream.write_all(&[msg.msg_type_id])?;
                     if ext_ts_needed {
-                        self.stream.write_all(&msg.timestamp.to_be_bytes())?;
+                        // §5.3.1.3: for a Type 1 chunk the field
+                        // encodes the full 32-bit *delta*, not the
+                        // absolute timestamp.
+                        self.stream.write_all(&ext_value.to_be_bytes())?;
                     }
                 }
                 2 => {
                     let ts_field = if ext_ts_needed { 0x00FF_FFFF } else { delta };
                     self.write_u24_be(ts_field)?;
                     if ext_ts_needed {
-                        self.stream.write_all(&msg.timestamp.to_be_bytes())?;
+                        self.stream.write_all(&ext_value.to_be_bytes())?;
                     }
                 }
                 3 => {
-                    // Continuation chunk must repeat the extended
-                    // timestamp iff the head chunk used one. Use the
-                    // current-message decision for the first round,
-                    // fall back to the previous message's sticky bit
-                    // otherwise.
-                    let ext_repeat = if !first_chunk_done {
-                        ext_ts_needed
-                    } else {
-                        prev_last_had_ext_ts && cursor == 0
-                    };
-                    if ext_repeat {
-                        self.stream.write_all(&msg.timestamp.to_be_bytes())?;
+                    // §5.3.1.3: a Type 3 chunk (head or continuation)
+                    // carries the extended-timestamp field when the
+                    // most recent Type 0/1/2 chunk on the csid
+                    // indicated one. For a fmt-3 head that is the
+                    // previous message's sticky bit; for a continuation
+                    // it is this message's own head-chunk decision
+                    // (`fmt3_ext` equals `ext_ts_needed` for fmt-0/1/2
+                    // heads, so one flag covers every chunk of the
+                    // message).
+                    if fmt3_ext {
+                        self.stream.write_all(&ext_value.to_be_bytes())?;
                     }
                 }
                 _ => unreachable!(),
@@ -659,7 +687,11 @@ impl<W: Write> ChunkWriter<W> {
         st.msg_length = payload_len;
         st.timestamp = msg.timestamp;
         st.last_delta = if fmt == 0 { msg.timestamp } else { delta };
-        st.last_had_ext_ts = ext_ts_needed;
+        // The sticky bit tracks the most recent fmt-0/1/2 chunk — a
+        // fmt-3 message leaves it untouched (mirroring the reader,
+        // which never updates it on fmt 3). `fmt3_ext` carries the
+        // previous value forward in that case.
+        st.last_had_ext_ts = fmt3_ext;
         st.primed = true;
         Ok(())
     }
@@ -916,25 +948,226 @@ mod tests {
         assert!(!r.abort_partial(9));
     }
 
-    /// Two back-to-back messages on the same csid should use fmt 3 for
-    /// the second when every field matches, keeping the wire compact.
-    #[test]
-    fn back_to_back_same_message_uses_fmt3() {
-        let msg = Message {
-            msg_type_id: 9,
-            msg_stream_id: 1,
-            timestamp: 1000,
-            payload: vec![0xAA; 32],
-        };
+    fn msg(ty: u8, stream: u32, ts: u32, len: usize) -> Message {
+        Message {
+            msg_type_id: ty,
+            msg_stream_id: stream,
+            timestamp: ts,
+            payload: vec![0xAA; len],
+        }
+    }
+
+    fn roundtrip(msgs: &[(u32, Message)], chunk_size: Option<usize>) -> Vec<Message> {
         let mut buf = Vec::new();
         {
             let mut w = ChunkWriter::new(&mut buf);
-            w.write_message(5, &msg).unwrap();
-            w.write_message(5, &msg).unwrap();
+            if let Some(cs) = chunk_size {
+                w.set_chunk_size(cs);
+            }
+            for (csid, m) in msgs {
+                w.write_message(*csid, m).unwrap();
+            }
         }
-        // First byte of the second basic header: fmt=3 (bits 7-6 = 11),
-        // csid=5 (bits 5-0 = 000101) → 0xC5.
-        let first_headers_len = 1 + 11 + 32; // fmt 0 on csid 5
-        assert_eq!(buf[first_headers_len], 0xC5);
+        let mut r = ChunkReader::new(Cursor::new(&buf));
+        if let Some(cs) = chunk_size {
+            r.set_chunk_size(cs);
+        }
+        msgs.iter().map(|_| r.read_message().unwrap()).collect()
+    }
+
+    /// §5.3.1.2.4: a fmt-3 head chunk reuses the registered delta —
+    /// spec worked example: "if the delta between the first message and
+    /// the second message is same as the time stamp of first message,
+    /// then chunk of type 3 would immediately follow the chunk of
+    /// type 0". Constant spacing after fmt 0 → fmt 3, and the reader
+    /// reconstructs every timestamp.
+    #[test]
+    fn constant_spacing_uses_fmt3_and_roundtrips() {
+        let msgs: Vec<(u32, Message)> = vec![
+            (5, msg(9, 1, 1000, 32)),
+            (5, msg(9, 1, 2000, 32)),
+            (5, msg(9, 1, 3000, 32)),
+        ];
+        let mut buf = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut buf);
+            for (csid, m) in &msgs {
+                w.write_message(*csid, m).unwrap();
+            }
+        }
+        // Second basic header (fmt=3, csid=5) → 0xC5, right after the
+        // fmt-0 chunk (1 + 11 header bytes + 32 payload bytes).
+        assert_eq!(buf[1 + 11 + 32], 0xC5);
+        // Third likewise, another bare basic header + payload later.
+        assert_eq!(buf[(1 + 11 + 32) + (1 + 32)], 0xC5);
+        let mut r = ChunkReader::new(Cursor::new(&buf));
+        for (_, m) in &msgs {
+            let got = r.read_message().unwrap();
+            assert_eq!(got.timestamp, m.timestamp);
+            assert_eq!(got.payload, m.payload);
+        }
+    }
+
+    /// A repeated timestamp is a delta of 0 — NOT the same delta the
+    /// fmt-0 head registered — so the writer must fall back to fmt 2
+    /// (delta 0) rather than fmt 3, or the reader would advance the
+    /// clock by the stale delta.
+    #[test]
+    fn same_timestamp_repeat_does_not_desync() {
+        let got = roundtrip(&[(5, msg(9, 1, 1000, 32)), (5, msg(9, 1, 1000, 32))], None);
+        assert_eq!(got[0].timestamp, 1000);
+        assert_eq!(got[1].timestamp, 1000);
+    }
+
+    /// §5.3.1.3 edge matrix — a multi-chunk message with an extended
+    /// absolute timestamp must repeat the ext field on every fmt-3
+    /// continuation chunk (December 2012 revision), or the reader
+    /// desyncs 4 bytes into the second chunk.
+    #[test]
+    fn ext_timestamp_multi_chunk_roundtrip() {
+        let payload: Vec<u8> = (0..1000u16).map(|i| (i & 0xFF) as u8).collect();
+        let m = Message {
+            msg_type_id: 9,
+            msg_stream_id: 1,
+            timestamp: 0x0100_0000,
+            payload: payload.clone(),
+        };
+        let got = roundtrip(&[(3, m)], Some(128));
+        assert_eq!(got[0].timestamp, 0x0100_0000);
+        assert_eq!(got[0].payload, payload);
+    }
+
+    /// Boundary case: a timestamp of exactly 0xFFFFFF MUST be sent via
+    /// the extended field ("greater than or equal to 16777215").
+    #[test]
+    fn ext_timestamp_exact_boundary() {
+        let mut buf = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut buf);
+            w.write_message(3, &msg(20, 0, 0x00FF_FFFF, 8)).unwrap();
+        }
+        // fmt-0 header: ts field must be the 0xFFFFFF sentinel and the
+        // 4-byte ext field must follow the 11-byte message header.
+        assert_eq!(&buf[1..4], &[0xFF, 0xFF, 0xFF]);
+        assert_eq!(&buf[12..16], &[0x00, 0xFF, 0xFF, 0xFF]);
+        let mut r = ChunkReader::new(Cursor::new(&buf));
+        assert_eq!(r.read_message().unwrap().timestamp, 0x00FF_FFFF);
+    }
+
+    /// Extended *delta* matrix: fmt-2 head with a ≥0xFFFFFF delta, then
+    /// a fmt-3 head reusing that same extended delta (which must carry
+    /// the ext field per the 2012 revision, since the most recent
+    /// fmt-0/1/2 chunk indicated one).
+    #[test]
+    fn ext_delta_fmt2_then_fmt3_head_roundtrip() {
+        let got = roundtrip(
+            &[
+                (5, msg(9, 1, 0, 16)),
+                (5, msg(9, 1, 0x0100_0000, 16)),
+                (5, msg(9, 1, 0x0200_0000, 16)),
+            ],
+            None,
+        );
+        assert_eq!(got[0].timestamp, 0);
+        assert_eq!(got[1].timestamp, 0x0100_0000);
+        assert_eq!(got[2].timestamp, 0x0200_0000);
+    }
+
+    /// Extended delta on a fmt-1 head (message type changes, huge
+    /// delta): the ext field must carry the 32-bit *delta*, not the
+    /// absolute timestamp.
+    #[test]
+    fn ext_delta_fmt1_roundtrip() {
+        let got = roundtrip(
+            &[(5, msg(9, 1, 100, 16)), (5, msg(8, 1, 0x0100_0064, 24))],
+            None,
+        );
+        assert_eq!(got[1].timestamp, 0x0100_0064);
+        assert_eq!(got[1].msg_type_id, 8);
+    }
+
+    /// An extended-delta head chunk of a multi-chunk message: every
+    /// continuation repeats the ext field too.
+    #[test]
+    fn ext_delta_multi_chunk_roundtrip() {
+        let payload: Vec<u8> = (0..600u16).map(|i| (i & 0xFF) as u8).collect();
+        let m2 = Message {
+            msg_type_id: 9,
+            msg_stream_id: 1,
+            timestamp: 0x0100_0000,
+            payload: payload.clone(),
+        };
+        let got = roundtrip(&[(5, msg(9, 1, 0, 16)), (5, m2)], Some(128));
+        assert_eq!(got[1].timestamp, 0x0100_0000);
+        assert_eq!(got[1].payload, payload);
+    }
+
+    /// §5.3.1.2.5: separate message streams CAN be multiplexed into one
+    /// chunk stream — each switch re-primes with a fmt-0 chunk.
+    #[test]
+    fn multiplexed_message_streams_one_csid() {
+        let got = roundtrip(
+            &[
+                (3, msg(8, 1, 500, 16)),
+                (3, msg(8, 2, 400, 16)),
+                (3, msg(8, 1, 600, 16)),
+            ],
+            None,
+        );
+        assert_eq!(
+            got.iter()
+                .map(|m| (m.msg_stream_id, m.timestamp))
+                .collect::<Vec<_>>(),
+            vec![(1, 500), (2, 400), (1, 600)]
+        );
+    }
+
+    /// Chunk-level interleave: two csids alternating chunk-by-chunk on
+    /// one connection. The reader keeps independent per-csid state, so
+    /// the message whose final chunk lands first completes first.
+    #[test]
+    fn interleaved_csids_chunk_by_chunk() {
+        // csid 3 carries a 2-chunk message; csid 4 slots a whole small
+        // message between the two chunks. Hand-spliced from two
+        // independently-written wires (per-csid state is independent,
+        // so the byte streams compose).
+        let mut wire_a = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut wire_a);
+            w.set_chunk_size(128);
+            let payload: Vec<u8> = (0..200u16).map(|i| (i & 0xFF) as u8).collect();
+            w.write_message(
+                3,
+                &Message {
+                    msg_type_id: 9,
+                    msg_stream_id: 1,
+                    timestamp: 10,
+                    payload,
+                },
+            )
+            .unwrap();
+        }
+        let mut wire_b = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut wire_b);
+            w.set_chunk_size(128);
+            w.write_message(4, &msg(8, 1, 20, 16)).unwrap();
+        }
+        // wire_a = [12-byte fmt0 header + 128 payload] + [1-byte fmt3
+        // header + 72 payload].
+        let split = 12 + 128;
+        let mut spliced = Vec::new();
+        spliced.extend_from_slice(&wire_a[..split]);
+        spliced.extend_from_slice(&wire_b);
+        spliced.extend_from_slice(&wire_a[split..]);
+        let mut r = ChunkReader::new(Cursor::new(&spliced));
+        r.set_chunk_size(128);
+        let first = r.read_message().unwrap();
+        assert_eq!(first.msg_type_id, 8, "csid-4 message completes first");
+        assert_eq!(first.timestamp, 20);
+        let second = r.read_message().unwrap();
+        assert_eq!(second.msg_type_id, 9);
+        assert_eq!(second.timestamp, 10);
+        assert_eq!(second.payload.len(), 200);
     }
 }
