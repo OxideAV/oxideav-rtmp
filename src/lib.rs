@@ -56,12 +56,17 @@
 //! [`PlayOptions::digest_handshake`] (with automatic fallback when the
 //! server doesn't digest).
 //!
+//! Shared Objects: the [`shared_object`] module parses + builds the
+//! message-type-19 (AMF0) / 16 (AMF3) Shared Object bodies — header,
+//! event framing, and all eleven documented event types — for callers
+//! that replicate property bags over an RTMP connection.
+//!
 //! Out of scope for this release:
 //!
 //! * RTMPS (TLS). Consumers who need it can wrap our `Read + Write`
 //!   with rustls. We may add an `rtmps` feature later.
-//! * Shared objects, RTMFP, and RTMP Encrypted (the RC4/DH transport
-//!   cipher that the digest handshake's key block feeds).
+//! * RTMFP and RTMP Encrypted (the RC4/DH transport cipher that the
+//!   digest handshake's key block feeds).
 
 pub mod adapter;
 pub mod aggregate;
@@ -80,6 +85,7 @@ pub mod message;
 mod netutil;
 pub mod player;
 pub mod server;
+pub mod shared_object;
 
 pub use adapter::{
     audio_codec_id, audio_codec_id_for_tag, audio_fourcc_codec_id, audio_to_packet, open_rtmp,
@@ -119,3 +125,4 @@ pub use server::{
     PlayRequest, PlaySession, PlaySessionEvent, PublishRequest, RtmpServer, RtmpSession,
     SessionRequest, StreamPacket,
 };
+pub use shared_object::{parse_shared_object, SharedObjectMessage, SoEvent, SO_FLAG_PERSISTENT};
