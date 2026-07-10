@@ -27,6 +27,7 @@ use crate::caps::ConnectCapabilities;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
 use crate::error::{Error, Result};
 use crate::flv::{self, AudioTag, VideoTag};
+use crate::handshake::HandshakeKind;
 use crate::message::*;
 
 /// Server-originated event observed by an [`RtmpClient`] in publish
@@ -185,6 +186,11 @@ pub struct RtmpClient {
     /// §5.4.5 Set Peer Bandwidth limit-type state (Hard / Soft /
     /// Dynamic) for the peer's output-bandwidth requests.
     peer_bw: PeerBandwidthLimiter,
+    /// Which handshake flavour the connection settled on — always
+    /// [`HandshakeKind::Simple`] for the plain constructors,
+    /// negotiated for
+    /// [`connect_with_digest_handshake`](Self::connect_with_digest_handshake).
+    handshake_kind: HandshakeKind,
 }
 
 /// Parsed RTMP URL: `rtmp://host[:port]/app/stream_name`.
@@ -237,7 +243,7 @@ impl RtmpClient {
     /// sequence, and return a ready-to-send client.
     pub fn connect(url: &str) -> Result<Self> {
         let parsed = RtmpUrl::parse(url)?;
-        Self::connect_parsed(&parsed, "live", &ConnectCapabilities::default())
+        Self::connect_parsed(&parsed, "live", &ConnectCapabilities::default(), false)
     }
 
     /// Same as [`connect`](Self::connect) but lets the caller pick the
@@ -245,7 +251,12 @@ impl RtmpClient {
     /// `"append"`).
     pub fn connect_with_type(url: &str, publish_type: &str) -> Result<Self> {
         let parsed = RtmpUrl::parse(url)?;
-        Self::connect_parsed(&parsed, publish_type, &ConnectCapabilities::default())
+        Self::connect_parsed(
+            &parsed,
+            publish_type,
+            &ConnectCapabilities::default(),
+            false,
+        )
     }
 
     /// Connect and advertise the supplied Enhanced RTMP v1+v2
@@ -266,7 +277,32 @@ impl RtmpClient {
         caps: &ConnectCapabilities,
     ) -> Result<Self> {
         let parsed = RtmpUrl::parse(url)?;
-        Self::connect_parsed(&parsed, publish_type, caps)
+        Self::connect_parsed(&parsed, publish_type, caps, false)
+    }
+
+    /// Same as [`connect_with_capabilities`](Self::connect_with_capabilities)
+    /// but running the digest (HMAC-SHA256) handshake instead of the
+    /// plain echo exchange: C1 goes out with an embedded digest and a
+    /// non-zero version field, and the server's digested S1/S2 are
+    /// validated. Falls back to the simple exchange transparently when
+    /// the server doesn't answer with a digested S1 — inspect
+    /// [`handshake_kind`](Self::handshake_kind) to learn what was
+    /// negotiated and whether the server's response digest verified.
+    pub fn connect_with_digest_handshake(
+        url: &str,
+        publish_type: &str,
+        caps: &ConnectCapabilities,
+    ) -> Result<Self> {
+        let parsed = RtmpUrl::parse(url)?;
+        Self::connect_parsed(&parsed, publish_type, caps, true)
+    }
+
+    /// Which handshake flavour the connection settled on
+    /// ([`HandshakeKind::Simple`] unless the client was built via
+    /// [`connect_with_digest_handshake`](Self::connect_with_digest_handshake)
+    /// and the server proved digest support).
+    pub fn handshake_kind(&self) -> HandshakeKind {
+        self.handshake_kind
     }
 
     /// Capability block advertised by the server in `_result(connect)`.
@@ -310,7 +346,12 @@ impl RtmpClient {
         }
     }
 
-    fn connect_parsed(u: &RtmpUrl, publish_type: &str, caps: &ConnectCapabilities) -> Result<Self> {
+    fn connect_parsed(
+        u: &RtmpUrl,
+        publish_type: &str,
+        caps: &ConnectCapabilities,
+        digest_handshake: bool,
+    ) -> Result<Self> {
         let sock_addr = (u.host.as_str(), u.port)
             .to_socket_addrs()
             .map_err(Error::from)?
@@ -322,7 +363,15 @@ impl RtmpClient {
         // Handshake on a fresh clone — no chunk state is shared with
         // it.
         let mut hs = stream.try_clone()?;
-        crate::handshake::client_handshake(&mut hs)?;
+        let handshake_kind = if digest_handshake {
+            crate::handshake::client_handshake_digest(
+                &mut hs,
+                crate::handshake::DigestScheme::Schema1,
+            )?
+        } else {
+            crate::handshake::client_handshake(&mut hs)?;
+            HandshakeKind::Simple
+        };
 
         let mut reader = ChunkReader::new(stream.try_clone()?);
         let mut writer = ChunkWriter::new(stream.try_clone()?);
@@ -393,6 +442,7 @@ impl RtmpClient {
             tc_url: u.tc_url.clone(),
             pending_subs: VecDeque::new(),
             peer_bw: PeerBandwidthLimiter::new(),
+            handshake_kind,
         })
     }
 

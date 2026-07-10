@@ -41,6 +41,7 @@ use crate::client::{
 };
 use crate::error::{Error, Result};
 use crate::flv::{parse_audio, parse_video, AudioTag, VideoTag};
+use crate::handshake::HandshakeKind;
 use crate::message::*;
 use crate::server::metadata_object;
 
@@ -69,6 +70,11 @@ pub struct PlayOptions {
     /// Enhanced RTMP v1+v2 capability block to advertise in the
     /// `connect` Command Object. Default = empty (legacy byte layout).
     pub capabilities: ConnectCapabilities,
+    /// Run the digest (HMAC-SHA256) handshake instead of the plain
+    /// echo exchange. Falls back to the simple handshake automatically
+    /// when the server doesn't answer with a digested S1; the outcome
+    /// is reported by [`RtmpPlayer::handshake_kind`]. Default `false`.
+    pub digest_handshake: bool,
 }
 
 /// One event delivered to a playing client by
@@ -142,6 +148,8 @@ pub struct RtmpPlayer {
     /// connect used 1, createStream 2; RPCs start at 10 so log lines
     /// are visually distinct from the fixed setup ids.
     next_tx: f64,
+    /// Which handshake flavour the connection settled on.
+    handshake_kind: HandshakeKind,
 }
 
 impl RtmpPlayer {
@@ -167,7 +175,15 @@ impl RtmpPlayer {
         let _ = stream.set_nodelay(true);
 
         let mut hs = stream.try_clone()?;
-        crate::handshake::client_handshake(&mut hs)?;
+        let handshake_kind = if opts.digest_handshake {
+            crate::handshake::client_handshake_digest(
+                &mut hs,
+                crate::handshake::DigestScheme::Schema1,
+            )?
+        } else {
+            crate::handshake::client_handshake(&mut hs)?;
+            HandshakeKind::Simple
+        };
 
         let mut reader = ChunkReader::new(stream.try_clone()?);
         let mut writer = ChunkWriter::new(stream.try_clone()?);
@@ -231,7 +247,16 @@ impl RtmpPlayer {
             pending_subs: VecDeque::new(),
             peer_bw: PeerBandwidthLimiter::new(),
             next_tx: 10.0,
+            handshake_kind,
         })
+    }
+
+    /// Which handshake flavour the connection settled on
+    /// ([`HandshakeKind::Simple`] unless
+    /// [`PlayOptions::digest_handshake`] was set and the server proved
+    /// digest support).
+    pub fn handshake_kind(&self) -> HandshakeKind {
+        self.handshake_kind
     }
 
     /// Issue a §7.2.1.2 NetConnection `call` RPC at the server. With

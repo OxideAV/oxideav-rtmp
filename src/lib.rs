@@ -49,12 +49,19 @@
 //!   handle all thirteen markers plus the three reference tables
 //!   (strings / objects / traits).
 //!
+//! Handshakes: the plain echo handshake and the digest (HMAC-SHA256)
+//! handshake are both supported — the server auto-detects which one a
+//! client speaks ([`handshake::server_handshake_negotiated`]), and
+//! clients opt in via [`RtmpClient::connect_with_digest_handshake`] /
+//! [`PlayOptions::digest_handshake`] (with automatic fallback when the
+//! server doesn't digest).
+//!
 //! Out of scope for this release:
 //!
 //! * RTMPS (TLS). Consumers who need it can wrap our `Read + Write`
 //!   with rustls. We may add an `rtmps` feature later.
-//! * Shared objects, RTMFP, RTMP Encrypted, and the Adobe
-//!   digest-verified handshake variant.
+//! * Shared objects, RTMFP, and RTMP Encrypted (the RC4/DH transport
+//!   cipher that the digest handshake's key block feeds).
 
 pub mod adapter;
 pub mod aggregate;
@@ -68,6 +75,7 @@ pub mod flv;
 pub mod flv_crypt;
 pub mod flv_file;
 pub mod handshake;
+mod hmac;
 pub mod message;
 mod netutil;
 pub mod player;
@@ -100,6 +108,9 @@ pub use flv_crypt::{
     FILTER_NAME_SELECTIVE, IV_LEN, NUM_FILTERS,
 };
 pub use flv_file::{FlvHeaderFlags, FlvReader, FlvTag, FlvWriter};
+pub use handshake::{
+    client_handshake_digest, server_handshake_negotiated, DigestScheme, HandshakeKind,
+};
 pub use message::{
     CallCommand, NetStreamCommand, PeerBandwidthLimiter, UserControlEvent, RECONNECT_REQUEST_CODE,
 };
