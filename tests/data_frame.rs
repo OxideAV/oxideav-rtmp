@@ -267,3 +267,80 @@ fn bare_data_messages_store_only_metadata() {
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].0, "onMetaData");
 }
+
+/// The full §2 replay story: a publisher stores data frames, a *late*
+/// subscriber connects afterwards, and the server hands it the stored
+/// state (`RtmpSession::data_frames` → `PlaySession::send_data`) —
+/// each frame arriving unwrapped (no `@setDataFrame` prefix).
+#[test]
+fn late_subscriber_receives_replayed_data_frames() {
+    let server = RtmpServer::bind("127.0.0.1:0").expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let server_thread = thread::spawn(move || {
+        // Connection 1: the publisher.
+        let mut publish = match server.accept_any().expect("accept publisher") {
+            oxideav_rtmp::SessionRequest::Publish(req) => req.accept().expect("session"),
+            oxideav_rtmp::SessionRequest::Play(_) => panic!("expected publisher first"),
+        };
+        publish
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        // Pump until both frames are stored.
+        while publish.data_frames().len() < 2 {
+            match publish.next_packet() {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => panic!("publisher ended before frames stored"),
+            }
+        }
+        let stored = publish.data_frames().to_vec();
+        ready_tx.send(()).unwrap();
+
+        // Connection 2: the late subscriber — replay the stored state.
+        let mut play = match server.accept_any().expect("accept subscriber") {
+            oxideav_rtmp::SessionRequest::Play(req) => req.accept().expect("play session"),
+            oxideav_rtmp::SessionRequest::Publish(_) => panic!("expected subscriber second"),
+        };
+        for (handler, value) in &stored {
+            play.send_data(handler, value).expect("replay frame");
+        }
+        play.close().expect("close play");
+
+        // Let the publisher finish.
+        while let Ok(Some(_)) = publish.next_packet() {}
+    });
+
+    thread::sleep(Duration::from_millis(50));
+    let url = format!("rtmp://{}:{}/live/replay-key", addr.ip(), addr.port());
+    let mut publisher = RtmpClient::connect(&url).expect("publisher connect");
+    let cue = Amf0Value::Object(vec![("t".into(), Amf0Value::Number(0.0))]);
+    publisher.send_metadata(sample_meta()).expect("metadata");
+    publisher
+        .send_data_frame("onCuePoint", cue.clone())
+        .expect("cue");
+
+    // Wait until the server confirms both frames are stored, then
+    // bring up the late subscriber.
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server must store both frames");
+    let play_url = format!("rtmp://{}:{}/live/replay-play", addr.ip(), addr.port());
+    let mut player = oxideav_rtmp::RtmpPlayer::connect(&play_url).expect("player connect");
+
+    let mut got: Vec<Amf0Value> = Vec::new();
+    while let Ok(Some(pkt)) = player.next_packet() {
+        if let oxideav_rtmp::PlayerPacket::Metadata(v) = pkt {
+            got.push(v);
+        }
+    }
+    assert_eq!(
+        got,
+        vec![sample_meta(), cue],
+        "late subscriber must receive both stored frames, unwrapped, in order"
+    );
+
+    thread::sleep(Duration::from_millis(50));
+    publisher.close().expect("publisher close");
+    server_thread.join().expect("server thread");
+}

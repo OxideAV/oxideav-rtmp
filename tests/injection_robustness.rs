@@ -766,3 +766,181 @@ fn amf0_valid_then_mutated_never_panics() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared Object body fuzz — random bytes through both flavours
+// ---------------------------------------------------------------------------
+
+/// Random byte strings through `SharedObjectMessage::parse_amf0` /
+/// `parse_amf3`: always a clean `Result`, never a panic, hang, or
+/// over-allocation (a forged UI32 event length must be checked against
+/// the remaining bytes before any allocation happens).
+#[test]
+fn shared_object_parse_random_bytes_never_panics() {
+    use oxideav_rtmp::shared_object::SharedObjectMessage;
+    let mut rng = Xs64::new(0x5A5A_0B1E_0001);
+    for _ in 0..1024 {
+        let len = (rng.next() as usize) % 257;
+        let mut buf = vec![0u8; len];
+        rng.fill(&mut buf);
+        let _ = SharedObjectMessage::<Amf0Value>::parse_amf0(&buf);
+        let _ = SharedObjectMessage::<oxideav_rtmp::Amf3Value>::parse_amf3(&buf);
+    }
+}
+
+/// Structured-but-corrupted SO bodies: build a healthy multi-event
+/// message, then splice random garbage into random offsets.
+#[test]
+fn shared_object_parse_corrupted_frames_never_panic() {
+    use oxideav_rtmp::shared_object::{SharedObjectMessage, SoEvent};
+    let mut so = SharedObjectMessage::new("fuzz-target");
+    so.version = 7;
+    so.events = vec![
+        SoEvent::Use,
+        SoEvent::Change {
+            pairs: vec![
+                ("a".into(), Amf0Value::Number(1.0)),
+                ("b".into(), Amf0Value::String("x".repeat(40))),
+            ],
+        },
+        SoEvent::SendMessage {
+            handler: "h".into(),
+            args: vec![Amf0Value::Null, Amf0Value::Boolean(true)],
+        },
+        SoEvent::Status {
+            code: "c".into(),
+            level: "l".into(),
+        },
+    ];
+    let healthy = so.build_amf0().expect("build");
+
+    let mut rng = Xs64::new(0x5A5A_0B1E_0002);
+    for _ in 0..512 {
+        let mut mutated = healthy.clone();
+        // Corrupt 1..=8 random positions.
+        let hits = 1 + (rng.next() as usize) % 8;
+        for _ in 0..hits {
+            let pos = (rng.next() as usize) % mutated.len();
+            mutated[pos] = rng.next() as u8;
+        }
+        let _ = SharedObjectMessage::<Amf0Value>::parse_amf0(&mutated);
+        // Random truncation of the corrupted body too.
+        let cut = (rng.next() as usize) % (mutated.len() + 1);
+        let _ = SharedObjectMessage::<Amf0Value>::parse_amf0(&mutated[..cut]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Digest handshake fuzz — random 1536-byte packets through the digest
+// validators and the negotiated server
+// ---------------------------------------------------------------------------
+
+/// Random C1-shaped packets through digest detection / offset
+/// arithmetic: `find_digest` must reject cleanly (the probability of a
+/// random packet carrying a valid HMAC is ~2^-256) and both offset
+/// helpers must stay in bounds for every byte pattern.
+#[test]
+fn digest_detection_random_packets_never_panic() {
+    use oxideav_rtmp::handshake::{
+        digest_offset, find_digest, key_offset, verify_response_digest, DigestScheme,
+        FMS_LABEL_LEN, FP_LABEL_LEN, GENUINE_FMS_KEY, GENUINE_FP_KEY, HANDSHAKE_PAYLOAD_LEN,
+    };
+    let mut rng = Xs64::new(0xD16E_57F2_0001);
+    for _ in 0..256 {
+        let mut pkt = [0u8; HANDSHAKE_PAYLOAD_LEN];
+        rng.fill(&mut pkt);
+        assert!(find_digest(&pkt, &GENUINE_FP_KEY[..FP_LABEL_LEN]).is_none());
+        assert!(find_digest(&pkt, &GENUINE_FMS_KEY[..FMS_LABEL_LEN]).is_none());
+        for scheme in [DigestScheme::Schema0, DigestScheme::Schema1] {
+            let d = digest_offset(&pkt, scheme);
+            assert!(d + 32 <= HANDSHAKE_PAYLOAD_LEN);
+            let k = key_offset(&pkt, scheme);
+            assert!(k + 128 <= HANDSHAKE_PAYLOAD_LEN);
+        }
+        let junk_digest = [0u8; 32];
+        assert!(!verify_response_digest(
+            &pkt,
+            &junk_digest,
+            &GENUINE_FMS_KEY
+        ));
+    }
+}
+
+/// A junk-version C1 (random bytes, non-zero version field) through
+/// `server_handshake_negotiated` must complete as a simple echo
+/// handshake — never error, never take the digest path.
+#[test]
+fn negotiated_server_random_c1_never_panics() {
+    use oxideav_rtmp::handshake::{server_handshake_negotiated, HandshakeKind};
+    let mut rng = Xs64::new(0xD16E_57F2_0002);
+    for _ in 0..64 {
+        let mut c1 = vec![0u8; 1536];
+        rng.fill(&mut c1);
+        let mut wire = Vec::with_capacity(1 + 1536 * 2);
+        wire.push(0x03);
+        wire.extend_from_slice(&c1);
+        wire.extend_from_slice(&[0u8; 1536]); // C2 drain
+        let mut duplex = DuplexPipe {
+            read: Cursor::new(wire),
+            write: Vec::new(),
+        };
+        let kind = server_handshake_negotiated(&mut duplex).expect("handshake");
+        assert_eq!(kind, HandshakeKind::Simple);
+        // S2 must echo the random C1 exactly.
+        assert_eq!(&duplex.write[1 + 1536..], &c1[..]);
+    }
+}
+
+struct DuplexPipe {
+    read: Cursor<Vec<u8>>,
+    write: Vec<u8>,
+}
+impl std::io::Read for DuplexPipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.read, buf)
+    }
+}
+impl std::io::Write for DuplexPipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data-frame classifier fuzz
+// ---------------------------------------------------------------------------
+
+/// Random AMF0 value lists (decoded from random bytes when they decode
+/// at all) plus adversarial hand-built lists through
+/// `parse_data_frame` — must classify or return `None`, never panic.
+#[test]
+fn parse_data_frame_random_values_never_panics() {
+    use oxideav_rtmp::parse_data_frame;
+    let mut rng = Xs64::new(0xDA7A_F4A3_0001);
+    for _ in 0..1024 {
+        let len = (rng.next() as usize) % 129;
+        let mut buf = vec![0u8; len];
+        rng.fill(&mut buf);
+        if let Ok(values) = amf0_decode_all(&buf) {
+            let _ = parse_data_frame(&values);
+        }
+    }
+    // Adversarial: control names with every wrong-typed argument shape.
+    let weird: Vec<Amf0Value> = vec![
+        Amf0Value::Null,
+        Amf0Value::Number(1.0),
+        Amf0Value::Boolean(false),
+        Amf0Value::Object(vec![]),
+        Amf0Value::EcmaArray(vec![]),
+    ];
+    for name in ["@setDataFrame", "@clearDataFrame"] {
+        for w in &weird {
+            let _ = parse_data_frame(&[Amf0Value::String(name.into()), w.clone()]);
+            let _ = parse_data_frame(&[Amf0Value::String(name.into()), w.clone(), w.clone()]);
+        }
+    }
+}
