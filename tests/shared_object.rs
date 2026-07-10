@@ -318,3 +318,152 @@ fn parse_shared_object_rejects_wrong_type() {
     };
     assert!(parse_shared_object(&msg).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Live SO exchange over loopback: all four connection surfaces.
+// ---------------------------------------------------------------------------
+
+use std::thread;
+use std::time::Duration;
+
+use oxideav_rtmp::{
+    ClientEvent, PlaySessionEvent, PlayerPacket, RtmpClient, RtmpPlayer, RtmpServer,
+    SessionRequest, StreamPacket,
+};
+
+/// Publish direction: the client `Use`s a shared object, the ingest
+/// session sees it as `StreamPacket::SharedObject` and answers with
+/// the acceptance sequence + a `Change` broadcast, which surfaces as
+/// `ClientEvent::SharedObject` on the publisher.
+#[test]
+fn publish_connection_shared_object_exchange() {
+    let server = RtmpServer::bind("127.0.0.1:0").expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+
+    let server_thread = thread::spawn(move || {
+        let req = server.accept().expect("accept");
+        let mut session = req.accept().expect("session");
+        session
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        // Wait for the client's Use.
+        let so = loop {
+            match session.next_packet().expect("next_packet") {
+                Some(StreamPacket::SharedObject(so)) => break so,
+                Some(_) => continue,
+                None => panic!("stream ended before the SO arrived"),
+            }
+        };
+        assert_eq!(so.name, "lobby");
+        assert_eq!(so.events, vec![SoEvent::Use]);
+
+        // Acceptance sequence + a Change broadcast.
+        let mut reply = SharedObjectMessage::new("lobby");
+        reply.version = 1;
+        reply.events = vec![
+            SoEvent::UseSuccess,
+            SoEvent::Clear,
+            SoEvent::Change {
+                pairs: vec![("topic".into(), Amf0Value::String("welcome".into()))],
+            },
+        ];
+        session.send_shared_object(&reply).expect("send SO");
+        // Drain until the client closes.
+        while let Ok(Some(_)) = session.next_packet() {}
+    });
+
+    thread::sleep(Duration::from_millis(50));
+    let url = format!("rtmp://{}:{}/live/so-key", addr.ip(), addr.port());
+    let mut client = RtmpClient::connect(&url).expect("connect");
+
+    let mut use_msg = SharedObjectMessage::new("lobby");
+    use_msg.events = vec![SoEvent::Use];
+    client.send_shared_object(&use_msg).expect("send Use");
+
+    // Pump events until the server's SO reply arrives.
+    let so = loop {
+        match client.poll_event().expect("poll_event") {
+            Some(ClientEvent::SharedObject(so)) => break so,
+            Some(_) => continue,
+            None => panic!("connection ended before the SO reply"),
+        }
+    };
+    assert_eq!(so.name, "lobby");
+    assert_eq!(so.version, 1);
+    assert_eq!(so.events.len(), 3);
+    assert_eq!(so.events[0], SoEvent::UseSuccess);
+    assert_eq!(so.events[1], SoEvent::Clear);
+    assert_eq!(
+        so.events[2],
+        SoEvent::Change {
+            pairs: vec![("topic".into(), Amf0Value::String("welcome".into()))],
+        }
+    );
+
+    client.close().expect("close");
+    server_thread.join().expect("server thread");
+}
+
+/// Play direction: the subscriber `Use`s a shared object
+/// (`PlaySessionEvent::SharedObject` on the serving side), the play
+/// session broadcasts a `Change` (`PlayerPacket::SharedObject` on the
+/// player side).
+#[test]
+fn play_connection_shared_object_exchange() {
+    let server = RtmpServer::bind("127.0.0.1:0").expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+
+    let server_thread = thread::spawn(move || match server.accept_any().expect("accept_any") {
+        SessionRequest::Play(req) => {
+            let mut session = req.accept().expect("play session");
+            session
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let so = loop {
+                match session.next_event().expect("next_event") {
+                    Some(PlaySessionEvent::SharedObject(so)) => break so,
+                    Some(_) => continue,
+                    None => panic!("play session ended before the SO arrived"),
+                }
+            };
+            assert_eq!(so.name, "scores");
+            assert_eq!(so.events, vec![SoEvent::Use]);
+
+            let mut bcast = SharedObjectMessage::new("scores");
+            bcast.version = 5;
+            bcast.events = vec![SoEvent::Change {
+                pairs: vec![("points".into(), Amf0Value::Number(99.0))],
+            }];
+            session.send_shared_object(&bcast).expect("send SO");
+            session.close().expect("close");
+        }
+        SessionRequest::Publish(_) => panic!("expected a play request"),
+    });
+
+    thread::sleep(Duration::from_millis(50));
+    let url = format!("rtmp://{}:{}/live/so-play", addr.ip(), addr.port());
+    let mut player = RtmpPlayer::connect(&url).expect("play connect");
+
+    let mut use_msg = SharedObjectMessage::new("scores");
+    use_msg.events = vec![SoEvent::Use];
+    player.send_shared_object(&use_msg).expect("send Use");
+
+    let mut seen = None;
+    while let Ok(Some(pkt)) = player.next_packet() {
+        if let PlayerPacket::SharedObject(so) = pkt {
+            seen = Some(so);
+            break;
+        }
+    }
+    let so = seen.expect("SO broadcast must arrive");
+    assert_eq!(so.name, "scores");
+    assert_eq!(so.version, 5);
+    assert_eq!(
+        so.events,
+        vec![SoEvent::Change {
+            pairs: vec![("points".into(), Amf0Value::Number(99.0))],
+        }]
+    );
+
+    server_thread.join().expect("server thread");
+}

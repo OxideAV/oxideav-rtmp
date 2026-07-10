@@ -504,6 +504,10 @@ pub enum PlaySessionEvent {
         transaction_id: f64,
         values: Vec<Amf0Value>,
     },
+    /// A Shared Object message (type 19 AMF0 / 16 AMF3, bridged onto
+    /// AMF0) from the subscriber — e.g. a `Use` subscribing to a named
+    /// SO. Answer with [`PlaySession::send_shared_object`].
+    SharedObject(crate::shared_object::SharedObjectMessage<Amf0Value>),
 }
 
 /// Active play (subscriber) session after [`PlayRequest::accept`].
@@ -620,6 +624,9 @@ impl PlaySession {
             // form (it only stops future replays).
             StreamPacket::DataFrame { handler, value } => self.send_data(handler, value),
             StreamPacket::DataFrameCleared { .. } => Ok(()),
+            // SO traffic is per-connection state replication, not
+            // stream content — not forwarded.
+            StreamPacket::SharedObject(_) => Ok(()),
             StreamPacket::Command(_) | StreamPacket::Call(_) | StreamPacket::CallReply { .. } => {
                 Ok(())
             }
@@ -762,6 +769,9 @@ impl PlaySession {
                 let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 self.classify_command_values(&values)
             }
+            MSG_SHARED_OBJECT_AMF0 | MSG_SHARED_OBJECT_AMF3 => Ok(Some(
+                PlaySessionEvent::SharedObject(crate::shared_object::parse_shared_object(&msg)?),
+            )),
             MSG_USER_CONTROL => {
                 match UserControlEvent::parse(&msg.payload)? {
                     UserControlEvent::SetBufferLength { buffer_ms, .. } => {
@@ -843,6 +853,20 @@ impl PlaySession {
             return Ok(None);
         }
         Ok(NetStreamCommand::parse(values)?.map(PlaySessionEvent::Command))
+    }
+
+    /// Send a Shared Object message (AMF0, type 19) to the subscriber
+    /// — e.g. the `UseSuccess` + `Clear` acceptance sequence, or a
+    /// `Change` broadcast to a replica the subscriber `Use`d. SO
+    /// traffic rides the command chunk stream on message stream 0.
+    pub fn send_shared_object(
+        &mut self,
+        so: &crate::shared_object::SharedObjectMessage<Amf0Value>,
+    ) -> Result<()> {
+        self.writer
+            .write_message(CSID_COMMAND, &so.to_message_amf0(0)?)?;
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// Issue a §7.2.1.2 NetConnection `call` RPC *to the subscriber*.
@@ -1004,6 +1028,11 @@ pub enum StreamPacket {
     /// [`RtmpSession::reply_call_error`] when
     /// [`CallCommand::expects_response`].
     Call(CallCommand),
+    /// A Shared Object message (type 19 AMF0 / 16 AMF3, bridged onto
+    /// AMF0) from the peer — e.g. a `Use` subscribing to a named SO or
+    /// a `RequestChange` proposing a property value. Answer with
+    /// [`RtmpSession::send_shared_object`].
+    SharedObject(crate::shared_object::SharedObjectMessage<Amf0Value>),
     /// The peer answered a server-initiated
     /// [`RtmpSession::send_call`] with `_result` (`success == true`)
     /// or `_error`. `values` is the whole decoded §7.2.1.2 response
@@ -1262,6 +1291,20 @@ impl RtmpSession {
             .map(|(_, v)| v)
     }
 
+    /// Send a Shared Object message (AMF0, type 19) to the peer — the
+    /// server side of the SO conversation (e.g. a `UseSuccess` +
+    /// `Clear` answering a client's `Use`, or a `Change` broadcast).
+    /// SO traffic rides the command chunk stream on message stream 0.
+    pub fn send_shared_object(
+        &mut self,
+        so: &crate::shared_object::SharedObjectMessage<Amf0Value>,
+    ) -> Result<()> {
+        self.writer
+            .write_message(CSID_COMMAND, &so.to_message_amf0(0)?)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Classify one decoded data-message value list (types 18/15 both
     /// land here after AMF3 bridging) and maintain the stored
     /// data-frame state:
@@ -1363,6 +1406,13 @@ impl RtmpSession {
                 // detection and §4.2 NetStream control commands.
                 let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 self.handle_command_values(&values)
+            }
+            MSG_SHARED_OBJECT_AMF0 | MSG_SHARED_OBJECT_AMF3 => {
+                // Shared Object update from the peer (AMF3 values are
+                // bridged onto AMF0 by parse_shared_object).
+                Ok(Some(StreamPacket::SharedObject(
+                    crate::shared_object::parse_shared_object(&msg)?,
+                )))
             }
             MSG_AGGREGATE => {
                 // RTMP 1.0 §7.1.6 Aggregate Message. Split into

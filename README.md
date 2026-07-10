@@ -202,7 +202,11 @@ client.close()?;
   UI16-prefixed strings; values are full AMF0 or AMF3 values (the
   struct is generic over the flavour, and `parse_shared_object`
   bridges either onto AMF0). Unknown event codes round-trip verbatim
-  for relays; truncations and overruns are clean errors.
+  for relays; truncations and overruns are clean errors. SO traffic is
+  live on all four connection surfaces: inbound messages surface as
+  `StreamPacket::SharedObject` / `ClientEvent::SharedObject` /
+  `PlayerPacket::SharedObject` / `PlaySessionEvent::SharedObject`, and
+  every surface has a `send_shared_object` for the reply direction.
 - **`@setDataFrame` / `@clearDataFrame`.** The reserved data-frame
   control names are wired on every surface: `RtmpClient::send_metadata`
   (the `onMetaData` special case), `send_data_frame(handler, value)`,

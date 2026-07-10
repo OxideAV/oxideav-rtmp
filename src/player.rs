@@ -120,6 +120,10 @@ pub enum PlayerPacket {
         transaction_id: f64,
         values: Vec<Amf0Value>,
     },
+    /// A Shared Object message (type 19 AMF0 / 16 AMF3, bridged onto
+    /// AMF0) from the server — e.g. a `Change` broadcast for an SO
+    /// this player `Use`d via [`RtmpPlayer::send_shared_object`].
+    SharedObject(crate::shared_object::SharedObjectMessage<Amf0Value>),
 }
 
 /// RTMP play (subscribe) client. See the [module docs](self) for the
@@ -433,6 +437,9 @@ impl RtmpPlayer {
                 let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 Ok(classify_status(&values))
             }
+            MSG_SHARED_OBJECT_AMF0 | MSG_SHARED_OBJECT_AMF3 => Ok(Some(
+                PlayerPacket::SharedObject(crate::shared_object::parse_shared_object(&msg)?),
+            )),
             MSG_USER_CONTROL => match UserControlEvent::parse(&msg.payload)? {
                 UserControlEvent::StreamEof { .. } => {
                     // §7.1.7: playback is over as requested. Latch and
@@ -523,6 +530,21 @@ impl RtmpPlayer {
     /// with `onStatus(NetStream.Seek.Notify)`; on failure, `_error`.
     pub fn seek(&mut self, milliseconds: f64) -> Result<()> {
         self.send_netstream(&NetStreamCommand::Seek { milliseconds })
+    }
+
+    /// Send a Shared Object message (AMF0, type 19) to the server —
+    /// e.g. a `Use` subscribing to a named SO. Server-side SO traffic
+    /// surfaces as [`PlayerPacket::SharedObject`] through
+    /// [`next_packet`](Self::next_packet). SO traffic rides the
+    /// command chunk stream on message stream 0.
+    pub fn send_shared_object(
+        &mut self,
+        so: &crate::shared_object::SharedObjectMessage<Amf0Value>,
+    ) -> Result<()> {
+        self.writer
+            .write_message(CSID_COMMAND, &so.to_message_amf0(0)?)?;
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// §4.2.4 `receiveAudio(flag)` — tell the server whether to send

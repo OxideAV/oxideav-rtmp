@@ -133,6 +133,11 @@ pub enum ClientEvent {
     /// [`RtmpClient::reply_call_error`] when
     /// [`CallCommand::expects_response`].
     Call(CallCommand),
+    /// A Shared Object message (type 19 AMF0 / 16 AMF3, bridged onto
+    /// AMF0) from the server — e.g. a `Change` broadcast or the
+    /// `UseSuccess` + `Clear` acceptance sequence for an SO this
+    /// client `Use`d via [`RtmpClient::send_shared_object`].
+    SharedObject(crate::shared_object::SharedObjectMessage<Amf0Value>),
     /// Any other server-originated message (ping, ack, set-chunk-size,
     /// bandwidth — most of which the client handles transparently
     /// inside [`RtmpClient::poll_event`] before this variant ever fires).
@@ -597,6 +602,22 @@ impl RtmpClient {
         self.clear_data_frame("onMetaData")
     }
 
+    /// Send a Shared Object message (AMF0, type 19) to the server —
+    /// e.g. a `Use` subscribing to a named SO or a `RequestChange`
+    /// proposing a property value. Server-side SO traffic surfaces as
+    /// [`ClientEvent::SharedObject`] through
+    /// [`poll_event`](Self::poll_event). SO traffic rides the command
+    /// chunk stream on message stream 0.
+    pub fn send_shared_object(
+        &mut self,
+        so: &crate::shared_object::SharedObjectMessage<Amf0Value>,
+    ) -> Result<()> {
+        self.writer
+            .write_message(CSID_COMMAND, &so.to_message_amf0(0)?)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Send `onMetaData` as an AMF3-encoded data message (RTMP message
     /// type 15) instead of the AMF0 default.
     ///
@@ -943,6 +964,9 @@ impl RtmpClient {
                 let values = amf3::decode_message_to_amf0(&msg.payload)?;
                 Ok(classify_command(values))
             }
+            MSG_SHARED_OBJECT_AMF0 | MSG_SHARED_OBJECT_AMF3 => Ok(ClientEvent::SharedObject(
+                crate::shared_object::parse_shared_object(&msg)?,
+            )),
             MSG_AGGREGATE => {
                 // A sub-message inside an aggregate is itself an
                 // aggregate. Forward to the same queue so the next

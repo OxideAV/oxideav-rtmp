@@ -232,7 +232,8 @@ impl MediaSource for RtmpSession {
             | Some(StreamPacket::Call(_))
             | Some(StreamPacket::CallReply { .. })
             | Some(StreamPacket::DataFrame { .. })
-            | Some(StreamPacket::DataFrameCleared { .. }) => MediaSourceEvent::Skip,
+            | Some(StreamPacket::DataFrameCleared { .. })
+            | Some(StreamPacket::SharedObject(_)) => MediaSourceEvent::Skip,
             None => MediaSourceEvent::End,
         })
     }
@@ -252,11 +253,13 @@ impl MediaSource for RtmpPlayer {
                 MediaSourceEvent::Video { timestamp, tag }
             }
             Some(PlayerPacket::Metadata(value)) => MediaSourceEvent::Metadata(value),
-            // onStatus / user-control / RPC traffic isn't media.
+            // onStatus / user-control / RPC / shared-object traffic
+            // isn't media.
             Some(PlayerPacket::Status { .. })
             | Some(PlayerPacket::Control(_))
             | Some(PlayerPacket::Call(_))
-            | Some(PlayerPacket::CallReply { .. }) => MediaSourceEvent::Skip,
+            | Some(PlayerPacket::CallReply { .. })
+            | Some(PlayerPacket::SharedObject(_)) => MediaSourceEvent::Skip,
             None => MediaSourceEvent::End,
         })
     }
