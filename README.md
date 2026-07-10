@@ -172,8 +172,50 @@ client.close()?;
   `amf::decode_all` path. Externalizable objects are decodable via
   `Decoder::register_externalizable` (the caller supplies a body-length
   resolver for a known class; an unregistered class is refused, not
-  guessed). Shared objects, RTMFP, and the Adobe digest-verified
-  handshake remain unimplemented.
+  guessed). RTMFP and RTMP Encrypted (the RC4/DH transport cipher)
+  remain unimplemented.
+- **Digest (HMAC-SHA256) handshake.** Both RTMP handshakes are
+  supported. The server auto-negotiates per connection
+  (`handshake::server_handshake_negotiated`): a zero — or junk —
+  version field takes the historical echo path, a validating digest
+  C1 gets a digested S1 (same 764-byte block order the client picked)
+  plus a chained-response S2, and the client's C2 response digest is
+  verified. Clients opt in via
+  `RtmpClient::connect_with_digest_handshake` /
+  `PlayOptions::digest_handshake`, emitting a digested C1 (schema 1)
+  and falling back to the echo exchange automatically when the server
+  doesn't digest; the outcome — including whether the peer's response
+  digest verified — surfaces as [`HandshakeKind`]. The low-level
+  pieces (both block orders, the `mod 728` digest / `mod 632` DH-key
+  offset arithmetic, install/verify/detect, response chaining) are
+  public in [`handshake`], carried by a dependency-free FIPS 180-4
+  SHA-256 + RFC 2104 HMAC validated against the published NIST /
+  RFC 4231 vectors.
+- **Shared Objects.** The [`shared_object`] module parses + builds the
+  message-type-19 (AMF0) / 16 (AMF3) Shared Object bodies: the header
+  (UI16 name length + bare UTF-8 name + UI32 version + UI32 flags with
+  the persistent bit + 4 reserved bytes) and the back-to-back event
+  stream (UI8 type + UI32 length + data), with all eleven documented
+  event types typed as [`SoEvent`] — Use / Release / Request Change /
+  Change / Success / Send Message / Status / Clear / Remove / Request
+  Remove / Use Success. Property and handler names are bare
+  UI16-prefixed strings; values are full AMF0 or AMF3 values (the
+  struct is generic over the flavour, and `parse_shared_object`
+  bridges either onto AMF0). Unknown event codes round-trip verbatim
+  for relays; truncations and overruns are clean errors.
+- **`@setDataFrame` / `@clearDataFrame`.** The reserved data-frame
+  control names are wired on every surface: `RtmpClient::send_metadata`
+  (the `onMetaData` special case), `send_data_frame(handler, value)`,
+  `clear_data_frame(handler)` / `clear_metadata()` on the publish
+  side; on the ingest side the session strips the control prefix,
+  maintains the stored-frame state (`RtmpSession::data_frames`, upsert
+  on set, removal on clear — the state a server replays to late
+  subscribers via `PlaySession::send_data`), and surfaces
+  `StreamPacket::Metadata` / `DataFrame` / `DataFrameCleared`;
+  `parse_data_frame` / `DataFrameCommand` classify a decoded data
+  message (type 18, or type 15 after the AMF3 bridge), and
+  `PlaySession::forward` relays a live non-`onMetaData` frame in its
+  bare subscriber shape.
 - **NetConnection `call` (RPC).** §7.2.1.2 both ways on every
   surface: an RPC's procedure name rides the wire command-name field,
   so any non-built-in command is a call aimed at the application.

@@ -859,19 +859,95 @@ pub fn build_reconnect_request(tc_url: Option<&str>, description: Option<&str>) 
     }
 }
 
+/// The reserved server-intercepted data-frame control name that asks
+/// the server to *store* the wrapped data message and replay it to
+/// every future subscriber (the `@` prefix marks it as a control name
+/// rather than a subscriber-visible handler).
+pub const SET_DATA_FRAME: &str = "@setDataFrame";
+/// The inverse control name: discard a previously stored data frame
+/// so it is no longer replayed to new subscribers.
+pub const CLEAR_DATA_FRAME: &str = "@clearDataFrame";
+
 /// `@setDataFrame("onMetaData", …)` — the standard way to publish
 /// per-stream metadata (width, height, video/audio codec ids,
 /// duration, …) before the first audio/video packet.
 pub fn build_set_data_frame(stream_id: u32, metadata: Amf0Value) -> Message {
+    build_set_data_frame_named(stream_id, "onMetaData", metadata)
+}
+
+/// `@setDataFrame(handler, value)` for an arbitrary handler name
+/// (`"onMetaData"`, `"onCuePoint"`, `"onFI"`, …): three AMF0 values —
+/// the reserved control name, the handler the server should re-emit
+/// under, and the payload (typically an ECMA array or object). The
+/// server strips the first value and replays `[handler, value]` as a
+/// plain data message to each new subscriber at play time.
+pub fn build_set_data_frame_named(stream_id: u32, handler: &str, value: Amf0Value) -> Message {
     let mut payload = Vec::new();
-    crate::amf::encode(&mut payload, &Amf0Value::String("@setDataFrame".into()));
-    crate::amf::encode(&mut payload, &Amf0Value::String("onMetaData".into()));
-    crate::amf::encode(&mut payload, &metadata);
+    crate::amf::encode(&mut payload, &Amf0Value::String(SET_DATA_FRAME.into()));
+    crate::amf::encode(&mut payload, &Amf0Value::String(handler.into()));
+    crate::amf::encode(&mut payload, &value);
     Message {
         msg_type_id: MSG_DATA_AMF0,
         msg_stream_id: stream_id,
         timestamp: 0,
         payload,
+    }
+}
+
+/// `@clearDataFrame(handler)` — tell the server to discard the stored
+/// data frame registered under `handler` (matching the name given to
+/// `@setDataFrame`) so it is no longer replayed to new subscribers.
+/// Two AMF0 values only; there is no payload argument.
+pub fn build_clear_data_frame(stream_id: u32, handler: &str) -> Message {
+    let mut payload = Vec::new();
+    crate::amf::encode(&mut payload, &Amf0Value::String(CLEAR_DATA_FRAME.into()));
+    crate::amf::encode(&mut payload, &Amf0Value::String(handler.into()));
+    Message {
+        msg_type_id: MSG_DATA_AMF0,
+        msg_stream_id: stream_id,
+        timestamp: 0,
+        payload,
+    }
+}
+
+/// A decoded `@setDataFrame` / `@clearDataFrame` data-frame control
+/// (the publisher→server metadata-carriage convention). Produced by
+/// [`parse_data_frame`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DataFrameCommand {
+    /// `["@setDataFrame", handler, value]` — store `value` under
+    /// `handler` and replay it to future subscribers.
+    Set {
+        handler: String,
+        /// The wrapped payload — usually an ECMA array, though some
+        /// encoders send a strict object (any AMF0 value is accepted).
+        value: Amf0Value,
+    },
+    /// `["@clearDataFrame", handler]` — drop the stored frame.
+    Clear { handler: String },
+}
+
+/// Classify a decoded data-message value list as a data-frame control.
+///
+/// Returns `None` when the message is not `@`-prefixed data-frame
+/// control traffic (e.g. a bare `onMetaData` or `onCuePoint` message)
+/// or when a control name arrives without its required arguments —
+/// callers fall back to their plain data-message handling in either
+/// case. AMF3 data messages (type 15) classify identically after
+/// bridging through [`crate::amf3::decode_message_to_amf0`].
+pub fn parse_data_frame(values: &[Amf0Value]) -> Option<DataFrameCommand> {
+    let name = values.first()?.as_str()?;
+    match name {
+        SET_DATA_FRAME => {
+            let handler = values.get(1)?.as_str()?.to_owned();
+            let value = values.get(2)?.clone();
+            Some(DataFrameCommand::Set { handler, value })
+        }
+        CLEAR_DATA_FRAME => {
+            let handler = values.get(1)?.as_str()?.to_owned();
+            Some(DataFrameCommand::Clear { handler })
+        }
+        _ => None,
     }
 }
 
@@ -885,9 +961,17 @@ pub fn build_set_data_frame(stream_id: u32, metadata: Amf0Value) -> Message {
 /// just the `["onMetaData", meta]` pair — the same §E.4.4 name+value
 /// layout an FLV script-data tag carries.
 pub fn build_on_meta_data(stream_id: u32, metadata: &Amf0Value) -> Message {
+    build_data_message(stream_id, "onMetaData", metadata)
+}
+
+/// A bare `[handler, value]` AMF0 data message (type 18) for an
+/// arbitrary handler name — the server→subscriber shape of any data
+/// frame (`onMetaData`, `onCuePoint`, `onFI`, …): the handler name
+/// string followed by its argument, with no `@setDataFrame` prefix.
+pub fn build_data_message(stream_id: u32, handler: &str, value: &Amf0Value) -> Message {
     let mut payload = Vec::new();
-    crate::amf::encode(&mut payload, &Amf0Value::String("onMetaData".into()));
-    crate::amf::encode(&mut payload, metadata);
+    crate::amf::encode(&mut payload, &Amf0Value::String(handler.into()));
+    crate::amf::encode(&mut payload, value);
     Message {
         msg_type_id: MSG_DATA_AMF0,
         msg_stream_id: stream_id,

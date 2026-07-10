@@ -226,10 +226,13 @@ impl MediaSource for RtmpSession {
             }
             Some(StreamPacket::Metadata(value)) => MediaSourceEvent::Metadata(value),
             // NetStream control commands / NetConnection RPCs aren't
-            // media packets.
+            // media packets; neither are non-onMetaData data frames
+            // (onCuePoint etc.) or data-frame revocations.
             Some(StreamPacket::Command(_))
             | Some(StreamPacket::Call(_))
-            | Some(StreamPacket::CallReply { .. }) => MediaSourceEvent::Skip,
+            | Some(StreamPacket::CallReply { .. })
+            | Some(StreamPacket::DataFrame { .. })
+            | Some(StreamPacket::DataFrameCleared { .. }) => MediaSourceEvent::Skip,
             None => MediaSourceEvent::End,
         })
     }

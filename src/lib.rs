@@ -118,7 +118,8 @@ pub use handshake::{
     client_handshake_digest, server_handshake_negotiated, DigestScheme, HandshakeKind,
 };
 pub use message::{
-    CallCommand, NetStreamCommand, PeerBandwidthLimiter, UserControlEvent, RECONNECT_REQUEST_CODE,
+    parse_data_frame, CallCommand, DataFrameCommand, NetStreamCommand, PeerBandwidthLimiter,
+    UserControlEvent, CLEAR_DATA_FRAME, RECONNECT_REQUEST_CODE, SET_DATA_FRAME,
 };
 pub use player::{PlayOptions, PlayerPacket, RtmpPlayer};
 pub use server::{

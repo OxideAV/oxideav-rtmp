@@ -304,6 +304,7 @@ impl PublishRequest {
             ended: false,
             pending_subs: VecDeque::new(),
             peer_bw: PeerBandwidthLimiter::new(),
+            data_frames: Vec::new(),
         })
     }
 
@@ -586,8 +587,19 @@ impl PlaySession {
     /// publish direction there is no `@setDataFrame` RPC prefix — the
     /// server relays the bare `["onMetaData", meta]` pair.
     pub fn send_metadata(&mut self, metadata: &Amf0Value) -> Result<()> {
-        self.writer
-            .write_message(CSID_DATA, &build_on_meta_data(self.stream_id, metadata))?;
+        self.send_data("onMetaData", metadata)
+    }
+
+    /// Send a bare `[handler, value]` data message to the subscriber —
+    /// the shape a server uses to (re)play a stored data frame
+    /// (`onMetaData`, `onCuePoint`, …). Feed it from
+    /// [`RtmpSession::data_frames`] to give a late subscriber the
+    /// publisher's `@setDataFrame` state at play time.
+    pub fn send_data(&mut self, handler: &str, value: &Amf0Value) -> Result<()> {
+        self.writer.write_message(
+            CSID_DATA,
+            &build_data_message(self.stream_id, handler, value),
+        )?;
         self.writer.flush()?;
         Ok(())
     }
@@ -603,6 +615,11 @@ impl PlaySession {
             StreamPacket::Audio { timestamp, tag } => self.send_audio(*timestamp, tag),
             StreamPacket::Video { timestamp, tag } => self.send_video(*timestamp, tag),
             StreamPacket::Metadata(meta) => self.send_metadata(meta),
+            // A non-onMetaData data frame relays as its bare
+            // subscriber shape; a clear has no subscriber-side wire
+            // form (it only stops future replays).
+            StreamPacket::DataFrame { handler, value } => self.send_data(handler, value),
+            StreamPacket::DataFrameCleared { .. } => Ok(()),
             StreamPacket::Command(_) | StreamPacket::Call(_) | StreamPacket::CallReply { .. } => {
                 Ok(())
             }
@@ -929,6 +946,12 @@ pub struct RtmpSession {
     /// §5.4.5 Set Peer Bandwidth limit-type state (Hard / Soft /
     /// Dynamic) for the peer's output-bandwidth requests.
     peer_bw: PeerBandwidthLimiter,
+    /// The publisher's stored data frames, in handler order of first
+    /// arrival: everything set via `@setDataFrame(handler, value)`
+    /// (including plain / bare `onMetaData`) minus anything since
+    /// revoked via `@clearDataFrame`. This is the state a server
+    /// application replays to late subscribers at play time.
+    data_frames: Vec<(String, Amf0Value)>,
 }
 
 /// One media-layer event reported to the caller.
@@ -942,10 +965,29 @@ pub enum StreamPacket {
         timestamp: u32,
         tag: VideoTag,
     },
-    /// `@setDataFrame("onMetaData", <amf0>)`. The AMF0 value is the
-    /// metadata object (usually width, height, codec ids, framerate,
-    /// bitrate, audiodatarate, ...).
+    /// `@setDataFrame("onMetaData", <amf0>)` — or a bare
+    /// `["onMetaData", <amf0>]` from clients that skip the control
+    /// prefix. The AMF0 value is the metadata object (usually width,
+    /// height, codec ids, framerate, bitrate, audiodatarate, ...).
     Metadata(Amf0Value),
+    /// `@setDataFrame(handler, <amf0>)` for a handler other than
+    /// `onMetaData` (e.g. `onCuePoint`, `onFI`): the publisher asked
+    /// the server to store this frame and replay it to future
+    /// subscribers under `handler`. The session keeps it in
+    /// [`RtmpSession::data_frames`] and also surfaces it here so a
+    /// relay can forward it live.
+    DataFrame {
+        handler: String,
+        value: Amf0Value,
+    },
+    /// `@clearDataFrame(handler)`: the publisher revoked the stored
+    /// data frame registered under `handler` (already removed from
+    /// [`RtmpSession::data_frames`] when this surfaces). New
+    /// subscribers must no longer receive it; what to do for existing
+    /// subscribers is the application's call.
+    DataFrameCleared {
+        handler: String,
+    },
     /// A NetStream control command the peer issued on the stream —
     /// `play` / `play2` / `pause` / `seek` / `receiveAudio` /
     /// `receiveVideo` per RTMP 1.0 Commands-Messages §4.2. Surfaced so
@@ -1204,6 +1246,76 @@ impl RtmpSession {
         Ok(())
     }
 
+    /// The publisher's currently stored data frames (`@setDataFrame`
+    /// state minus `@clearDataFrame` revocations), `onMetaData`
+    /// included — replay these to a late subscriber at play time (e.g.
+    /// via [`PlaySession::send_data`]).
+    pub fn data_frames(&self) -> &[(String, Amf0Value)] {
+        &self.data_frames
+    }
+
+    /// Look up one stored data frame by handler name.
+    pub fn data_frame(&self, handler: &str) -> Option<&Amf0Value> {
+        self.data_frames
+            .iter()
+            .find(|(h, _)| h == handler)
+            .map(|(_, v)| v)
+    }
+
+    /// Classify one decoded data-message value list (types 18/15 both
+    /// land here after AMF3 bridging) and maintain the stored
+    /// data-frame state:
+    ///
+    /// * `@setDataFrame(handler, value)` upserts the stored frame;
+    ///   `onMetaData` keeps surfacing as [`StreamPacket::Metadata`]
+    ///   (the historical shape), any other handler as
+    ///   [`StreamPacket::DataFrame`].
+    /// * `@clearDataFrame(handler)` removes it and surfaces
+    ///   [`StreamPacket::DataFrameCleared`].
+    /// * anything else falls back to the bare-`onMetaData` heuristic
+    ///   ([`metadata_object`]) — a bare metadata message is stored
+    ///   under `onMetaData` too, since publishers that skip the
+    ///   control prefix still mean "this is the stream's metadata".
+    fn dispatch_data_values(&mut self, values: &[Amf0Value]) -> Option<StreamPacket> {
+        match parse_data_frame(values) {
+            Some(DataFrameCommand::Set { handler, value }) => {
+                self.store_data_frame(&handler, value.clone());
+                if handler == "onMetaData" {
+                    Some(StreamPacket::Metadata(value))
+                } else {
+                    Some(StreamPacket::DataFrame { handler, value })
+                }
+            }
+            Some(DataFrameCommand::Clear { handler }) => {
+                self.data_frames.retain(|(h, _)| h != &handler);
+                Some(StreamPacket::DataFrameCleared { handler })
+            }
+            None => {
+                let meta = metadata_object(values)?;
+                // Only a *metadata* message (bare `onMetaData` name, or
+                // a naked object with no handler string at all) updates
+                // the stored onMetaData frame; e.g. a bare `onCuePoint`
+                // is live-only traffic.
+                let is_meta = values
+                    .first()
+                    .and_then(Amf0Value::as_str)
+                    .map(|s| s == "onMetaData")
+                    .unwrap_or(true);
+                if is_meta {
+                    self.store_data_frame("onMetaData", meta.clone());
+                }
+                Some(StreamPacket::Metadata(meta))
+            }
+        }
+    }
+
+    fn store_data_frame(&mut self, handler: &str, value: Amf0Value) {
+        match self.data_frames.iter_mut().find(|(h, _)| h == handler) {
+            Some((_, stored)) => *stored = value,
+            None => self.data_frames.push((handler.to_owned(), value)),
+        }
+    }
+
     /// Per-message dispatch shared between the wire path and the
     /// aggregate-sub-drain path. Returns `Ok(Some(packet))` if the
     /// message produced a user-visible event, `Ok(None)` if it was
@@ -1228,10 +1340,7 @@ impl RtmpSession {
             MSG_DATA_AMF0 => {
                 // @setDataFrame + onMetaData + <object>
                 let values = amf::decode_all(&msg.payload)?;
-                // Common shape: ["@setDataFrame", "onMetaData",
-                // <meta>]. Some clients omit "@setDataFrame" and
-                // just send ["onMetaData", <meta>]. Accept both.
-                Ok(metadata_object(&values).map(StreamPacket::Metadata))
+                Ok(self.dispatch_data_values(&values))
             }
             MSG_DATA_AMF3 => {
                 // AMF3-encoded data message (type 15). Per the
@@ -1242,7 +1351,7 @@ impl RtmpSession {
                 // bridges onto the AMF0 shape so metadata flows
                 // through the same path as MSG_DATA_AMF0.
                 let values = amf3::decode_message_to_amf0(&msg.payload)?;
-                Ok(metadata_object(&values).map(StreamPacket::Metadata))
+                Ok(self.dispatch_data_values(&values))
             }
             MSG_COMMAND_AMF0 => {
                 let values = amf::decode_all(&msg.payload)?;

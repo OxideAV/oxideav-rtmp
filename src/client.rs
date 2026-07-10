@@ -567,6 +567,36 @@ impl RtmpClient {
         Ok(())
     }
 
+    /// Send `@setDataFrame(handler, value)` for an arbitrary handler
+    /// name (`"onCuePoint"`, `"onFI"`, …): ask the server to store the
+    /// frame and replay it under `handler` to every future subscriber.
+    /// [`send_metadata`](Self::send_metadata) is the
+    /// `handler == "onMetaData"` special case.
+    pub fn send_data_frame(&mut self, handler: &str, value: Amf0Value) -> Result<()> {
+        let msg = build_set_data_frame_named(self.stream_id, handler, value);
+        self.writer.write_message(CSID_DATA, &msg)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Send `@clearDataFrame(handler)` — revoke a data frame
+    /// previously stored via
+    /// [`send_data_frame`](Self::send_data_frame) /
+    /// [`send_metadata`](Self::send_metadata) so the server stops
+    /// replaying it to new subscribers.
+    pub fn clear_data_frame(&mut self, handler: &str) -> Result<()> {
+        let msg = build_clear_data_frame(self.stream_id, handler);
+        self.writer.write_message(CSID_DATA, &msg)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// `@clearDataFrame("onMetaData")` — the inverse of
+    /// [`send_metadata`](Self::send_metadata).
+    pub fn clear_metadata(&mut self) -> Result<()> {
+        self.clear_data_frame("onMetaData")
+    }
+
     /// Send `onMetaData` as an AMF3-encoded data message (RTMP message
     /// type 15) instead of the AMF0 default.
     ///
