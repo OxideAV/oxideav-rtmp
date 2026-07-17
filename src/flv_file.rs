@@ -23,8 +23,8 @@
 //! * §E.3 — the alternating `PreviousTagSize` / `FLVTAG` body. The
 //!   first back-pointer (`PreviousTagSize0`) is always 0; each
 //!   subsequent one is `11 + DataSize(prev tag)`.
-//! * §E.4.1 — the 11-byte `FLVTAG` header: `TagType` (UB[2]
-//!   reserved + UB[1] filter + UB[5] tag type), `DataSize` (UI24),
+//! * §E.4.1 — the 11-byte `FLVTAG` header: `TagType` (`UB[2]`
+//!   reserved + `UB[1]` filter + `UB[5]` tag type), `DataSize` (UI24),
 //!   `Timestamp` (UI24 low 24 bits) + `TimestampExtended` (UI8 upper
 //!   8 bits, forming an SI32 milliseconds value), and `StreamID`
 //!   (UI24, always 0 in FLV).
@@ -106,7 +106,7 @@ const UI24_MAX: u32 = 0x00FF_FFFF;
 /// Header flag bits for the 9-byte FLV file header (§E.2):
 /// `TypeFlagsAudio` (1 = audio tags are present) and
 /// `TypeFlagsVideo` (1 = video tags are present). The two reserved
-/// fields (`TypeFlagsReserved` UB[5] and a single UB[1] between
+/// fields (`TypeFlagsReserved` `UB[5]` and a single `UB[1]` between
 /// them) are always zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlvHeaderFlags {

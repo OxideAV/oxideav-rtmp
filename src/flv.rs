@@ -483,7 +483,7 @@ pub mod audio_channel_mask {
 /// (enhanced-rtmp-v2.pdf §"ExAudioTagBody"). The body sits in
 /// [`AudioTag::body`] verbatim on parse; callers can lift it into this
 /// strongly-typed view via [`MultichannelConfig::parse`] and round-trip
-/// back through [`MultichannelConfig::encode`] / [`AudioTag::with_multichannel_config`].
+/// back through [`MultichannelConfig::encode`] / [`AudioTag::multichannel_config_tag`].
 ///
 /// Per spec the body length depends on `audio_channel_order`:
 ///   - `Unspecified` (`0`): 2 bytes (`order`, `channel_count`).
@@ -504,7 +504,7 @@ pub struct MultichannelConfig {
     /// Number of channels in the multichannel stream. UI8 on the wire,
     /// so values 0..=255 are representable.
     pub channel_count: u8,
-    /// Trailing bytes preserved verbatim when [`order`] is
+    /// Trailing bytes preserved verbatim when [`order`](MultichannelConfig::order) is
     /// [`MultichannelConfigOrder::Reserved`] (forward-compat with
     /// future spec additions). Empty for the three recognised orders.
     pub extra: Vec<u8>,
@@ -2028,7 +2028,7 @@ pub fn build_video(tag: &VideoTag) -> Vec<u8> {
 /// says: "if (soundFormat == SoundFormat.ExHeader) we switch into
 /// FOURCC audio mode as defined below. This means that soundRate,
 /// soundSize and soundType bits are not interpreted, instead the
-/// UB[4] bits are interpreted as an AudioPacketType". We zero
+/// `UB[4]` bits are interpreted as an AudioPacketType". We zero
 /// them on parse for tags that arrive in Enhanced mode so callers
 /// don't accidentally read them as audio configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]

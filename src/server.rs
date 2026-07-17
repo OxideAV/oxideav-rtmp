@@ -1122,7 +1122,7 @@ impl RtmpSession {
     /// Per spec, "the server sends this event to test whether the
     /// client is reachable. Event data is a 4-byte timestamp,
     /// representing the local server time when the server dispatched
-    /// the command." The client (our [`RtmpClient`]) replies with the
+    /// the command." The client (our [`RtmpClient`](crate::RtmpClient)) replies with the
     /// matching `PingResponse` carrying the same 4 bytes —
     /// `RtmpClient::poll_event` answers the ping internally without
     /// surfacing the request to the publisher caller.

@@ -19,7 +19,7 @@
 //! publisher, verifies that the announced `app` + `stream_name`
 //! match the URL path (rejecting otherwise), then returns a
 //! [`RtmpPacketSource`] the executor pumps via `next_packet()`.
-//! The historical [`RtmpServer`](crate::RtmpServer) /
+//! The historical [`RtmpServer`] /
 //! [`RtmpClient`](crate::RtmpClient) API is unchanged — this
 //! adapter is purely additive.
 //!

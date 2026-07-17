@@ -1,8 +1,9 @@
 //! RTMP message-type constants + tiny builders for the protocol
 //! control and command messages we send during publish setup.
 //!
-//! Each builder returns a [`chunk::Message`] ready to feed to
-//! [`chunk::ChunkWriter::write_message`].
+//! Each builder returns a [`chunk::Message`](crate::chunk::Message)
+//! ready to feed to
+//! [`chunk::ChunkWriter::write_message`](crate::chunk::ChunkWriter::write_message).
 
 use crate::amf::{encode_command, Amf0Value};
 use crate::caps::ConnectCapabilities;
