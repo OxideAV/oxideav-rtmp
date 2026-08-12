@@ -226,12 +226,8 @@ fn packet_source_exposes_per_track_streams() {
     assert_eq!(indices, vec![AUDIO_STREAM_INDEX, VIDEO_STREAM_INDEX, 2]);
 
     let mut per_stream: Vec<Vec<(i64, Vec<u8>)>> = vec![Vec::new(); 3];
-    loop {
-        match source.next_packet() {
-            Ok(pkt) => per_stream[pkt.stream_index as usize]
-                .push((pkt.pts.expect("pts"), pkt.data.clone())),
-            Err(_) => break,
-        }
+    while let Ok(pkt) = source.next_packet() {
+        per_stream[pkt.stream_index as usize].push((pkt.pts.expect("pts"), pkt.data.clone()));
     }
     assert_eq!(per_stream[AUDIO_STREAM_INDEX as usize].len(), 1);
     // Default video track: two frames, CTS 17 folded into pts.
