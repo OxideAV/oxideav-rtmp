@@ -295,15 +295,33 @@ client.close()?;
   `audio_fourcc()` / `video_fourcc()` reconstruct the four ASCII bytes
   while leaving legacy single-byte CodecIDs as `None`. The v2
   `audioTrackIdInfoMap` / `videoTrackIdInfoMap` per-track maps are
-  preserved as raw AMF for callers doing multitrack selection.
-- **Multichannel + multitrack audio.** `AudioTag::multichannel_config()`
-  lifts the `MultichannelConfig` body into a typed view, and the
-  `Multitrack` AudioPacketType / VideoPacketType is wired end-to-end —
-  `OneTrack` / `ManyTracks` / `ManyTracksManyCodecs` all round-trip via
-  `multitrack` / `multitrack_tag`, with reserved `multitrackType`
-  values passed through verbatim. The `audio_channel` /
+  preserved as raw AMF and additionally lift to typed [`TrackInfo`]
+  views (see the multitrack bullet above).
+- **Multichannel audio.** `AudioTag::multichannel_config()` lifts the
+  `MultichannelConfig` body into a typed view. The `audio_channel` /
   `audio_channel_mask` submodules name all 24 spec-defined positions
   including the 22.2 surround extras (SMPTE ST 2036-2).
+- **Multitrack streaming (Enhanced RTMP v2), end-to-end.** The
+  `Multitrack` AudioPacketType / VideoPacketType round-trips at the
+  wire level (`OneTrack` / `ManyTracks` / `ManyTracksManyCodecs` via
+  `multitrack` / `multitrack_tag`, reserved `multitrackType` values
+  passed through verbatim) *and* at the track level:
+  `VideoTag::demux_tracks` / `AudioTag::demux_tracks` lift each track
+  into the standalone single-track tag the same frame would have
+  produced alone (per-track or shared FourCC, the real inner
+  PacketType, and the per-track SI24 composition time the NALU FourCCs
+  carry inside their track bodies), and
+  `multitrack_from_tags` is the validated inverse (one inner
+  PacketType / FrameType per message, shared-vs-per-track FourCC by
+  mode, `OneTrack` cardinality, no nested Multitrack / ModEx).
+  Publishing helpers ride every send surface —
+  `RtmpClient::send_video_multitrack` / `send_audio_multitrack` on the
+  publish client and the `PlaySession` mirrors for serving an ABR
+  ladder / multi-codec variant set on one play stream — and the typed
+  `TrackInfo` view decodes the v2 `audioTrackIdInfoMap` /
+  `videoTrackIdInfoMap` per-track metadata (spec-typical fields lifted,
+  everything else preserved verbatim; `OnMetaData::video_track_info` /
+  `audio_track_info` / `set_*_track_info` do keyed lookups + upserts).
 - **Graceful session close.** `RtmpSession::close` emits a
   `UserControl StreamEOF` before `onStatus("NetStream.Unpublish.Success")`,
   flushes the chunk writer, and half-closes the write side.
@@ -392,7 +410,12 @@ let _pulled = reg.open("rtmp-play://origin.example.com:1935/vod/clip")?;
 ```
 
 Codec ids are auto-detected from the publisher's first audio + video
-tags (FourCC + legacy single-byte modes). The opener is listen-style:
+tags (FourCC + legacy single-byte modes). A v2 `Multitrack` message
+demultiplexes into one packet per track: trackId 0 (the spec's default
+track) maps onto streams 0 / 1, and each additional `(kind, trackId)`
+pair lazily registers its own stream (indices 2, 3, … in first-seen
+order) with per-track composition times folded into that track's
+`pts`. The opener is listen-style:
 each `open()` binds the URL's `host:port`, accepts one publisher,
 validates the announced `app` + `stream_name` against the URL path, and
 hands packets to the registry. For multi-client service, use

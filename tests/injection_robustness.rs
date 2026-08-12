@@ -944,3 +944,80 @@ fn parse_data_frame_random_values_never_panics() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multitrack per-track demux + TrackInfo (Enhanced RTMP v2
+// §"Multitrack Streaming via Enhanced RTMP" / §"Enhancing onMetaData")
+// ---------------------------------------------------------------------------
+
+/// `demux_tracks` on whatever `parse_video` / `parse_audio` accepts
+/// from random multitrack-framed payloads: every outcome is a
+/// `Result`, never a panic, and every successfully demuxed track
+/// re-muxes without panicking either.
+#[test]
+fn multitrack_demux_survives_random_track_lists() {
+    use oxideav_rtmp::flv::{AudioTag, VideoTag};
+    let mut rng = Xs64::new(0x4D54_5241_434B_5331);
+    for i in 0..2048 {
+        let len = (rng.next() % 96) as usize;
+        let mut payload = vec![0u8; len + 2];
+        rng.fill(&mut payload[2..]);
+        // Pin the ex-header + Multitrack nibble so the fuzz reaches the
+        // track-list parser instead of dying at the framing gate:
+        // video 0x80|frame|PacketType(6), audio 0x9?|PacketType(5).
+        payload[0] = if i % 2 == 0 { 0x96 } else { 0x95 };
+        if i % 2 == 0 {
+            if let Ok(tag) = parse_video(&payload) {
+                if let Ok(tracks) = tag.demux_tracks() {
+                    let refs: Vec<(u8, &oxideav_rtmp::flv::VideoTag)> =
+                        tracks.iter().map(|(id, t)| (*id, t)).collect();
+                    let _ = VideoTag::multitrack_from_tags(
+                        tag.multitrack.as_ref().unwrap().multitrack_type,
+                        &refs,
+                    );
+                }
+            }
+        } else {
+            payload[0] = 0x95;
+            if let Ok(tag) = parse_audio(&payload) {
+                if let Ok(tracks) = tag.demux_tracks() {
+                    let refs: Vec<(u8, &oxideav_rtmp::flv::AudioTag)> =
+                        tracks.iter().map(|(id, t)| (*id, t)).collect();
+                    let _ = AudioTag::multitrack_from_tags(
+                        tag.multitrack.as_ref().unwrap().multitrack_type,
+                        &refs,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `TrackInfo::from_amf0` over whatever the AMF0 decoder produces
+/// from random bytes, plus the `OnMetaData` per-track accessors over
+/// the same values: `Result` everywhere, no panic.
+#[test]
+fn track_info_survives_random_amf_values() {
+    use oxideav_rtmp::flv::{OnMetaData, TrackInfo};
+    let mut rng = Xs64::new(0x5452_4B49_4E46_4F31);
+    for _ in 0..2048 {
+        let len = (rng.next() % 128) as usize;
+        let mut buf = vec![0u8; len];
+        rng.fill(&mut buf);
+        let mut pos = 0usize;
+        if let Ok(value) = amf0_decode(&buf, &mut pos) {
+            let _ = TrackInfo::from_amf0(&value);
+            let meta = OnMetaData {
+                video_track_id_info_map: Some(value.clone()),
+                audio_track_id_info_map: Some(value),
+                ..OnMetaData::default()
+            };
+            let _ = meta.video_track_ids();
+            let _ = meta.audio_track_ids();
+            for id in [0u8, 1, 2, 255] {
+                let _ = meta.video_track_info(id);
+                let _ = meta.audio_track_info(id);
+            }
+        }
+    }
+}
