@@ -25,20 +25,30 @@
 //!
 //! # Stream layout
 //!
-//! Always exactly two streams, both opened with TimeBase
-//! 1/1_000_000_000 (nanoseconds). RTMP chunks carry a millisecond
-//! `timestamp` and Enhanced-RTMP-v2 ModEx `TimestampOffsetNano`
-//! entries add sub-millisecond precision; the adapter folds both
-//! into the same nanosecond-resolution timeline so a downstream
-//! consumer reads a single uniform clock:
+//! Two streams for the common single-track session, both opened with
+//! TimeBase 1/1_000_000_000 (nanoseconds). RTMP chunks carry a
+//! millisecond `timestamp` and Enhanced-RTMP-v2 ModEx
+//! `TimestampOffsetNano` entries add sub-millisecond precision; the
+//! adapter folds both into the same nanosecond-resolution timeline so
+//! a downstream consumer reads a single uniform clock:
 //!
-//! * **Stream 0 — audio.** Codec id derived lazily from the first
-//!   audio tag the publisher sends (`aac` for AAC, `mp3` for MP3,
-//!   etc; see [`audio_codec_id`]). If the publisher never sends
-//!   audio the stream stays present but emits no packets.
-//! * **Stream 1 — video.** Codec id from the first video tag
-//!   (`h264` for AVC, `h263`, `vp6`, `vp6a`, screen-codec ids;
-//!   see [`video_codec_id`]).
+//! * **Stream 0 — audio (default track).** Codec id derived lazily
+//!   from the first audio tag the publisher sends (`aac` for AAC,
+//!   `mp3` for MP3, etc; see [`audio_codec_id`]). If the publisher
+//!   never sends audio the stream stays present but emits no packets.
+//! * **Stream 1 — video (default track).** Codec id from the first
+//!   video tag (`h264` for AVC, `h263`, `vp6`, `vp6a`, screen-codec
+//!   ids; see [`video_codec_id`]).
+//! * **Streams 2, 3, … — additional Multitrack tracks.** An
+//!   Enhanced-RTMP v2 `Multitrack` message (enhanced-rtmp-v2.pdf
+//!   §"Multitrack Streaming via Enhanced RTMP") demultiplexes into
+//!   one packet per track: trackId 0 is the spec's default track and
+//!   maps onto stream 0 / 1 above, while each additional
+//!   `(kind, trackId)` pair lazily registers its own stream (indices
+//!   assigned in first-seen order, codec id from that track's first
+//!   tag). Per-track SI24 composition times reach each track's `pts`
+//!   individually, and a message-level `TimestampOffsetNano` folds
+//!   into every demuxed track's presentation time.
 //!
 //! The opener buffers up to [`PROBE_LIMIT`] packets after the
 //! handshake completes so it can observe at least one of each
@@ -186,6 +196,121 @@ struct BufferedPacket {
     is_audio: bool,
 }
 
+/// Maps an Enhanced-RTMP v2 `(media kind, trackId)` pair to a stream
+/// index (enhanced-rtmp-v2.pdf §"Multitrack Streaming via Enhanced
+/// RTMP").
+///
+/// The default tracks keep the historical fixed indices —
+/// `(audio, 0)` → [`AUDIO_STREAM_INDEX`], `(video, 0)` →
+/// [`VIDEO_STREAM_INDEX`] — so a single-track session's layout is
+/// unchanged (a non-multitrack tag *is* the default track, per the
+/// spec's "trackId 0 is the default track" convention). Additional
+/// tracks allocate indices 2, 3, … in first-seen order.
+#[derive(Debug, Default)]
+struct TrackStreams {
+    /// `(is_audio, track_id, stream_index)` for non-default tracks.
+    extra: Vec<(bool, u8, u32)>,
+}
+
+impl TrackStreams {
+    fn index(&mut self, is_audio: bool, track_id: u8) -> u32 {
+        if track_id == 0 {
+            return if is_audio {
+                AUDIO_STREAM_INDEX
+            } else {
+                VIDEO_STREAM_INDEX
+            };
+        }
+        if let Some(&(_, _, idx)) = self
+            .extra
+            .iter()
+            .find(|(a, t, _)| *a == is_audio && *t == track_id)
+        {
+            return idx;
+        }
+        let idx = 2 + self.extra.len() as u32;
+        self.extra.push((is_audio, track_id, idx));
+        idx
+    }
+}
+
+/// Register `index` in `streams` if absent (keeping the list sorted by
+/// index). `params` is only evaluated for a fresh registration, so the
+/// first tag seen on a stream fixes its codec parameters — the same
+/// rule the two-stream layout always applied.
+fn ensure_stream(
+    streams: &mut Vec<StreamInfo>,
+    index: u32,
+    params: impl FnOnce() -> CodecParameters,
+) {
+    if streams.iter().all(|s| s.index != index) {
+        streams.push(StreamInfo {
+            index,
+            time_base: RTMP_TIME_BASE,
+            duration: None,
+            start_time: None,
+            params: params(),
+        });
+        streams.sort_by_key(|s| s.index);
+    }
+}
+
+/// Expand one received audio message into per-stream [`Packet`]s.
+///
+/// A single-track message yields one packet on the default audio
+/// stream. A v2 `Multitrack` message demuxes into one packet per
+/// track (each on its own lazily-registered stream); the outer tag's
+/// `TimestampOffsetNano` ModEx sum applies to the whole message per
+/// §"ExAudioTagHeader", so it folds into every track's presentation
+/// time.
+fn audio_packets(
+    ts_ms: i64,
+    tag: &AudioTag,
+    tracks: &mut TrackStreams,
+    streams: &mut Vec<StreamInfo>,
+) -> crate::Result<Vec<Packet>> {
+    if !tag.is_multitrack() {
+        let index = tracks.index(true, 0);
+        ensure_stream(streams, index, || audio_codec_params(tag));
+        return Ok(vec![audio_to_packet_at(ts_ms, tag, index, 0)]);
+    }
+    let outer_nano = tag.timestamp_offset_nano() as i64;
+    let demuxed = tag.demux_tracks()?;
+    let mut out = Vec::with_capacity(demuxed.len());
+    for (track_id, ttag) in &demuxed {
+        let index = tracks.index(true, *track_id);
+        ensure_stream(streams, index, || audio_codec_params(ttag));
+        out.push(audio_to_packet_at(ts_ms, ttag, index, outer_nano));
+    }
+    Ok(out)
+}
+
+/// Expand one received video message into per-stream [`Packet`]s —
+/// the video mirror of [`audio_packets`]. Per-track SI24 composition
+/// times (decoded from each track body by
+/// [`VideoTag::demux_tracks`]) reach each track's `pts` individually.
+fn video_packets(
+    ts_ms: i64,
+    tag: &VideoTag,
+    tracks: &mut TrackStreams,
+    streams: &mut Vec<StreamInfo>,
+) -> crate::Result<Vec<Packet>> {
+    if !tag.is_multitrack() {
+        let index = tracks.index(false, 0);
+        ensure_stream(streams, index, || video_codec_params(tag));
+        return Ok(vec![video_to_packet_at(ts_ms, tag, index, 0)]);
+    }
+    let outer_nano = tag.timestamp_offset_nano() as i64;
+    let demuxed = tag.demux_tracks()?;
+    let mut out = Vec::with_capacity(demuxed.len());
+    for (track_id, ttag) in &demuxed {
+        let index = tracks.index(false, *track_id);
+        ensure_stream(streams, index, || video_codec_params(ttag));
+        out.push(video_to_packet_at(ts_ms, ttag, index, outer_nano));
+    }
+    Ok(out)
+}
+
 /// Unified media event shared by the two protocol pumps — the
 /// server-side [`RtmpSession`] (accepted publisher) and the
 /// client-side [`RtmpPlayer`] (pulled play stream) both reduce to
@@ -278,6 +403,10 @@ struct ProbeState {
     /// §4 timestamp unwrapping state, carried into the source so the
     /// steady phase continues the probe phase's extended timeline.
     ts: TimestampUnwrapper,
+    /// Multitrack `(kind, trackId)` → stream-index assignments made
+    /// during probing, carried into the source so the steady phase
+    /// keeps the same layout.
+    tracks: TrackStreams,
 }
 
 /// Shared probe loop: read up to [`PROBE_LIMIT`] events, note the
@@ -299,6 +428,7 @@ fn probe_source<S: MediaSource>(
         buffered: VecDeque::new(),
         ended: false,
         ts: TimestampUnwrapper::new(),
+        tracks: TrackStreams::default(),
     };
     let mut have_audio = false;
     let mut have_video = false;
@@ -323,36 +453,24 @@ fn probe_source<S: MediaSource>(
         };
         match next {
             MediaSourceEvent::Audio { timestamp, tag } => {
-                if !have_audio {
-                    state.streams.push(StreamInfo {
-                        index: AUDIO_STREAM_INDEX,
-                        time_base: RTMP_TIME_BASE,
-                        duration: None,
-                        start_time: None,
-                        params: audio_codec_params(&tag),
+                let ts_ms = state.ts.unwrap_ms(timestamp);
+                for packet in audio_packets(ts_ms, &tag, &mut state.tracks, &mut state.streams)? {
+                    state.buffered.push_back(BufferedPacket {
+                        packet,
+                        is_audio: true,
                     });
-                    have_audio = true;
                 }
-                state.buffered.push_back(BufferedPacket {
-                    packet: audio_to_packet(state.ts.unwrap_ms(timestamp), &tag),
-                    is_audio: true,
-                });
+                have_audio = true;
             }
             MediaSourceEvent::Video { timestamp, tag } => {
-                if !have_video {
-                    state.streams.push(StreamInfo {
-                        index: VIDEO_STREAM_INDEX,
-                        time_base: RTMP_TIME_BASE,
-                        duration: None,
-                        start_time: None,
-                        params: video_codec_params(&tag),
+                let ts_ms = state.ts.unwrap_ms(timestamp);
+                for packet in video_packets(ts_ms, &tag, &mut state.tracks, &mut state.streams)? {
+                    state.buffered.push_back(BufferedPacket {
+                        packet,
+                        is_audio: false,
                     });
-                    have_video = true;
                 }
-                state.buffered.push_back(BufferedPacket {
-                    packet: video_to_packet(state.ts.unwrap_ms(timestamp), &tag),
-                    is_audio: false,
-                });
+                have_video = true;
             }
             MediaSourceEvent::Metadata(value) => {
                 flatten_metadata(&value, &mut state.metadata);
@@ -377,41 +495,42 @@ fn probe_source<S: MediaSource>(
 /// Shared steady-state pump: read media events until one converts to
 /// a [`Packet`], lazily registering a stream the probe phase never
 /// observed, recording metadata, and latching `ended` on clean EOS.
+///
+/// A v2 `Multitrack` message expands into several packets; the first
+/// is returned and the rest queue onto `pending`, which the caller
+/// drains ahead of the next wire read.
+#[allow(clippy::too_many_arguments)]
 fn steady_next<S: MediaSource>(
     src: &mut S,
     streams: &mut Vec<StreamInfo>,
     metadata: &mut Vec<(String, String)>,
     ended: &mut bool,
     ts: &mut TimestampUnwrapper,
+    tracks: &mut TrackStreams,
+    pending: &mut VecDeque<Packet>,
 ) -> CoreResult<Packet> {
     loop {
         let event = src.next_media().map_err(rtmp_to_core_err)?;
         match event {
             MediaSourceEvent::Audio { timestamp, tag } => {
-                if streams.iter().all(|s| s.index != AUDIO_STREAM_INDEX) {
-                    streams.push(StreamInfo {
-                        index: AUDIO_STREAM_INDEX,
-                        time_base: RTMP_TIME_BASE,
-                        duration: None,
-                        start_time: None,
-                        params: audio_codec_params(&tag),
-                    });
-                    streams.sort_by_key(|s| s.index);
+                let ts_ms = ts.unwrap_ms(timestamp);
+                let mut packets = audio_packets(ts_ms, &tag, tracks, streams)
+                    .map_err(rtmp_to_core_err)?
+                    .into_iter();
+                if let Some(first) = packets.next() {
+                    pending.extend(packets);
+                    return Ok(first);
                 }
-                return Ok(audio_to_packet(ts.unwrap_ms(timestamp), &tag));
             }
             MediaSourceEvent::Video { timestamp, tag } => {
-                if streams.iter().all(|s| s.index != VIDEO_STREAM_INDEX) {
-                    streams.push(StreamInfo {
-                        index: VIDEO_STREAM_INDEX,
-                        time_base: RTMP_TIME_BASE,
-                        duration: None,
-                        start_time: None,
-                        params: video_codec_params(&tag),
-                    });
-                    streams.sort_by_key(|s| s.index);
+                let ts_ms = ts.unwrap_ms(timestamp);
+                let mut packets = video_packets(ts_ms, &tag, tracks, streams)
+                    .map_err(rtmp_to_core_err)?
+                    .into_iter();
+                if let Some(first) = packets.next() {
+                    pending.extend(packets);
+                    return Ok(first);
                 }
-                return Ok(video_to_packet(ts.unwrap_ms(timestamp), &tag));
             }
             MediaSourceEvent::Metadata(value) => {
                 flatten_metadata(&value, metadata);
@@ -446,6 +565,11 @@ pub struct RtmpPacketSource {
     /// §4 serial-number timestamp unwrapping across the 49.7-day
     /// 32-bit rollover.
     ts: TimestampUnwrapper,
+    /// Multitrack `(kind, trackId)` → stream-index assignments.
+    tracks: TrackStreams,
+    /// Overflow packets from a demuxed v2 `Multitrack` message,
+    /// drained ahead of the next wire read.
+    pending: VecDeque<Packet>,
 }
 
 impl RtmpPacketSource {
@@ -461,6 +585,8 @@ impl RtmpPacketSource {
             buffered: VecDeque::new(),
             ended: false,
             ts: TimestampUnwrapper::new(),
+            tracks: TrackStreams::default(),
+            pending: VecDeque::new(),
         }
     }
 
@@ -486,6 +612,8 @@ impl RtmpPacketSource {
             buffered: state.buffered,
             ended: state.ended,
             ts: state.ts,
+            tracks: state.tracks,
+            pending: VecDeque::new(),
         })
     }
 
@@ -507,6 +635,9 @@ impl PacketSource for RtmpPacketSource {
         if let Some(buf) = self.buffered.pop_front() {
             return Ok(buf.packet);
         }
+        if let Some(pkt) = self.pending.pop_front() {
+            return Ok(pkt);
+        }
         if self.ended {
             return Err(CoreError::Eof);
         }
@@ -516,6 +647,8 @@ impl PacketSource for RtmpPacketSource {
             &mut self.metadata,
             &mut self.ended,
             &mut self.ts,
+            &mut self.tracks,
+            &mut self.pending,
         )
     }
 
@@ -552,6 +685,11 @@ pub struct RtmpPlayerPacketSource {
     /// §4 serial-number timestamp unwrapping across the 49.7-day
     /// 32-bit rollover.
     ts: TimestampUnwrapper,
+    /// Multitrack `(kind, trackId)` → stream-index assignments.
+    tracks: TrackStreams,
+    /// Overflow packets from a demuxed v2 `Multitrack` message,
+    /// drained ahead of the next wire read.
+    pending: VecDeque<Packet>,
 }
 
 impl RtmpPlayerPacketSource {
@@ -565,6 +703,8 @@ impl RtmpPlayerPacketSource {
             buffered: VecDeque::new(),
             ended: false,
             ts: TimestampUnwrapper::new(),
+            tracks: TrackStreams::default(),
+            pending: VecDeque::new(),
         }
     }
 
@@ -585,6 +725,8 @@ impl RtmpPlayerPacketSource {
             buffered: state.buffered,
             ended: state.ended,
             ts: state.ts,
+            tracks: state.tracks,
+            pending: VecDeque::new(),
         })
     }
 
@@ -604,6 +746,9 @@ impl PacketSource for RtmpPlayerPacketSource {
         if let Some(buf) = self.buffered.pop_front() {
             return Ok(buf.packet);
         }
+        if let Some(pkt) = self.pending.pop_front() {
+            return Ok(pkt);
+        }
         if self.ended {
             return Err(CoreError::Eof);
         }
@@ -613,6 +758,8 @@ impl PacketSource for RtmpPlayerPacketSource {
             &mut self.metadata,
             &mut self.ended,
             &mut self.ts,
+            &mut self.tracks,
+            &mut self.pending,
         )
     }
 
@@ -656,8 +803,21 @@ impl PacketSource for RtmpPlayerPacketSource {
 /// time (audio has no separate decode time, so both `pts` and `dts`
 /// receive the offset).
 pub fn audio_to_packet(timestamp_ms: i64, tag: &AudioTag) -> Packet {
+    audio_to_packet_at(timestamp_ms, tag, AUDIO_STREAM_INDEX, 0)
+}
+
+/// [`audio_to_packet`] with an explicit stream index and an extra
+/// message-level presentation offset (ns) — the demuxed-multitrack
+/// path: a per-track tag carries no ModEx of its own, so the *outer*
+/// message's `TimestampOffsetNano` sum is passed down here.
+fn audio_to_packet_at(
+    timestamp_ms: i64,
+    tag: &AudioTag,
+    stream_index: u32,
+    extra_nano: i64,
+) -> Packet {
     let ts_ns = timestamp_ms * RTMP_MS_TO_NS;
-    let nano_offset = tag.timestamp_offset_nano() as i64;
+    let nano_offset = tag.timestamp_offset_nano() as i64 + extra_nano;
     let presentation_ns = ts_ns + nano_offset;
     let (data, is_header) = if tag.audio_fourcc.is_some() {
         // Enhanced RTMP v2: body is the codec's data verbatim
@@ -685,7 +845,7 @@ pub fn audio_to_packet(timestamp_ms: i64, tag: &AudioTag) -> Packet {
         ..Default::default()
     };
     Packet {
-        stream_index: AUDIO_STREAM_INDEX,
+        stream_index,
         time_base: RTMP_TIME_BASE,
         pts: Some(presentation_ns),
         dts: Some(presentation_ns),
@@ -714,6 +874,17 @@ pub fn audio_to_packet(timestamp_ms: i64, tag: &AudioTag) -> Packet {
 /// *presentation* time of the current media message without
 /// altering the core (decode) timestamp.
 pub fn video_to_packet(timestamp_ms: i64, tag: &VideoTag) -> Packet {
+    video_to_packet_at(timestamp_ms, tag, VIDEO_STREAM_INDEX, 0)
+}
+
+/// [`video_to_packet`] with an explicit stream index and an extra
+/// message-level presentation offset (ns) — see [`audio_to_packet_at`].
+fn video_to_packet_at(
+    timestamp_ms: i64,
+    tag: &VideoTag,
+    stream_index: u32,
+    extra_nano: i64,
+) -> Packet {
     let dts_ns = timestamp_ms * RTMP_MS_TO_NS;
     // CTS lives in two places on the wire — AVC's 3-byte
     // SI24 (legacy), and the three NALU-based Enhanced-RTMP
@@ -735,7 +906,7 @@ pub fn video_to_packet(timestamp_ms: i64, tag: &VideoTag) -> Packet {
     // per spec but the typed accessor returns up to ~16 M as the
     // raw bytesToUI24 sum across multiple entries) folds onto the
     // presentation time only.
-    let nano_offset = tag.timestamp_offset_nano() as i64;
+    let nano_offset = tag.timestamp_offset_nano() as i64 + extra_nano;
     let pts_ns = dts_ns + cts_ns + nano_offset;
     // `header` is set for *both* legacy AVC sequence headers and
     // Enhanced-RTMP `PacketTypeSequenceStart` tags — downstream
@@ -755,7 +926,7 @@ pub fn video_to_packet(timestamp_ms: i64, tag: &VideoTag) -> Packet {
         ..Default::default()
     };
     Packet {
-        stream_index: VIDEO_STREAM_INDEX,
+        stream_index,
         time_base: RTMP_TIME_BASE,
         pts: Some(pts_ns),
         dts: Some(dts_ns),
@@ -1859,5 +2030,203 @@ mod tests {
             CoreError::InvalidData(s) => assert!(s.contains("bad chunk size")),
             _ => panic!("expected InvalidData"),
         }
+    }
+
+    // ────────────── Multitrack demux through the PacketSource ──────────────
+
+    /// Stub MediaSource yielding a fixed event list — drives
+    /// `probe_source` / `steady_next` without a socket.
+    struct StubSource(std::collections::VecDeque<MediaSourceEvent>);
+    impl MediaSource for StubSource {
+        fn next_media(&mut self) -> RtmpResult<MediaSourceEvent> {
+            Ok(self.0.pop_front().unwrap_or(MediaSourceEvent::End))
+        }
+        fn set_timeout(&mut self, _d: Option<Duration>) {}
+    }
+
+    fn ex_video_tag(fourcc: [u8; 4], cts: i32, body: &[u8]) -> VideoTag {
+        VideoTag {
+            frame_type: VIDEO_FRAME_KEYFRAME,
+            codec_id: 0,
+            avc_packet_type: None,
+            composition_time: cts,
+            body: body.to_vec(),
+            ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
+            fourcc: Some(fourcc),
+            mod_ex: Vec::new(),
+            multitrack: None,
+        }
+    }
+
+    fn ex_audio_tag(fourcc: [u8; 4], body: &[u8]) -> AudioTag {
+        AudioTag {
+            sound_format: AUDIO_FORMAT_EX_HEADER,
+            sound_rate: 0,
+            sound_size_16bit: false,
+            stereo: false,
+            aac_packet_type: None,
+            ex_packet_type: Some(crate::flv::AUDIO_PACKET_TYPE_CODED_FRAMES),
+            audio_fourcc: Some(fourcc),
+            body: body.to_vec(),
+            mod_ex: Vec::new(),
+            multitrack: None,
+        }
+    }
+
+    #[test]
+    fn multitrack_video_probes_per_track_streams_with_per_track_cts() {
+        // ManyTracksManyCodecs: HEVC default track (trackId 0, CTS 17)
+        // + AV1 alternate (trackId 1, no CTS). The default track keeps
+        // the fixed video index 1; the alternate allocates index 2.
+        let hevc = ex_video_tag(FOURCC_HEVC, 17, b"hevc-au");
+        let av1 = ex_video_tag(FOURCC_AV1, 0, b"av1-tu");
+        let outer = VideoTag::multitrack_from_tags(
+            crate::flv::AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS,
+            &[(0, &hevc), (1, &av1)],
+        )
+        .expect("mux");
+        let mut src = StubSource(
+            [MediaSourceEvent::Video {
+                timestamp: 1000,
+                tag: outer,
+            }]
+            .into_iter()
+            .collect(),
+        );
+        let state = probe_source(&mut src, None).expect("probe");
+        let indices: Vec<u32> = state.streams.iter().map(|s| s.index).collect();
+        assert_eq!(indices, vec![VIDEO_STREAM_INDEX, 2]);
+        assert_eq!(state.streams[0].params.codec_id.as_str(), "hevc");
+        assert_eq!(state.streams[1].params.codec_id.as_str(), "av1");
+
+        assert_eq!(state.buffered.len(), 2);
+        let p0 = &state.buffered[0].packet;
+        let p1 = &state.buffered[1].packet;
+        assert_eq!(p0.stream_index, VIDEO_STREAM_INDEX);
+        assert_eq!(p0.dts, Some(1000 * RTMP_MS_TO_NS));
+        // Per-track SI24 CTS reaches only that track's pts.
+        assert_eq!(p0.pts, Some((1000 + 17) * RTMP_MS_TO_NS));
+        assert_eq!(p0.data, b"hevc-au");
+        assert_eq!(p1.stream_index, 2);
+        assert_eq!(p1.pts, Some(1000 * RTMP_MS_TO_NS));
+        assert_eq!(p1.data, b"av1-tu");
+    }
+
+    #[test]
+    fn multitrack_audio_default_track_keeps_index_zero() {
+        let opus = ex_audio_tag(crate::flv::FOURCC_OPUS, b"opus");
+        let flac = ex_audio_tag(crate::flv::FOURCC_FLAC, b"flac");
+        let outer = AudioTag::multitrack_from_tags(
+            crate::flv::AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS,
+            &[(0, &opus), (7, &flac)],
+        )
+        .expect("mux");
+        let mut src = StubSource(
+            [MediaSourceEvent::Audio {
+                timestamp: 40,
+                tag: outer,
+            }]
+            .into_iter()
+            .collect(),
+        );
+        let state = probe_source(&mut src, None).expect("probe");
+        let indices: Vec<u32> = state.streams.iter().map(|s| s.index).collect();
+        assert_eq!(indices, vec![AUDIO_STREAM_INDEX, 2]);
+        assert_eq!(state.streams[0].params.codec_id.as_str(), "opus");
+        assert_eq!(state.streams[1].params.codec_id.as_str(), "flac");
+        assert_eq!(state.buffered[0].packet.stream_index, AUDIO_STREAM_INDEX);
+        assert_eq!(state.buffered[1].packet.stream_index, 2);
+    }
+
+    #[test]
+    fn steady_next_returns_first_track_and_queues_the_rest() {
+        let a = ex_video_tag(FOURCC_HEVC, 0, b"rung-a");
+        let b = ex_video_tag(FOURCC_HEVC, 0, b"rung-b");
+        let outer = VideoTag::multitrack_from_tags(
+            crate::flv::AV_MULTITRACK_TYPE_MANY_TRACKS,
+            &[(0, &a), (1, &b)],
+        )
+        .expect("mux");
+        let mut src = StubSource(
+            [MediaSourceEvent::Video {
+                timestamp: 500,
+                tag: outer,
+            }]
+            .into_iter()
+            .collect(),
+        );
+        let mut streams = Vec::new();
+        let mut metadata = Vec::new();
+        let mut ended = false;
+        let mut ts = TimestampUnwrapper::new();
+        let mut tracks = TrackStreams::default();
+        let mut pending = VecDeque::new();
+        let first = steady_next(
+            &mut src,
+            &mut streams,
+            &mut metadata,
+            &mut ended,
+            &mut ts,
+            &mut tracks,
+            &mut pending,
+        )
+        .expect("first packet");
+        assert_eq!(first.stream_index, VIDEO_STREAM_INDEX);
+        assert_eq!(first.data, b"rung-a");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].stream_index, 2);
+        assert_eq!(pending[0].data, b"rung-b");
+        // Both streams registered lazily during the steady phase.
+        let indices: Vec<u32> = streams.iter().map(|s| s.index).collect();
+        assert_eq!(indices, vec![VIDEO_STREAM_INDEX, 2]);
+    }
+
+    #[test]
+    fn outer_modex_nano_offset_folds_into_every_demuxed_track() {
+        // §"ExVideoTagHeader": a message-level TimestampOffsetNano
+        // adjusts the presentation time of the whole message; after
+        // demux it must reach every track's pts (and no track's dts).
+        let a = ex_video_tag(FOURCC_HEVC, 17, b"a");
+        let b = ex_video_tag(FOURCC_HEVC, 0, b"b");
+        let mut outer = VideoTag::multitrack_from_tags(
+            crate::flv::AV_MULTITRACK_TYPE_MANY_TRACKS,
+            &[(0, &a), (1, &b)],
+        )
+        .expect("mux");
+        outer.mod_ex = vec![crate::flv::ModEx::timestamp_offset_nano_entry(750_000)];
+        let mut tracks = TrackStreams::default();
+        let mut streams = Vec::new();
+        let packets = video_packets(2_000, &outer, &mut tracks, &mut streams).expect("expand");
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].dts, Some(2_000 * RTMP_MS_TO_NS));
+        assert_eq!(packets[0].pts, Some((2_000 + 17) * RTMP_MS_TO_NS + 750_000));
+        assert_eq!(packets[1].dts, Some(2_000 * RTMP_MS_TO_NS));
+        assert_eq!(packets[1].pts, Some(2_000 * RTMP_MS_TO_NS + 750_000));
+    }
+
+    #[test]
+    fn malformed_multitrack_track_body_is_a_clean_error() {
+        // hvc1 CodedFrames track body shorter than its SI24 CTS: the
+        // expansion surfaces a typed error (probe propagates it, the
+        // steady phase maps it onto CoreError) instead of panicking.
+        let outer = VideoTag::multitrack_tag(
+            VIDEO_FRAME_KEYFRAME,
+            EX_PACKET_TYPE_CODED_FRAMES,
+            Some(FOURCC_HEVC),
+            crate::flv::Multitrack {
+                multitrack_type: crate::flv::AV_MULTITRACK_TYPE_ONE_TRACK,
+                tracks: vec![crate::flv::MultitrackTrack {
+                    fourcc: None,
+                    track_id: 0,
+                    body: vec![0x01, 0x02],
+                }],
+            },
+        );
+        let mut tracks = TrackStreams::default();
+        let mut streams = Vec::new();
+        let err = video_packets(0, &outer, &mut tracks, &mut streams).unwrap_err();
+        assert!(err.to_string().contains("track 0"), "{err}");
+        // No stream was registered for the failed message.
+        assert!(streams.is_empty());
     }
 }
