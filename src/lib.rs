@@ -107,7 +107,7 @@ pub use error::{Error, Result};
 pub use flv::{
     build_audio_message, build_silence_audio, is_silence_payload, parse_audio_message,
     AudioMessage, AudioTag, ColorConfig, ColorInfo, HdrCll, HdrMdcv, ModEx, MultichannelConfig,
-    MultichannelConfigOrder, Multitrack, MultitrackTrack, OnMetaData, VideoTag,
+    MultichannelConfigOrder, Multitrack, MultitrackTrack, OnMetaData, TrackInfo, VideoTag,
 };
 pub use flv_crypt::{
     parse_encrypted_body, EncryptedTag, FilterParams, FILTER_NAME_ENCRYPTION,
