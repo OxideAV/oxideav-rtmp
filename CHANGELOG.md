@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.6...v0.0.7) - 2026-08-12
+
+### Other
+
+- re-export TrackInfo at the crate root alongside the other typed flv views
+- satisfy clippy while-let-loop in the PacketSource multitrack drain
+- real-socket PacketSource proof of the per-track stream layout
+- multitrack injection sweeps, README/CHANGELOG rollup
+- multitrack-aware PacketSource — per-track streams on both directions
+- typed TrackInfo views over the v2 per-track metadata maps
+- public tag-level sends + Multitrack send helpers on both directions
+- per-track demux/mux for Enhanced RTMP v2 Multitrack tags
+- public-API surface audit (zero doc(hidden) needed) + rustdoc link-warning sweep
+- injection-robustness for the new surfaces + late-subscriber data-frame replay flow
+- shared object: live SO traffic on all four connection surfaces
+- data frames: @setDataFrame / @clearDataFrame end-to-end (staged trace §2)
+- shared object: message-type 19/16 body parse + build — header, event framing, all 11 event types (staged trace §1)
+- digest (HMAC-SHA256) variant per staged trace §3 — schema 0/1, offset arithmetic, chained C2/S2, auto-negotiating server, opt-in client/player
+- escape the RFC1982 bracket citation in rustdoc
+- round-up — chunk ext-ts matrix, AMF3 selector framing, call RPC, timestamp rollover, peer-bandwidth limit types
+- §5.4.5 Set Peer Bandwidth — Hard / Soft / Dynamic limit-type semantics
+- §4 serial-number timestamp unwrapping across the 32-bit rollover
+- injection robustness for the v2 selector decoder + CallCommand
+- §7.2.1.2 call RPC surface on the play (subscribe) client
+- §7.2.1.2 NetConnection call — RPC end-to-end
+- accept AMF3 (type-17) commands in the negotiation driver
+- Enhanced RTMP v2 format-selector byte for type-15/17 bodies
+- §5.3.1.3 extended-timestamp + fmt-3 head-chunk correctness
+- add CI / crates.io / docs.rs / MIT-license badges
+- §4.2.4/§4.2.5 receiveAudio(true)/receiveVideo(true) reply helper
+- adversarial-input coverage for the play surfaces
+- play-direction round-up — README, module docs, CHANGELOG
+- §4.2.1 dynamic playlists + §4.2.2 play2 + drained teardown
+- drain-until-FIN on every graceful close — fixes RST teardown races
+- deterministic drain barrier in the relay test
+- rtmp-play:// pull-mode PacketSource + shared probe core
+- full-stack publish → ingest → play relay over loopback
+- RtmpPlayer — the §4.2.1 play (pull / subscribe) client
+- accept the §4.2.1 play (subscribe) direction
+- bridge inline avmplus-object-marker (0x11) to the AMF3 decoder
+- complete marker set — Unsupported 0x0D / XML Document 0x0F / Typed Object 0x10
+- typed SequenceEnd surface + crate README round-up (Enhanced RTMP v2)
+- typed VideoPacketType.MPEG2TSSequenceStart (Enhanced RTMP v2 §"ExVideoTagBody")
+- audio silence message (Enhanced RTMP v2 §"ExAudioTagHeader")
+- typed OnMetaData view (Enhanced RTMP v2 §"Enhancing onMetaData")
+- typed VideoFrameType.Command (StartSeek/EndSeek) seek-command frames
+- fix EncryptionTagHeader rustdoc link to EncryptedTag
+- parse FLV Encryption envelope (Annex F.3.1/F.3.2)
+- typed NetStreamCommand (RTMP 1.0 §4.2) parser + builder; surface inbound on server
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - Multitrack streaming (enhanced-rtmp-v2.pdf §"Multitrack Streaming via Enhanced RTMP") end-to-end: `VideoTag::demux_tracks` / `AudioTag::demux_tracks` lift each track of a `Multitrack` message into the standalone single-track tag the same frame would have produced alone (per-track/shared FourCC, real inner PacketType, per-track SI24 composition time decoded through the ordinary parse rules), with `multitrack_from_tags` as the validated inverse (uniform inner PacketType + FrameType, shared-vs-per-track FourCC by mode, OneTrack cardinality, no nested Multitrack/ModEx); `RtmpClient::send_video_tag` / `send_audio_tag` go public and `send_video_multitrack` / `send_audio_multitrack` land on both `RtmpClient` and `PlaySession`; the v2 `audioTrackIdInfoMap` / `videoTrackIdInfoMap` per-track metadata lifts into the typed `TrackInfo` view (`OnMetaData::video/audio_track_ids`, `video/audio_track_info`, `set_video/audio_track_info` upserts; FourCC-as-UI32 codec ids decoded, non-typical fields preserved verbatim); both `PacketSource` adapters demultiplex multitrack messages into one packet per track (trackId 0 keeps the fixed audio-0/video-1 layout, additional tracks lazily register streams 2, 3, … with per-track codec params; message-level `TimestampOffsetNano` folds into every track's presentation time; malformed track bodies are typed errors) — covered by wire-golden + mux/demux round-trip units, loopback publish/play integration flows, stub-source adapter units, and randomized injection sweeps over the track-list parser and the `TrackInfo` decoder
