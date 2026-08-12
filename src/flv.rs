@@ -1300,6 +1300,95 @@ impl Multitrack {
     }
 }
 
+/// Validation plan shared by [`VideoTag::multitrack_from_tags`] /
+/// [`AudioTag::multitrack_from_tags`].
+struct MultitrackPlan {
+    inner_packet_type: u8,
+    shared_fourcc: Option<[u8; 4]>,
+    per_track_fourcc: bool,
+}
+
+/// Validate a per-track tag list against the §"ExVideoTagHeader" /
+/// §"ExAudioTagHeader" multitrack invariants (one inner PacketType per
+/// message, shared-vs-per-track FourCC by mode, `OneTrack` = exactly one
+/// track) and derive the outer-tag fields. Generic over the audio/video
+/// tag type via accessors so both pipelines share one rule set.
+#[allow(clippy::too_many_arguments)]
+fn plan_multitrack<T>(
+    multitrack_type: u8,
+    tracks: &[(u8, &T)],
+    fourcc: impl Fn(&T) -> Option<[u8; 4]>,
+    ex_packet_type: impl Fn(&T) -> Option<u8>,
+    is_multitrack: impl Fn(&T) -> bool,
+    has_mod_ex: impl Fn(&T) -> bool,
+    pt_multitrack: u8,
+    pt_mod_ex: u8,
+    kind: &str,
+) -> Result<MultitrackPlan> {
+    if tracks.is_empty() {
+        return Err(Error::Other(format!(
+            "multitrack_from_tags ({kind}): need at least one track"
+        )));
+    }
+    let one_track = multitrack_type == AV_MULTITRACK_TYPE_ONE_TRACK;
+    let many_codecs = multitrack_type == AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS;
+    if one_track && tracks.len() != 1 {
+        return Err(Error::Other(format!(
+            "multitrack_from_tags ({kind}): OneTrack mode carries exactly one track, got {}",
+            tracks.len()
+        )));
+    }
+    let inner_pt = ex_packet_type(tracks[0].1).ok_or_else(|| {
+        Error::Other(format!(
+            "multitrack_from_tags ({kind}): track {} is not an Enhanced-RTMP tag (no PacketType)",
+            tracks[0].0
+        ))
+    })?;
+    if inner_pt == pt_multitrack || inner_pt == pt_mod_ex {
+        return Err(Error::Other(format!(
+            "multitrack_from_tags ({kind}): inner PacketType {inner_pt} is reserved (Multitrack / ModEx cannot nest)"
+        )));
+    }
+    for (id, tag) in tracks {
+        if is_multitrack(tag) {
+            return Err(Error::Other(format!(
+                "multitrack_from_tags ({kind}): track {id} is itself a Multitrack tag"
+            )));
+        }
+        if has_mod_ex(tag) {
+            return Err(Error::Other(format!(
+                "multitrack_from_tags ({kind}): track {id} carries a ModEx prelude (message-level ModEx belongs on the outer tag)"
+            )));
+        }
+        if ex_packet_type(tag) != Some(inner_pt) {
+            return Err(Error::Other(format!(
+                "multitrack_from_tags ({kind}): track {id} PacketType differs (the wire carries one inner PacketType per message)"
+            )));
+        }
+        if fourcc(tag).is_none() {
+            return Err(Error::Other(format!(
+                "multitrack_from_tags ({kind}): track {id} is not an Enhanced-RTMP tag (no FourCC)"
+            )));
+        }
+    }
+    let shared_fourcc = if many_codecs {
+        None
+    } else {
+        let fcc = fourcc(tracks[0].1);
+        if let Some((id, _)) = tracks.iter().find(|(_, t)| fourcc(t) != fcc) {
+            return Err(Error::Other(format!(
+                "multitrack_from_tags ({kind}): track {id} FourCC differs — OneTrack / ManyTracks share one codec; use ManyTracksManyCodecs"
+            )));
+        }
+        fcc
+    };
+    Ok(MultitrackPlan {
+        inner_packet_type: inner_pt,
+        shared_fourcc,
+        per_track_fourcc: many_codecs,
+    })
+}
+
 /// Decoded FLV video-tag header + payload. For H.264 the
 /// `composition_time` is the signed CTS offset (ms) between the
 /// decoder timestamp the RTMP chunk carries and the presentation
@@ -1668,6 +1757,129 @@ impl VideoTag {
             mod_ex: Vec::new(),
             multitrack: Some(mt),
         }
+    }
+
+    /// Demultiplex an Enhanced-RTMP v2 video `Multitrack` tag into
+    /// standalone per-track [`VideoTag`]s (enhanced-rtmp-v2.pdf
+    /// §"Multitrack Streaming via Enhanced RTMP" / §"ExVideoTagBody").
+    ///
+    /// Each returned `(trackId, tag)` pair is the single-track tag the
+    /// same frame would have produced had it been published alone: the
+    /// per-track FourCC (the shared one for `OneTrack` / `ManyTracks`,
+    /// the track's own for `ManyTracksManyCodecs`), the message's real
+    /// inner PacketType, the outer FrameType, and the track body decoded
+    /// through the ordinary [`parse_video`] rules — in particular the
+    /// per-track SI24 `compositionTimeOffset` that `CodedFrames` carries
+    /// for the NALU FourCCs (`hvc1` / `avc1` / `vvc1`) is lifted into
+    /// [`VideoTag::composition_time`], exactly as the spec's
+    /// `ExVideoTagBody` loop reads it once per track.
+    ///
+    /// The outer tag's ModEx prelude is *not* copied onto the per-track
+    /// tags: per §"ExVideoTagHeader" a ModEx entry (e.g.
+    /// `TimestampOffsetNano`) modifies the whole message, so it stays a
+    /// property of the outer tag ([`VideoTag::timestamp_offset_nano`]).
+    ///
+    /// Errors: the tag is not multitrack, a `ManyTracksManyCodecs` track
+    /// is missing its FourCC, or a track body fails the per-track parse
+    /// (e.g. a truncated SI24 CTS).
+    pub fn demux_tracks(&self) -> Result<Vec<(u8, VideoTag)>> {
+        let mt = self.multitrack.as_ref().ok_or_else(|| {
+            Error::Other("VideoTag::demux_tracks: tag is not a Multitrack message".into())
+        })?;
+        let inner_pt = self.ex_packet_type.ok_or_else(|| {
+            Error::Other("VideoTag::demux_tracks: multitrack tag lacks inner PacketType".into())
+        })?;
+        let mut out = Vec::with_capacity(mt.tracks.len());
+        for track in &mt.tracks {
+            let fcc = track.fourcc.or(self.fourcc).ok_or_else(|| {
+                Error::Other(format!(
+                    "VideoTag::demux_tracks: track {} has no FourCC (neither per-track nor shared)",
+                    track.track_id
+                ))
+            })?;
+            // Synthesize the single-track wire payload and reuse
+            // `parse_video` so the per-track body follows the exact
+            // §"ExVideoTagBody" shape (CTS, Metadata, Command, …) with
+            // one source of truth.
+            let mut payload = Vec::with_capacity(5 + track.body.len());
+            payload.push(VIDEO_IS_EX_HEADER | ((self.frame_type & 0x07) << 4) | (inner_pt & 0x0F));
+            payload.extend_from_slice(&fcc);
+            payload.extend_from_slice(&track.body);
+            let tag = parse_video(&payload).map_err(|e| {
+                Error::Other(format!(
+                    "VideoTag::demux_tracks: track {} body failed to parse: {e}",
+                    track.track_id
+                ))
+            })?;
+            out.push((track.track_id, tag));
+        }
+        Ok(out)
+    }
+
+    /// Multiplex standalone single-track Enhanced-RTMP [`VideoTag`]s
+    /// into one v2 `Multitrack` tag — the inverse of
+    /// [`VideoTag::demux_tracks`].
+    ///
+    /// `multitrack_type` is one of the `AV_MULTITRACK_TYPE_*` modes.
+    /// Every input tag must be an Enhanced-RTMP tag (`fourcc` +
+    /// `ex_packet_type` set), non-multitrack, with an empty ModEx
+    /// prelude (message-level ModEx belongs on the returned outer tag —
+    /// set [`VideoTag::mod_ex`] afterwards); all tags must share the
+    /// same inner PacketType and FrameType (the wire carries one of
+    /// each per message, per §"ExVideoTagHeader"), and the inner
+    /// PacketType must not be `Multitrack` or `ModEx`. `OneTrack`
+    /// requires exactly one track; `OneTrack` / `ManyTracks` require a
+    /// single shared FourCC across all tracks, while
+    /// `ManyTracksManyCodecs` stamps each track's own FourCC into the
+    /// track list.
+    pub fn multitrack_from_tags(
+        multitrack_type: u8,
+        tracks: &[(u8, &VideoTag)],
+    ) -> Result<VideoTag> {
+        let plan = plan_multitrack(
+            multitrack_type,
+            tracks,
+            |t| t.fourcc,
+            |t| t.ex_packet_type,
+            |t| t.multitrack.is_some(),
+            |t| !t.mod_ex.is_empty(),
+            EX_PACKET_TYPE_MULTITRACK,
+            EX_PACKET_TYPE_MOD_EX,
+            "video",
+        )?;
+        let frame_type = tracks[0].1.frame_type;
+        if let Some((id, _)) = tracks.iter().find(|(_, t)| t.frame_type != frame_type) {
+            return Err(Error::Other(format!(
+                "multitrack_from_tags: track {id} FrameType differs (the outer header carries one FrameType per message)"
+            )));
+        }
+        let mut mt_tracks = Vec::with_capacity(tracks.len());
+        for (track_id, tag) in tracks {
+            // `build_video` emits `[head(1)][FourCC(4)][CTS?][body]` for a
+            // non-multitrack Enhanced tag with no ModEx; stripping the
+            // 5-byte prefix leaves exactly the §"ExVideoTagBody" per-track
+            // body (including the SI24 CTS where the FourCC × PacketType
+            // pair carries one).
+            let wire = build_video(tag);
+            mt_tracks.push(MultitrackTrack {
+                fourcc: if plan.per_track_fourcc {
+                    tag.fourcc
+                } else {
+                    None
+                },
+                track_id: *track_id,
+                body: wire[5..].to_vec(),
+            });
+        }
+        Ok(VideoTag::multitrack_tag(
+            frame_type,
+            plan.inner_packet_type,
+            plan.shared_fourcc,
+            Multitrack {
+                multitrack_type,
+                tracks: mt_tracks,
+            },
+        ))
     }
 }
 
@@ -2222,6 +2434,96 @@ impl AudioTag {
             mod_ex: Vec::new(),
             multitrack: Some(mt),
         }
+    }
+
+    /// Demultiplex an Enhanced-RTMP v2 audio `Multitrack` tag into
+    /// standalone per-track [`AudioTag`]s (enhanced-rtmp-v2.pdf
+    /// §"Multitrack Streaming via Enhanced RTMP" / §"ExAudioTagBody").
+    ///
+    /// Mirror of [`VideoTag::demux_tracks`]: each `(trackId, tag)` pair
+    /// is the single-track tag the same frame would have produced alone
+    /// (per-track or shared FourCC, the message's real inner
+    /// AudioPacketType, body decoded through the ordinary
+    /// [`parse_audio`] rules). The outer tag's ModEx prelude is not
+    /// copied — it modifies the whole message and stays a property of
+    /// the outer tag.
+    pub fn demux_tracks(&self) -> Result<Vec<(u8, AudioTag)>> {
+        let mt = self.multitrack.as_ref().ok_or_else(|| {
+            Error::Other("AudioTag::demux_tracks: tag is not a Multitrack message".into())
+        })?;
+        let inner_pt = self.ex_packet_type.ok_or_else(|| {
+            Error::Other("AudioTag::demux_tracks: multitrack tag lacks inner PacketType".into())
+        })?;
+        let mut out = Vec::with_capacity(mt.tracks.len());
+        for track in &mt.tracks {
+            let fcc = track.fourcc.or(self.audio_fourcc).ok_or_else(|| {
+                Error::Other(format!(
+                    "AudioTag::demux_tracks: track {} has no FourCC (neither per-track nor shared)",
+                    track.track_id
+                ))
+            })?;
+            let mut payload = Vec::with_capacity(5 + track.body.len());
+            payload.push((AUDIO_FORMAT_EX_HEADER << 4) | (inner_pt & 0x0F));
+            payload.extend_from_slice(&fcc);
+            payload.extend_from_slice(&track.body);
+            let tag = parse_audio(&payload).map_err(|e| {
+                Error::Other(format!(
+                    "AudioTag::demux_tracks: track {} body failed to parse: {e}",
+                    track.track_id
+                ))
+            })?;
+            out.push((track.track_id, tag));
+        }
+        Ok(out)
+    }
+
+    /// Multiplex standalone single-track Enhanced-RTMP [`AudioTag`]s
+    /// into one v2 `Multitrack` tag — the inverse of
+    /// [`AudioTag::demux_tracks`] and the mirror of
+    /// [`VideoTag::multitrack_from_tags`] (same invariants: uniform
+    /// inner AudioPacketType, shared FourCC for `OneTrack` /
+    /// `ManyTracks` vs per-track FourCC for `ManyTracksManyCodecs`,
+    /// exactly one track in `OneTrack` mode, no nested Multitrack /
+    /// ModEx).
+    pub fn multitrack_from_tags(
+        multitrack_type: u8,
+        tracks: &[(u8, &AudioTag)],
+    ) -> Result<AudioTag> {
+        let plan = plan_multitrack(
+            multitrack_type,
+            tracks,
+            |t| t.audio_fourcc,
+            |t| t.ex_packet_type,
+            |t| t.multitrack.is_some(),
+            |t| !t.mod_ex.is_empty(),
+            AUDIO_PACKET_TYPE_MULTITRACK,
+            AUDIO_PACKET_TYPE_MOD_EX,
+            "audio",
+        )?;
+        let mut mt_tracks = Vec::with_capacity(tracks.len());
+        for (track_id, tag) in tracks {
+            // `build_audio` emits `[head(1)][FourCC(4)][body]` for a
+            // non-multitrack Enhanced tag with no ModEx; stripping the
+            // 5-byte prefix leaves the §"ExAudioTagBody" per-track body.
+            let wire = build_audio(tag);
+            mt_tracks.push(MultitrackTrack {
+                fourcc: if plan.per_track_fourcc {
+                    tag.audio_fourcc
+                } else {
+                    None
+                },
+                track_id: *track_id,
+                body: wire[5..].to_vec(),
+            });
+        }
+        Ok(AudioTag::multitrack_tag(
+            plan.inner_packet_type,
+            plan.shared_fourcc,
+            Multitrack {
+                multitrack_type,
+                tracks: mt_tracks,
+            },
+        ))
     }
 }
 
