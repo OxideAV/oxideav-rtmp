@@ -573,6 +573,38 @@ impl PlaySession {
         self.send_media(MSG_VIDEO, CSID_VIDEO, timestamp_ms, payload)
     }
 
+    /// Send one Enhanced-RTMP v2 `Multitrack` video message
+    /// (enhanced-rtmp-v2.pdf §"Multitrack Streaming via Enhanced
+    /// RTMP") to the subscriber from standalone single-track tags —
+    /// the server-side mirror of
+    /// [`RtmpClient::send_video_multitrack`](crate::RtmpClient::send_video_multitrack),
+    /// multiplexed via [`VideoTag::multitrack_from_tags`]. Useful for
+    /// serving an ABR ladder or multi-codec variants on one play
+    /// stream.
+    pub fn send_video_multitrack(
+        &mut self,
+        timestamp_ms: u32,
+        multitrack_type: u8,
+        tracks: &[(u8, &VideoTag)],
+    ) -> Result<()> {
+        let tag = VideoTag::multitrack_from_tags(multitrack_type, tracks)?;
+        self.send_video(timestamp_ms, &tag)
+    }
+
+    /// Send one Enhanced-RTMP v2 `Multitrack` audio message to the
+    /// subscriber from standalone single-track tags — the audio mirror
+    /// of [`send_video_multitrack`](Self::send_video_multitrack),
+    /// multiplexed via [`AudioTag::multitrack_from_tags`].
+    pub fn send_audio_multitrack(
+        &mut self,
+        timestamp_ms: u32,
+        multitrack_type: u8,
+        tracks: &[(u8, &AudioTag)],
+    ) -> Result<()> {
+        let tag = AudioTag::multitrack_from_tags(multitrack_type, tracks)?;
+        self.send_audio(timestamp_ms, &tag)
+    }
+
     fn send_media(&mut self, type_id: u8, csid: u32, ts: u32, payload: Vec<u8>) -> Result<()> {
         self.writer.write_message(
             csid,

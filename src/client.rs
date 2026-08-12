@@ -493,7 +493,13 @@ impl RtmpClient {
         self.send_video_tag(timestamp_ms, &tag)
     }
 
-    fn send_video_tag(&mut self, ts: u32, tag: &VideoTag) -> Result<()> {
+    /// Send one pre-framed FLV video tag — the general-purpose escape
+    /// hatch behind the AVC-specific [`send_video`](Self::send_video):
+    /// build any legacy or Enhanced-RTMP [`VideoTag`] (FourCC codecs,
+    /// `SequenceStart` config records, `CodedFramesX`, HDR
+    /// `colorInfo` metadata, `Multitrack`, …) and publish it on the
+    /// session's video chunk stream.
+    pub fn send_video_tag(&mut self, ts: u32, tag: &VideoTag) -> Result<()> {
         let payload = flv::build_video(tag);
         self.writer.write_message(
             CSID_VIDEO,
@@ -546,7 +552,13 @@ impl RtmpClient {
         self.send_audio_tag(timestamp_ms, &tag)
     }
 
-    fn send_audio_tag(&mut self, ts: u32, tag: &AudioTag) -> Result<()> {
+    /// Send one pre-framed FLV audio tag — the general-purpose escape
+    /// hatch behind the AAC-specific [`send_audio`](Self::send_audio):
+    /// build any legacy or Enhanced-RTMP [`AudioTag`] (FourCC codecs,
+    /// `SequenceStart` config records, `MultichannelConfig`,
+    /// `Multitrack`, …) and publish it on the session's audio chunk
+    /// stream.
+    pub fn send_audio_tag(&mut self, ts: u32, tag: &AudioTag) -> Result<()> {
         let payload = flv::build_audio(tag);
         self.writer.write_message(
             CSID_AUDIO,
@@ -559,6 +571,39 @@ impl RtmpClient {
         )?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    /// Publish one Enhanced-RTMP v2 `Multitrack` video message
+    /// (enhanced-rtmp-v2.pdf §"Multitrack Streaming via Enhanced
+    /// RTMP") from standalone single-track tags. Each `(trackId,
+    /// tag)` pair is an ordinary Enhanced-RTMP [`VideoTag`] (FourCC +
+    /// PacketType set); the helper multiplexes them via
+    /// [`VideoTag::multitrack_from_tags`] and sends the result. All
+    /// tracks ride one RTMP timestamp — per the spec's guidelines
+    /// every video message MUST include a `videoTrackId` and all
+    /// tracks within a single timestamp are processed together.
+    pub fn send_video_multitrack(
+        &mut self,
+        timestamp_ms: u32,
+        multitrack_type: u8,
+        tracks: &[(u8, &VideoTag)],
+    ) -> Result<()> {
+        let tag = VideoTag::multitrack_from_tags(multitrack_type, tracks)?;
+        self.send_video_tag(timestamp_ms, &tag)
+    }
+
+    /// Publish one Enhanced-RTMP v2 `Multitrack` audio message from
+    /// standalone single-track tags — the audio mirror of
+    /// [`send_video_multitrack`](Self::send_video_multitrack), built
+    /// via [`AudioTag::multitrack_from_tags`].
+    pub fn send_audio_multitrack(
+        &mut self,
+        timestamp_ms: u32,
+        multitrack_type: u8,
+        tracks: &[(u8, &AudioTag)],
+    ) -> Result<()> {
+        let tag = AudioTag::multitrack_from_tags(multitrack_type, tracks)?;
+        self.send_audio_tag(timestamp_ms, &tag)
     }
 
     /// Send `@setDataFrame("onMetaData", metadata)`. Metadata is an
