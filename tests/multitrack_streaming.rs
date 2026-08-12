@@ -181,3 +181,71 @@ fn play_session_serves_multitrack_to_subscriber() {
     assert!(got, "subscriber never saw the multitrack message");
     server_thread.join().expect("server thread");
 }
+
+/// PacketSource direction: a multitrack publisher feeding a real
+/// `RtmpPacketSource` (probe + steady phases) yields one stream per
+/// track — the default track on the historical fixed indices, the
+/// additional rung on stream 2 — with per-track composition times on
+/// each track's pts.
+#[test]
+fn packet_source_exposes_per_track_streams() {
+    use oxideav_core::PacketSource as _;
+    use oxideav_rtmp::{RtmpPacketSource, AUDIO_STREAM_INDEX, RTMP_MS_TO_NS, VIDEO_STREAM_INDEX};
+
+    let server = RtmpServer::bind("127.0.0.1:0").expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+
+    let publisher = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        let url = format!("rtmp://{}:{}/live/mt-src", addr.ip(), addr.port());
+        let mut client = RtmpClient::connect(&url).expect("connect");
+        // Audio: single-track Opus (default track only).
+        client
+            .send_audio_tag(0, &ex_audio(FOURCC_OPUS, b"opus-frame"))
+            .expect("audio");
+        // Video: two-rung HEVC ladder, distinct CTS per track.
+        let v0 = ex_video(FOURCC_HEVC, 17, b"hevc-hi");
+        let v1 = ex_video(FOURCC_HEVC, 0, b"hevc-lo");
+        client
+            .send_video_multitrack(40, AV_MULTITRACK_TYPE_MANY_TRACKS, &[(0, &v0), (1, &v1)])
+            .expect("video multitrack");
+        client
+            .send_video_multitrack(80, AV_MULTITRACK_TYPE_MANY_TRACKS, &[(0, &v0), (1, &v1)])
+            .expect("second multitrack");
+        client.close().expect("close");
+    });
+
+    let req = server.accept().expect("accept");
+    let session = req.accept().expect("session");
+    let mut source =
+        RtmpPacketSource::from_session_with_probe(session, Some(Duration::from_millis(500)))
+            .expect("probe");
+
+    // Probe saw audio (default track) + both video tracks.
+    let indices: Vec<u32> = source.streams().iter().map(|s| s.index).collect();
+    assert_eq!(indices, vec![AUDIO_STREAM_INDEX, VIDEO_STREAM_INDEX, 2]);
+
+    let mut per_stream: Vec<Vec<(i64, Vec<u8>)>> = vec![Vec::new(); 3];
+    loop {
+        match source.next_packet() {
+            Ok(pkt) => per_stream[pkt.stream_index as usize]
+                .push((pkt.pts.expect("pts"), pkt.data.clone())),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(per_stream[AUDIO_STREAM_INDEX as usize].len(), 1);
+    // Default video track: two frames, CTS 17 folded into pts.
+    let v_default = &per_stream[VIDEO_STREAM_INDEX as usize];
+    assert_eq!(v_default.len(), 2);
+    assert_eq!(v_default[0].0, (40 + 17) * RTMP_MS_TO_NS);
+    assert_eq!(v_default[0].1, b"hevc-hi");
+    assert_eq!(v_default[1].0, (80 + 17) * RTMP_MS_TO_NS);
+    // Alternate rung on stream 2, no CTS.
+    let v_alt = &per_stream[2];
+    assert_eq!(v_alt.len(), 2);
+    assert_eq!(v_alt[0].0, 40 * RTMP_MS_TO_NS);
+    assert_eq!(v_alt[0].1, b"hevc-lo");
+    assert_eq!(v_alt[1].0, 80 * RTMP_MS_TO_NS);
+
+    publisher.join().expect("publisher");
+}
