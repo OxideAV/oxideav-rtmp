@@ -191,3 +191,190 @@ fn round_trips_through_amf0_wire_codec() {
     assert_eq!(back.video_fourcc(), Some(*b"av01"));
     assert_eq!(back.audio_fourcc(), Some(*b"Opus"));
 }
+
+// -----------------------------------------------------------------
+// Typed per-track info maps (§"Enhancing onMetaData",
+// audioTrackIdInfoMap / videoTrackIdInfoMap)
+// -----------------------------------------------------------------
+
+use oxideav_rtmp::flv::TrackInfo;
+
+fn obj(pairs: Vec<(&str, Amf0Value)>) -> Amf0Value {
+    Amf0Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+/// FourCC → the numeric encoding the spec mandates ("big-endian
+/// relative to the underlying ASCII character sequence").
+fn fourcc_num(fcc: &[u8; 4]) -> f64 {
+    u32::from_be_bytes(*fcc) as f64
+}
+
+#[test]
+fn spec_example_track_maps_lift_to_typed_views() {
+    // The example maps from the §"Enhancing onMetaData" table: trackId
+    // 0 is the default track described by the top-level fields;
+    // additional tracks begin at trackId 1.
+    let arg = ecma(vec![
+        ("width", Amf0Value::Number(1920.0)),
+        (
+            "videoTrackIdInfoMap",
+            obj(vec![
+                (
+                    "1",
+                    obj(vec![
+                        ("width", Amf0Value::Number(1024.0)),
+                        ("height", Amf0Value::Number(768.0)),
+                        ("videodatarate", Amf0Value::Number(2000.0)),
+                        ("videocodecid", Amf0Value::Number(fourcc_num(b"av01"))),
+                    ]),
+                ),
+                (
+                    "2",
+                    obj(vec![
+                        ("width", Amf0Value::Number(3840.0)),
+                        ("height", Amf0Value::Number(2160.0)),
+                        ("videodatarate", Amf0Value::Number(30000.0)),
+                        ("videocodecid", Amf0Value::Number(fourcc_num(b"avc1"))),
+                    ]),
+                ),
+            ]),
+        ),
+        (
+            "audioTrackIdInfoMap",
+            obj(vec![
+                (
+                    "1",
+                    obj(vec![
+                        ("audiodatarate", Amf0Value::Number(256.0)),
+                        ("channels", Amf0Value::Number(2.0)),
+                        ("samplerate", Amf0Value::Number(44100.0)),
+                        ("audiocodecid", Amf0Value::Number(fourcc_num(b"mp4a"))),
+                    ]),
+                ),
+                (
+                    "2",
+                    obj(vec![
+                        ("audiodatarate", Amf0Value::Number(320.0)),
+                        ("channels", Amf0Value::Number(2.0)),
+                        ("samplerate", Amf0Value::Number(48000.0)),
+                        ("audiocodecid", Amf0Value::Number(fourcc_num(b"Opus"))),
+                    ]),
+                ),
+            ]),
+        ),
+    ]);
+    let meta = OnMetaData::from_amf0(&arg).expect("from_amf0");
+
+    assert_eq!(meta.video_track_ids(), vec![1, 2]);
+    assert_eq!(meta.audio_track_ids(), vec![1, 2]);
+
+    let v1 = meta.video_track_info(1).unwrap().expect("v1");
+    assert_eq!(v1.width, Some(1024.0));
+    assert_eq!(v1.height, Some(768.0));
+    assert_eq!(v1.videodatarate, Some(2000.0));
+    assert_eq!(v1.video_fourcc(), Some(*b"av01"));
+    let v2 = meta.video_track_info(2).unwrap().expect("v2");
+    assert_eq!(v2.video_fourcc(), Some(*b"avc1"));
+    assert_eq!(v2.width, Some(3840.0));
+
+    let a1 = meta.audio_track_info(1).unwrap().expect("a1");
+    assert_eq!(a1.audiodatarate, Some(256.0));
+    assert_eq!(a1.channels, Some(2.0));
+    assert_eq!(a1.samplerate, Some(44100.0));
+    assert_eq!(a1.audio_fourcc(), Some(*b"mp4a"));
+    let a2 = meta.audio_track_info(2).unwrap().expect("a2");
+    assert_eq!(a2.audio_fourcc(), Some(*b"Opus"));
+
+    // Absent entries answer Ok(None); the default track (0) is
+    // described by the top-level fields, not the map.
+    assert_eq!(meta.video_track_info(0).unwrap(), None);
+    assert_eq!(meta.video_track_info(9).unwrap(), None);
+
+    // Whole-metadata round-trip keeps the maps verbatim.
+    let back = OnMetaData::from_amf0(&meta.to_amf0()).expect("round-trip");
+    assert_eq!(back, meta);
+}
+
+#[test]
+fn track_info_preserves_unknown_fields_and_delta_style() {
+    // Delta-style per-track entry: only the fields that differ from
+    // the top-level defaults, plus a non-typical field ("language")
+    // that must survive in `extra`.
+    let entry = obj(vec![
+        ("audiodatarate", Amf0Value::Number(96.0)),
+        ("language", Amf0Value::String("deu".into())),
+    ]);
+    let info = TrackInfo::from_amf0(&entry).expect("from_amf0");
+    assert_eq!(info.audiodatarate, Some(96.0));
+    assert_eq!(info.channels, None);
+    assert_eq!(
+        info.extra,
+        vec![("language".to_string(), Amf0Value::String("deu".into()))]
+    );
+    // Lossless re-encode.
+    let re = TrackInfo::from_amf0(&info.to_amf0()).expect("re-decode");
+    assert_eq!(re, info);
+}
+
+#[test]
+fn set_track_info_upserts_and_creates_the_map() {
+    let mut meta = OnMetaData::from_amf0(&ecma(vec![])).expect("empty");
+    assert_eq!(meta.video_track_ids(), Vec::<u8>::new());
+
+    let rung = TrackInfo {
+        width: Some(1280.0),
+        height: Some(720.0),
+        videodatarate: Some(3000.0),
+        videocodecid: Some(fourcc_num(b"hvc1")),
+        ..TrackInfo::default()
+    };
+    meta.set_video_track_info(1, &rung);
+    assert_eq!(meta.video_track_ids(), vec![1]);
+    assert_eq!(
+        meta.video_track_info(1).unwrap().unwrap().video_fourcc(),
+        Some(*b"hvc1")
+    );
+
+    // Upsert replaces in place.
+    let smaller = TrackInfo {
+        width: Some(640.0),
+        ..rung.clone()
+    };
+    meta.set_video_track_info(1, &smaller);
+    assert_eq!(meta.video_track_ids(), vec![1]);
+    assert_eq!(
+        meta.video_track_info(1).unwrap().unwrap().width,
+        Some(640.0)
+    );
+
+    // A second id appends; the emitted onMetaData still round-trips.
+    meta.set_video_track_info(2, &rung);
+    let back = OnMetaData::from_amf0(&meta.to_amf0()).expect("round-trip");
+    assert_eq!(back.video_track_ids(), vec![1, 2]);
+}
+
+#[test]
+fn track_map_hostile_shapes_are_clean() {
+    // Non-numeric keys are skipped by the id enumerator but preserved
+    // in the raw map; a non-object entry is a typed error, not a panic.
+    let arg = ecma(vec![(
+        "videoTrackIdInfoMap",
+        obj(vec![
+            ("default", obj(vec![("width", Amf0Value::Number(1.0))])),
+            ("3", Amf0Value::String("not-an-object".into())),
+        ]),
+    )]);
+    let meta = OnMetaData::from_amf0(&arg).expect("from_amf0");
+    assert_eq!(meta.video_track_ids(), vec![3]);
+    assert!(meta.video_track_info(3).is_err());
+    // The raw map is untouched (non-numeric key still present).
+    let back = meta.to_amf0();
+    let re = OnMetaData::from_amf0(&back).unwrap();
+    assert_eq!(re.video_track_id_info_map, meta.video_track_id_info_map);
+
+    // A map that is not an object at all: no ids, no entries.
+    let arg = ecma(vec![("audioTrackIdInfoMap", Amf0Value::Number(4.0))]);
+    let meta = OnMetaData::from_amf0(&arg).expect("from_amf0");
+    assert_eq!(meta.audio_track_ids(), Vec::<u8>::new());
+    assert_eq!(meta.audio_track_info(1).unwrap(), None);
+}

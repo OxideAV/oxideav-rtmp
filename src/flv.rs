@@ -1073,6 +1073,201 @@ impl OnMetaData {
     }
 }
 
+/// Typed view of one entry in the Enhanced RTMP v2
+/// `audioTrackIdInfoMap` / `videoTrackIdInfoMap` per-track metadata
+/// maps (enhanced-rtmp-v2.pdf §"Enhancing onMetaData"). Each map keys
+/// a non-default `trackId` (`"1"`, `"2"`, …; trackId 0 is described by
+/// the top-level `onMetaData` fields) to an object of track-level
+/// attributes.
+///
+/// The spec's typical fields are lifted into named `Option`s — the
+/// video-flavoured `width` / `height` / `videodatarate` /
+/// `videocodecid` and the audio-flavoured `audiodatarate` / `channels`
+/// / `samplerate` / `audiocodecid` — and everything else is preserved
+/// verbatim in `extra` (the spec marks the field list "typical …, but
+/// not limited to", and both delta-style and complete per-track
+/// descriptors are valid). [`TrackInfo::to_amf0`] re-encodes
+/// losslessly.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TrackInfo {
+    /// Width of this track's video, in pixels.
+    pub width: Option<f64>,
+    /// Height of this track's video, in pixels.
+    pub height: Option<f64>,
+    /// Video bitrate of this track, in kilobits per second.
+    pub videodatarate: Option<f64>,
+    /// Video codec ID: a legacy single-byte CodecID or a FourCC encoded
+    /// as a number (see [`TrackInfo::video_fourcc`]).
+    pub videocodecid: Option<f64>,
+    /// Audio bitrate of this track, in kilobits per second.
+    pub audiodatarate: Option<f64>,
+    /// Channel count of this track's audio.
+    pub channels: Option<f64>,
+    /// Sample rate of this track's audio, in Hz.
+    pub samplerate: Option<f64>,
+    /// Audio codec ID: a legacy single-byte CodecID or a FourCC encoded
+    /// as a number (see [`TrackInfo::audio_fourcc`]).
+    pub audiocodecid: Option<f64>,
+    /// Any property outside the typical-fields list, preserved in wire
+    /// order so a decode/encode round-trip is lossless.
+    pub extra: Vec<(String, Amf0Value)>,
+}
+
+impl TrackInfo {
+    /// Decode one per-track object from an already-decoded
+    /// [`Amf0Value`] (an anonymous Object or ECMA array — both shapes
+    /// circulate). Any other AMF type is rejected.
+    pub fn from_amf0(value: &Amf0Value) -> Result<TrackInfo> {
+        let pairs: &[(String, Amf0Value)] = match value {
+            Amf0Value::EcmaArray(p) | Amf0Value::Object(p) => p.as_slice(),
+            _ => {
+                return Err(Error::Other(
+                    "trackIdInfoMap entry: value must be an Object or ECMA array".into(),
+                ))
+            }
+        };
+        let mut info = TrackInfo::default();
+        for (k, v) in pairs {
+            let num = match v {
+                Amf0Value::Number(n) => Some(*n),
+                _ => None,
+            };
+            match (k.as_str(), num) {
+                ("width", Some(n)) => info.width = Some(n),
+                ("height", Some(n)) => info.height = Some(n),
+                ("videodatarate", Some(n)) => info.videodatarate = Some(n),
+                ("videocodecid", Some(n)) => info.videocodecid = Some(n),
+                ("audiodatarate", Some(n)) => info.audiodatarate = Some(n),
+                ("channels", Some(n)) => info.channels = Some(n),
+                ("samplerate", Some(n)) => info.samplerate = Some(n),
+                ("audiocodecid", Some(n)) => info.audiocodecid = Some(n),
+                _ => info.extra.push((k.clone(), v.clone())),
+            }
+        }
+        Ok(info)
+    }
+
+    /// Re-encode as the anonymous-Object shape shown in the spec's
+    /// example (`videoTrackIdInfoMap = { 1: { width: 1024, … } }`).
+    /// Typed fields emit first in the spec example's order, then
+    /// `extra` verbatim.
+    pub fn to_amf0(&self) -> Amf0Value {
+        let mut obj: Vec<(String, Amf0Value)> = Vec::new();
+        let mut push = |key: &str, val: Option<f64>| {
+            if let Some(n) = val {
+                obj.push((key.to_string(), Amf0Value::Number(n)));
+            }
+        };
+        push("width", self.width);
+        push("height", self.height);
+        push("videodatarate", self.videodatarate);
+        push("videocodecid", self.videocodecid);
+        push("audiodatarate", self.audiodatarate);
+        push("channels", self.channels);
+        push("samplerate", self.samplerate);
+        push("audiocodecid", self.audiocodecid);
+        obj.extend(self.extra.iter().cloned());
+        Amf0Value::Object(obj)
+    }
+
+    /// Reconstruct the FourCC from [`videocodecid`](Self::videocodecid)
+    /// (`None` for legacy single-byte CodecIDs — see
+    /// [`OnMetaData::video_fourcc`]).
+    pub fn video_fourcc(&self) -> Option<[u8; 4]> {
+        self.videocodecid.and_then(num_to_fourcc)
+    }
+
+    /// Reconstruct the FourCC from [`audiocodecid`](Self::audiocodecid)
+    /// (`None` for legacy single-byte CodecIDs — see
+    /// [`OnMetaData::audio_fourcc`]).
+    pub fn audio_fourcc(&self) -> Option<[u8; 4]> {
+        self.audiocodecid.and_then(num_to_fourcc)
+    }
+}
+
+/// Enhanced RTMP v2 §"Enhancing onMetaData" per-track map accessors.
+impl OnMetaData {
+    /// Track ids present in `videoTrackIdInfoMap`, ascending. Keys that
+    /// are not decimal `u8` strings are skipped (they remain untouched
+    /// in the raw map — the accessor never mutates).
+    pub fn video_track_ids(&self) -> Vec<u8> {
+        track_ids(self.video_track_id_info_map.as_ref())
+    }
+
+    /// Track ids present in `audioTrackIdInfoMap`, ascending.
+    pub fn audio_track_ids(&self) -> Vec<u8> {
+        track_ids(self.audio_track_id_info_map.as_ref())
+    }
+
+    /// Typed view of `videoTrackIdInfoMap[track_id]`. `Ok(None)` when
+    /// the map or the entry is absent; `Err` when the entry exists but
+    /// is not an object.
+    pub fn video_track_info(&self, track_id: u8) -> Result<Option<TrackInfo>> {
+        track_info(self.video_track_id_info_map.as_ref(), track_id)
+    }
+
+    /// Typed view of `audioTrackIdInfoMap[track_id]`. Mirror of
+    /// [`video_track_info`](Self::video_track_info).
+    pub fn audio_track_info(&self, track_id: u8) -> Result<Option<TrackInfo>> {
+        track_info(self.audio_track_id_info_map.as_ref(), track_id)
+    }
+
+    /// Upsert `videoTrackIdInfoMap[track_id] = info` (creating the map
+    /// when absent). Existing entry order is preserved; a new track id
+    /// appends.
+    pub fn set_video_track_info(&mut self, track_id: u8, info: &TrackInfo) {
+        set_track_info(&mut self.video_track_id_info_map, track_id, info);
+    }
+
+    /// Upsert `audioTrackIdInfoMap[track_id] = info`. Mirror of
+    /// [`set_video_track_info`](Self::set_video_track_info).
+    pub fn set_audio_track_info(&mut self, track_id: u8, info: &TrackInfo) {
+        set_track_info(&mut self.audio_track_id_info_map, track_id, info);
+    }
+}
+
+fn track_map_pairs(map: Option<&Amf0Value>) -> &[(String, Amf0Value)] {
+    match map {
+        Some(Amf0Value::EcmaArray(p)) | Some(Amf0Value::Object(p)) => p.as_slice(),
+        _ => &[],
+    }
+}
+
+fn track_ids(map: Option<&Amf0Value>) -> Vec<u8> {
+    let mut ids: Vec<u8> = track_map_pairs(map)
+        .iter()
+        .filter_map(|(k, _)| k.parse::<u8>().ok())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn track_info(map: Option<&Amf0Value>, track_id: u8) -> Result<Option<TrackInfo>> {
+    let key = track_id.to_string();
+    match track_map_pairs(map).iter().find(|(k, _)| *k == key) {
+        Some((_, v)) => TrackInfo::from_amf0(v).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn set_track_info(map: &mut Option<Amf0Value>, track_id: u8, info: &TrackInfo) {
+    let key = track_id.to_string();
+    let value = info.to_amf0();
+    let pairs = match map {
+        Some(Amf0Value::EcmaArray(p)) | Some(Amf0Value::Object(p)) => p,
+        _ => {
+            *map = Some(Amf0Value::Object(vec![(key, value)]));
+            return;
+        }
+    };
+    if let Some(slot) = pairs.iter_mut().find(|(k, _)| *k == key) {
+        slot.1 = value;
+    } else {
+        pairs.push((key, value));
+    }
+}
+
 fn push_bool(obj: &mut Vec<(String, Amf0Value)>, key: &str, val: Option<bool>) {
     if let Some(b) = val {
         obj.push((key.to_string(), Amf0Value::Boolean(b)));
