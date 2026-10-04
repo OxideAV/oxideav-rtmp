@@ -13,6 +13,7 @@ external dependencies, blocking-thread-per-connection.
 
 ```rust
 use oxideav_rtmp::{RtmpServer, StreamPacket};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 let server = RtmpServer::bind("0.0.0.0:1935")?;
 let req = server.accept()?;                         // blocks until a publisher connects
@@ -28,13 +29,20 @@ while let Some(pkt) = session.next_packet()? {
         StreamPacket::Video { timestamp, tag } => { /* AVC bytes in `tag.body` */ }
         StreamPacket::Audio { timestamp, tag } => { /* AAC bytes in `tag.body` */ }
         StreamPacket::Metadata(meta)           => { /* onMetaData (AMF0 or AMF3, bridged to AMF0) */ }
+        _ => { /* other data frames, NetStream commands, calls, shared objects */ }
     }
 }
+# Ok(())
+# }
 ```
 
 Multi-client variant — one thread per connection:
 
 ```rust
+# use oxideav_rtmp::{RtmpServer, RtmpSession};
+# fn auth_ok(_app: &str, _key: &str) -> bool { true }
+# fn route(_s: RtmpSession) {}
+# let server = RtmpServer::bind("0.0.0.0:1935")?;
 server.serve(|req| {
     if auth_ok(&req.app, &req.stream_name) {
         let session = req.accept().expect("accept");
@@ -43,6 +51,7 @@ server.serve(|req| {
         let _ = req.reject("forbidden");
     }
 })?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## Server (serve subscribers / relay)
@@ -53,6 +62,12 @@ the peer issues after `createStream` (`publish` or `play`):
 
 ```rust
 use oxideav_rtmp::{RtmpServer, SessionRequest};
+# fn demo(
+#     meta: oxideav_rtmp::Amf0Value,
+#     ts: u32,
+#     video_tag: oxideav_rtmp::VideoTag,
+#     audio_tag: oxideav_rtmp::AudioTag,
+# ) -> Result<(), Box<dyn std::error::Error>> {
 
 let server = RtmpServer::bind("0.0.0.0:1935")?;
 match server.accept_any()? {
@@ -71,6 +86,8 @@ match server.accept_any()? {
         session.close()?;                  // UserControl StreamEOF
     }
 }
+# Ok(())
+# }
 ```
 
 `accept_recorded()` announces `StreamIsRecorded` first (recorded /
@@ -93,9 +110,11 @@ while let Some(pkt) = player.next_packet()? {
         PlayerPacket::Metadata(meta)           => { /* onMetaData */ }
         PlayerPacket::Status { code, .. }      => { /* NetStream.* */ }
         PlayerPacket::Control(_)               => { /* UCM events */ }
+        _ => { /* calls, call replies, shared objects */ }
     }
 }
 player.close()?; // deleteStream
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `connect_with_options` exposes the §4.2.1 Start / Duration / Reset
@@ -111,6 +130,14 @@ capability block. Mid-stream: `pause(ms)` / `resume(ms)` (§4.2.8),
 
 ```rust
 use oxideav_rtmp::RtmpClient;
+# fn demo(
+#     avcc_bytes: Vec<u8>,
+#     aac_asc: Vec<u8>,
+#     ts_ms: u32,
+#     is_keyframe: bool,
+#     length_prefixed_nalus: Vec<u8>,
+#     raw_aac_frame: Vec<u8>,
+# ) -> Result<(), Box<dyn std::error::Error>> {
 
 let mut client = RtmpClient::connect("rtmp://origin.example.com:1935/live/stream-key-abc")?;
 
@@ -120,9 +147,12 @@ client.send_audio_sequence_header(&aac_asc)?;       // 2-byte AudioSpecificConfi
 loop {
     client.send_video(ts_ms, is_keyframe, &length_prefixed_nalus)?;
     client.send_audio(ts_ms, &raw_aac_frame)?;
+#   break;
 }
 
 client.close()?;
+# Ok(())
+# }
 ```
 
 ## Scope
@@ -407,6 +437,7 @@ let _src = reg.open("rtmp://0.0.0.0:1935/live/secret-key")?;
 // dial the named remote server as a §4.2.1 play client and surface
 // the received stream through the identical PacketSource layout.
 let _pulled = reg.open("rtmp-play://origin.example.com:1935/vod/clip")?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Codec ids are auto-detected from the publisher's first audio + video
