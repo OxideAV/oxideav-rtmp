@@ -5,7 +5,7 @@
 //! ready to feed to
 //! [`chunk::ChunkWriter::write_message`](crate::chunk::ChunkWriter::write_message).
 
-use crate::amf::{encode_command, Amf0Value};
+use crate::amf::{Amf0Value, encode_command};
 use crate::caps::ConnectCapabilities;
 use crate::chunk::Message;
 use crate::error::{Error, Result};

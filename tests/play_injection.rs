@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use oxideav_rtmp::chunk::{ChunkReader, ChunkWriter};
 use oxideav_rtmp::handshake::{client_handshake, server_handshake};
-use oxideav_rtmp::message::{build_connect, build_create_stream, NetStreamCommand};
-use oxideav_rtmp::{amf, Amf0Value, RtmpPlayer, RtmpServer, SessionRequest};
+use oxideav_rtmp::message::{NetStreamCommand, build_connect, build_create_stream};
+use oxideav_rtmp::{Amf0Value, RtmpPlayer, RtmpServer, SessionRequest, amf};
 
 /// Deterministic xorshift32 byte stream — same generator family the
 /// parser fuzz suite uses, so failures reproduce byte-for-byte.

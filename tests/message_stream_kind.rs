@@ -23,7 +23,7 @@
 use std::io::Cursor;
 
 use oxideav_rtmp::chunk::{ChunkReader, ChunkWriter, Message, MessageStreamKind};
-use oxideav_rtmp::message::{build_set_chunk_size, MSG_SET_CHUNK_SIZE, MSG_VIDEO};
+use oxideav_rtmp::message::{MSG_SET_CHUNK_SIZE, MSG_VIDEO, build_set_chunk_size};
 
 #[test]
 fn protocol_control_round_trips_as_control_stream() {

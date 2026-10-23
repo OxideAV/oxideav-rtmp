@@ -541,7 +541,7 @@ mod tests {
         body.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // flags: persistent
         body.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // reserved
         body.push(SO_EVENT_CHANGE); // event type 4
-                                    // event data: "topic" + AMF0 string "hello"
+        // event data: "topic" + AMF0 string "hello"
         let mut ev = Vec::new();
         ev.extend_from_slice(&[0x00, 0x05]);
         ev.extend_from_slice(b"topic");

@@ -36,11 +36,11 @@ use crate::amf3;
 use crate::caps::ConnectCapabilities;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
 use crate::client::{
-    extract_server_caps, read_u32_be, wait_for_create_stream_result, RtmpUrl, CLIENT_CHUNK_SIZE,
-    FLASH_VER,
+    CLIENT_CHUNK_SIZE, FLASH_VER, RtmpUrl, extract_server_caps, read_u32_be,
+    wait_for_create_stream_result,
 };
 use crate::error::{Error, Result};
-use crate::flv::{parse_audio, parse_video, AudioTag, VideoTag};
+use crate::flv::{AudioTag, VideoTag, parse_audio, parse_video};
 use crate::handshake::HandshakeKind;
 use crate::message::*;
 use crate::server::metadata_object;

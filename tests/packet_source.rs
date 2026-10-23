@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use oxideav_core::{Error as CoreError, SourceOutput, SourceRegistry};
 use oxideav_rtmp::{
-    register, RtmpClient, AUDIO_STREAM_INDEX, RTMP_MS_TO_NS, RTMP_TIME_BASE, VIDEO_STREAM_INDEX,
+    AUDIO_STREAM_INDEX, RTMP_MS_TO_NS, RTMP_TIME_BASE, RtmpClient, VIDEO_STREAM_INDEX, register,
 };
 
 /// Reserve an ephemeral port by binding a TcpListener and then
@@ -204,7 +204,7 @@ fn registry_open_rtmp_url_yields_packet_source_with_expected_packets() {
     assert_eq!(audio[1].pts, Some(20 * RTMP_MS_TO_NS));
     assert!(!audio[1].flags.header);
     assert_eq!(audio[1].data[0], 0x01); // raw marker
-                                        // Audio[2] = raw AAC at pts 43 ms.
+    // Audio[2] = raw AAC at pts 43 ms.
     assert_eq!(audio[2].pts, Some(43 * RTMP_MS_TO_NS));
 
     // Video[0] = AVC sequence header (keyframe + header flags, pts/dts 0).

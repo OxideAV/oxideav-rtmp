@@ -712,7 +712,7 @@ impl<W: Write> ChunkWriter<W> {
             other => {
                 return Err(Error::ProtocolViolation(format!(
                     "chunk stream id {other} out of range"
-                )))
+                )));
             }
         }
         Ok(())

@@ -51,9 +51,9 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; SHA256_LEN] {
 
     let mut h = H0;
     let mut w = [0u32; 64];
-    for chunk in msg.chunks_exact(BLOCK_LEN) {
+    for chunk in msg.as_chunks::<BLOCK_LEN>().0 {
         // §6.2.2 message schedule.
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..64 {

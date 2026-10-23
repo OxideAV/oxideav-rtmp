@@ -34,7 +34,7 @@ use crate::amf3;
 use crate::caps::ConnectCapabilities;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
 use crate::error::{Error, Result};
-use crate::flv::{parse_audio, parse_video, AudioTag, VideoTag};
+use crate::flv::{AudioTag, VideoTag, parse_audio, parse_video};
 use crate::message::*;
 
 /// After-connect server chunk size. Larger = fewer chunk headers per

@@ -12,14 +12,14 @@
 //! chunk framing / `_result` info-object placement — is exercised
 //! exactly like a wire publish.
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use oxideav_rtmp::{
-    ConnectCapabilities, RtmpClient, RtmpServer, RtmpSession, CAPS_EX_MOD_EX, CAPS_EX_MULTITRACK,
-    CAPS_EX_RECONNECT, CAPS_EX_TIMESTAMP_NANO_OFFSET, FOURCC_INFO_CAN_DECODE,
-    FOURCC_INFO_CAN_ENCODE, FOURCC_INFO_CAN_FORWARD,
+    CAPS_EX_MOD_EX, CAPS_EX_MULTITRACK, CAPS_EX_RECONNECT, CAPS_EX_TIMESTAMP_NANO_OFFSET,
+    ConnectCapabilities, FOURCC_INFO_CAN_DECODE, FOURCC_INFO_CAN_ENCODE, FOURCC_INFO_CAN_FORWARD,
+    RtmpClient, RtmpServer, RtmpSession,
 };
 
 /// Drive the session until the client closes (returns None) or a short

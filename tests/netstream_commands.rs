@@ -26,7 +26,7 @@ use std::thread;
 use std::time::Duration;
 
 use oxideav_rtmp::chunk::{ChunkReader, ChunkWriter};
-use oxideav_rtmp::message::{build_connect, build_create_stream, build_publish, CSID_COMMAND};
+use oxideav_rtmp::message::{CSID_COMMAND, build_connect, build_create_stream, build_publish};
 use oxideav_rtmp::{Message, NetStreamCommand, RtmpServer, StreamPacket};
 
 const APP: &str = "live";

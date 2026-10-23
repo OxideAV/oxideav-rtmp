@@ -25,10 +25,10 @@ use std::time::Duration;
 use oxideav_rtmp::chunk::{ChunkReader, ChunkWriter, Message};
 use oxideav_rtmp::handshake::client_handshake;
 use oxideav_rtmp::message::{
-    build_connect, build_create_stream, build_publish, build_window_ack_size, MSG_ACK, MSG_AUDIO,
-    MSG_COMMAND_AMF0,
+    MSG_ACK, MSG_AUDIO, MSG_COMMAND_AMF0, build_connect, build_create_stream, build_publish,
+    build_window_ack_size,
 };
-use oxideav_rtmp::{amf, Amf0Value, RtmpServer, StreamPacket};
+use oxideav_rtmp::{Amf0Value, RtmpServer, StreamPacket, amf};
 
 const APP: &str = "live";
 const STREAM_KEY: &str = "ack-key";
@@ -198,10 +198,10 @@ fn drain_until_create_stream_result<R: Read>(reader: &mut ChunkReader<R>) -> u32
         if msg.msg_type_id == MSG_COMMAND_AMF0 {
             let values = amf::decode_all(&msg.payload).unwrap_or_default();
             let name = values.first().and_then(Amf0Value::as_str).unwrap_or("");
-            if name == "_result" {
-                if let Some(sid) = values.iter().rev().find_map(Amf0Value::as_f64) {
-                    return sid as u32;
-                }
+            if name == "_result"
+                && let Some(sid) = values.iter().rev().find_map(Amf0Value::as_f64)
+            {
+                return sid as u32;
             }
         }
     }

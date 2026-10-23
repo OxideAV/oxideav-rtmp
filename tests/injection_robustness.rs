@@ -20,10 +20,10 @@
 use std::io::Cursor;
 
 use oxideav_rtmp::aggregate::parse_aggregate;
-use oxideav_rtmp::amf::{decode as amf0_decode, decode_all as amf0_decode_all, Amf0Value};
+use oxideav_rtmp::amf::{Amf0Value, decode as amf0_decode, decode_all as amf0_decode_all};
 use oxideav_rtmp::amf3::{
-    decode as amf3_decode, decode_all as amf3_decode_all, decode_data_message,
-    decode_message_to_amf0, FORMAT_SELECTOR_AMF0,
+    FORMAT_SELECTOR_AMF0, decode as amf3_decode, decode_all as amf3_decode_all,
+    decode_data_message, decode_message_to_amf0,
 };
 use oxideav_rtmp::chunk::{ChunkReader, ChunkWriter, Message};
 use oxideav_rtmp::flv::{parse_audio, parse_video};
@@ -719,7 +719,7 @@ fn aggregate_oversize_sub_data_size_errors_fast() {
     // tag type = 9 (video), DataSize UI24 = 0xFFFFFF (16 MiB).
     let mut body = vec![9u8, 0xFF, 0xFF, 0xFF];
     body.extend_from_slice(&[0; 7]); // ts + sid
-                                     // No payload, no back pointer — far short of what the header claims.
+    // No payload, no back pointer — far short of what the header claims.
     let msg = Message {
         msg_type_id: 22,
         msg_stream_id: 0,
@@ -842,8 +842,8 @@ fn shared_object_parse_corrupted_frames_never_panic() {
 #[test]
 fn digest_detection_random_packets_never_panic() {
     use oxideav_rtmp::handshake::{
-        digest_offset, find_digest, key_offset, verify_response_digest, DigestScheme,
-        FMS_LABEL_LEN, FP_LABEL_LEN, GENUINE_FMS_KEY, GENUINE_FP_KEY, HANDSHAKE_PAYLOAD_LEN,
+        DigestScheme, FMS_LABEL_LEN, FP_LABEL_LEN, GENUINE_FMS_KEY, GENUINE_FP_KEY,
+        HANDSHAKE_PAYLOAD_LEN, digest_offset, find_digest, key_offset, verify_response_digest,
     };
     let mut rng = Xs64::new(0xD16E_57F2_0001);
     for _ in 0..256 {
@@ -871,7 +871,7 @@ fn digest_detection_random_packets_never_panic() {
 /// handshake — never error, never take the digest path.
 #[test]
 fn negotiated_server_random_c1_never_panics() {
-    use oxideav_rtmp::handshake::{server_handshake_negotiated, HandshakeKind};
+    use oxideav_rtmp::handshake::{HandshakeKind, server_handshake_negotiated};
     let mut rng = Xs64::new(0xD16E_57F2_0002);
     for _ in 0..64 {
         let mut c1 = vec![0u8; 1536];
@@ -967,27 +967,27 @@ fn multitrack_demux_survives_random_track_lists() {
         // video 0x80|frame|PacketType(6), audio 0x9?|PacketType(5).
         payload[0] = if i % 2 == 0 { 0x96 } else { 0x95 };
         if i % 2 == 0 {
-            if let Ok(tag) = parse_video(&payload) {
-                if let Ok(tracks) = tag.demux_tracks() {
-                    let refs: Vec<(u8, &oxideav_rtmp::flv::VideoTag)> =
-                        tracks.iter().map(|(id, t)| (*id, t)).collect();
-                    let _ = VideoTag::multitrack_from_tags(
-                        tag.multitrack.as_ref().unwrap().multitrack_type,
-                        &refs,
-                    );
-                }
+            if let Ok(tag) = parse_video(&payload)
+                && let Ok(tracks) = tag.demux_tracks()
+            {
+                let refs: Vec<(u8, &oxideav_rtmp::flv::VideoTag)> =
+                    tracks.iter().map(|(id, t)| (*id, t)).collect();
+                let _ = VideoTag::multitrack_from_tags(
+                    tag.multitrack.as_ref().unwrap().multitrack_type,
+                    &refs,
+                );
             }
         } else {
             payload[0] = 0x95;
-            if let Ok(tag) = parse_audio(&payload) {
-                if let Ok(tracks) = tag.demux_tracks() {
-                    let refs: Vec<(u8, &oxideav_rtmp::flv::AudioTag)> =
-                        tracks.iter().map(|(id, t)| (*id, t)).collect();
-                    let _ = AudioTag::multitrack_from_tags(
-                        tag.multitrack.as_ref().unwrap().multitrack_type,
-                        &refs,
-                    );
-                }
+            if let Ok(tag) = parse_audio(&payload)
+                && let Ok(tracks) = tag.demux_tracks()
+            {
+                let refs: Vec<(u8, &oxideav_rtmp::flv::AudioTag)> =
+                    tracks.iter().map(|(id, t)| (*id, t)).collect();
+                let _ = AudioTag::multitrack_from_tags(
+                    tag.multitrack.as_ref().unwrap().multitrack_type,
+                    &refs,
+                );
             }
         }
     }

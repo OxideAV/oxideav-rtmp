@@ -1631,8 +1631,8 @@ mod tests {
         bytes.push(M_ARRAY);
         write_u29(&mut bytes, (2 << 1) | 1); // dense count 2
         write_u29(&mut bytes, 1); // empty assoc terminator
-                                  // dense[0]: the externalizable object (object index 1 — the
-                                  // array itself reserves index 0).
+        // dense[0]: the externalizable object (object index 1 — the
+        // array itself reserves index 0).
         bytes.push(M_OBJECT);
         write_u29(&mut bytes, 0b0111);
         write_u29_string(&mut bytes, "Reffed");

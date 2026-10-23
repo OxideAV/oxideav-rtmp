@@ -990,7 +990,7 @@ impl OnMetaData {
             _ => {
                 return Err(Error::Other(
                     "onMetaData: argument must be an ECMA array or Object".into(),
-                ))
+                ));
             }
         };
         let mut m = OnMetaData::default();
@@ -1123,7 +1123,7 @@ impl TrackInfo {
             _ => {
                 return Err(Error::Other(
                     "trackIdInfoMap entry: value must be an Object or ECMA array".into(),
-                ))
+                ));
             }
         };
         let mut info = TrackInfo::default();
@@ -4211,7 +4211,7 @@ mod tests {
         assert_eq!(payload[0], 0x97);
         assert_eq!(payload[1], 2); // 3-byte data → UI8 = 2.
         assert_eq!(&payload[2..5], &[0x03, 0xD0, 0x90]); // bytesToUI24(250_000)
-                                                         // nibble: ModExType 0 | CodedFrames(1).
+        // nibble: ModExType 0 | CodedFrames(1).
         assert_eq!(payload[5], 0x01);
         assert_eq!(&payload[6..10], b"Opus");
         assert_eq!(&payload[10..], b"opus-pkt");

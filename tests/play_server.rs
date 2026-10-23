@@ -30,17 +30,17 @@ use std::time::Duration;
 
 use oxideav_rtmp::chunk::{ChunkReader, ChunkWriter, Message};
 use oxideav_rtmp::flv::{
-    self, AudioTag, VideoTag, AAC_PACKET_TYPE_RAW, AUDIO_FORMAT_AAC, AVC_PACKET_TYPE_NALU,
-    VIDEO_CODEC_AVC, VIDEO_FRAME_KEYFRAME,
+    self, AAC_PACKET_TYPE_RAW, AUDIO_FORMAT_AAC, AVC_PACKET_TYPE_NALU, AudioTag, VIDEO_CODEC_AVC,
+    VIDEO_FRAME_KEYFRAME, VideoTag,
 };
 use oxideav_rtmp::handshake::client_handshake;
 use oxideav_rtmp::message::{
-    build_connect, build_create_stream, build_user_control_set_buffer_length, NetStreamCommand,
     MSG_AUDIO, MSG_COMMAND_AMF0, MSG_DATA_AMF0, MSG_SET_CHUNK_SIZE, MSG_USER_CONTROL, MSG_VIDEO,
-    STATUS_PAUSE_NOTIFY, STATUS_PLAY_RESET, STATUS_PLAY_START, STATUS_PLAY_STREAM_NOT_FOUND,
-    USR_STREAM_BEGIN,
+    NetStreamCommand, STATUS_PAUSE_NOTIFY, STATUS_PLAY_RESET, STATUS_PLAY_START,
+    STATUS_PLAY_STREAM_NOT_FOUND, USR_STREAM_BEGIN, build_connect, build_create_stream,
+    build_user_control_set_buffer_length,
 };
-use oxideav_rtmp::{amf, Amf0Value, PlaySessionEvent, RtmpServer, SessionRequest};
+use oxideav_rtmp::{Amf0Value, PlaySessionEvent, RtmpServer, SessionRequest, amf};
 
 const APP: &str = "vod";
 const STREAM: &str = "mp4:sample.m4v";
@@ -121,10 +121,10 @@ fn drain_until_create_stream_result<R: Read>(reader: &mut ChunkReader<R>) -> u32
         if msg.msg_type_id == MSG_COMMAND_AMF0 {
             let values = amf::decode_all(&msg.payload).unwrap_or_default();
             let name = values.first().and_then(Amf0Value::as_str).unwrap_or("");
-            if name == "_result" {
-                if let Some(sid) = values.iter().rev().find_map(Amf0Value::as_f64) {
-                    return sid as u32;
-                }
+            if name == "_result"
+                && let Some(sid) = values.iter().rev().find_map(Amf0Value::as_f64)
+            {
+                return sid as u32;
             }
         }
     }

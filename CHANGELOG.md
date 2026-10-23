@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.6...v0.0.7) - 2026-10-04
 
 ### Other

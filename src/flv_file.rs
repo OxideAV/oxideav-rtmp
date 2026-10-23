@@ -801,10 +801,10 @@ fn read_exact_eof<R: Read>(inner: &mut R, buf: &mut [u8]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::flv::{
-        parse_audio, parse_video, AAC_PACKET_TYPE_RAW, AAC_PACKET_TYPE_SEQUENCE_HEADER,
-        AUDIO_FORMAT_AAC, AVC_PACKET_TYPE_NALU, AVC_PACKET_TYPE_SEQUENCE_HEADER,
-        EX_PACKET_TYPE_CODED_FRAMES, FOURCC_HEVC, VIDEO_CODEC_AVC, VIDEO_FRAME_INTER,
-        VIDEO_FRAME_KEYFRAME,
+        AAC_PACKET_TYPE_RAW, AAC_PACKET_TYPE_SEQUENCE_HEADER, AUDIO_FORMAT_AAC,
+        AVC_PACKET_TYPE_NALU, AVC_PACKET_TYPE_SEQUENCE_HEADER, EX_PACKET_TYPE_CODED_FRAMES,
+        FOURCC_HEVC, VIDEO_CODEC_AVC, VIDEO_FRAME_INTER, VIDEO_FRAME_KEYFRAME, parse_audio,
+        parse_video,
     };
 
     fn aac_seq_header_tag() -> AudioTag {
@@ -1008,9 +1008,9 @@ mod tests {
         assert_eq!(&buf[17..20], &[0, 0, 0]); // ts low 24
         assert_eq!(buf[20], 0); // ts ext
         assert_eq!(&buf[21..24], &[0, 0, 0]); // StreamID
-                                              // Payload byte 0 — Enhanced-RTMP IsExHeader bit MUST be
-                                              // zero for a legacy AVC tag (FrameType high nibble == 1
-                                              // for keyframe, CodecID low nibble == 7 for AVC).
+        // Payload byte 0 — Enhanced-RTMP IsExHeader bit MUST be
+        // zero for a legacy AVC tag (FrameType high nibble == 1
+        // for keyframe, CodecID low nibble == 7 for AVC).
         assert_eq!(buf[24], 0x17);
         // AVCPacketType (0 = seq header).
         assert_eq!(buf[25], 0x00);
@@ -1555,7 +1555,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(&header);
         buf.extend_from_slice(&0u32.to_be_bytes()); // PrevTagSize0
-                                                    // 11-byte FLVTAG header + 3-byte body → tag size 14.
+        // 11-byte FLVTAG header + 3-byte body → tag size 14.
         buf.extend_from_slice(&[
             9, // TagType = video
             0, 0, 3, // DataSize = 3

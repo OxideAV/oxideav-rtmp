@@ -6,8 +6,8 @@
 //! AMF0/AMF3 values.
 
 use oxideav_rtmp::shared_object::{
-    parse_shared_object, SharedObjectMessage, SoEvent, SO_EVENT_CHANGE, SO_EVENT_SEND_MESSAGE,
-    SO_EVENT_STATUS, SO_EVENT_USE, SO_FLAG_PERSISTENT,
+    SO_EVENT_CHANGE, SO_EVENT_SEND_MESSAGE, SO_EVENT_STATUS, SO_EVENT_USE, SO_FLAG_PERSISTENT,
+    SharedObjectMessage, SoEvent, parse_shared_object,
 };
 use oxideav_rtmp::{Amf0Value, Amf3Value};
 
@@ -175,7 +175,7 @@ fn golden_multi_event_layout() {
     body.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // version 2
     body.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags 0
     body.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // reserved
-                                                       // Use (1), empty.
+    // Use (1), empty.
     body.push(SO_EVENT_USE);
     body.extend_from_slice(&[0, 0, 0, 0]);
     // Status (7): code then level.

@@ -5,8 +5,8 @@
 //! `videoPacketType != Metadata && videoFrameType == Command` branch).
 
 use oxideav_rtmp::flv::{
-    build_video, parse_video, VideoTag, EX_PACKET_TYPE_CODED_FRAMES, VIDEO_CODEC_AVC,
-    VIDEO_COMMAND_END_SEEK, VIDEO_COMMAND_START_SEEK, VIDEO_FRAME_COMMAND,
+    EX_PACKET_TYPE_CODED_FRAMES, VIDEO_CODEC_AVC, VIDEO_COMMAND_END_SEEK, VIDEO_COMMAND_START_SEEK,
+    VIDEO_FRAME_COMMAND, VideoTag, build_video, parse_video,
 };
 
 const FOURCC_HEVC: [u8; 4] = *b"hvc1";

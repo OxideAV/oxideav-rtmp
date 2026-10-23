@@ -7,11 +7,11 @@
 //! `enhanced-rtmp-v2.pdf` §"Enhanced Audio".
 
 use oxideav_rtmp::flv::{
-    build_audio, parse_audio, AudioTag, AUDIO_FORMAT_EX_HEADER, AUDIO_PACKET_TYPE_CODED_FRAMES,
-    AUDIO_PACKET_TYPE_SEQUENCE_END, AUDIO_PACKET_TYPE_SEQUENCE_START, FOURCC_AC3, FOURCC_EAC3,
-    FOURCC_FLAC, FOURCC_MP3, FOURCC_OPUS,
+    AUDIO_FORMAT_EX_HEADER, AUDIO_PACKET_TYPE_CODED_FRAMES, AUDIO_PACKET_TYPE_SEQUENCE_END,
+    AUDIO_PACKET_TYPE_SEQUENCE_START, AudioTag, FOURCC_AC3, FOURCC_EAC3, FOURCC_FLAC, FOURCC_MP3,
+    FOURCC_OPUS, build_audio, parse_audio,
 };
-use oxideav_rtmp::{audio_codec_id_for_tag, audio_to_packet, RTMP_MS_TO_NS};
+use oxideav_rtmp::{RTMP_MS_TO_NS, audio_codec_id_for_tag, audio_to_packet};
 
 /// Exact wire bytes for an Opus `SequenceStart` per
 /// `enhanced-rtmp-v2.pdf` §"ExAudioTagBody":

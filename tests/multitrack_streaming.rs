@@ -17,9 +17,9 @@ use std::thread;
 use std::time::Duration;
 
 use oxideav_rtmp::flv::{
-    AudioTag, VideoTag, AUDIO_PACKET_TYPE_CODED_FRAMES, AV_MULTITRACK_TYPE_MANY_TRACKS,
-    AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS, EX_PACKET_TYPE_CODED_FRAMES, FOURCC_FLAC,
-    FOURCC_HEVC, FOURCC_OPUS, VIDEO_FRAME_KEYFRAME,
+    AUDIO_PACKET_TYPE_CODED_FRAMES, AV_MULTITRACK_TYPE_MANY_TRACKS,
+    AV_MULTITRACK_TYPE_MANY_TRACKS_MANY_CODECS, AudioTag, EX_PACKET_TYPE_CODED_FRAMES, FOURCC_FLAC,
+    FOURCC_HEVC, FOURCC_OPUS, VIDEO_FRAME_KEYFRAME, VideoTag,
 };
 use oxideav_rtmp::{
     PlayOptions, PlayerPacket, RtmpClient, RtmpPlayer, RtmpServer, SessionRequest, StreamPacket,
@@ -190,7 +190,7 @@ fn play_session_serves_multitrack_to_subscriber() {
 #[test]
 fn packet_source_exposes_per_track_streams() {
     use oxideav_core::PacketSource as _;
-    use oxideav_rtmp::{RtmpPacketSource, AUDIO_STREAM_INDEX, RTMP_MS_TO_NS, VIDEO_STREAM_INDEX};
+    use oxideav_rtmp::{AUDIO_STREAM_INDEX, RTMP_MS_TO_NS, RtmpPacketSource, VIDEO_STREAM_INDEX};
 
     let server = RtmpServer::bind("127.0.0.1:0").expect("bind");
     let addr = server.local_addr().expect("local_addr");

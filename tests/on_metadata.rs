@@ -8,8 +8,8 @@
 //! table losslessly, that the codec-id FourCC note ("Opus" == 0x4F707573)
 //! decodes, and that the v2 per-track info maps round-trip verbatim.
 
-use oxideav_rtmp::flv::OnMetaData;
 use oxideav_rtmp::Amf0Value;
+use oxideav_rtmp::flv::OnMetaData;
 
 fn ecma(pairs: Vec<(&str, Amf0Value)>) -> Amf0Value {
     Amf0Value::EcmaArray(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())

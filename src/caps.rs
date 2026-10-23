@@ -176,15 +176,16 @@ impl FourCcInfoMap {
         };
         let mut out = Self::new();
         for (k, val) in pairs {
-            if let Amf0Value::Number(n) = val {
-                if n.is_finite() && *n >= 0.0 {
-                    let m = if *n >= u32::MAX as f64 {
-                        u32::MAX
-                    } else {
-                        *n as u32
-                    };
-                    out.insert(k.clone(), m);
-                }
+            if let Amf0Value::Number(n) = val
+                && n.is_finite()
+                && *n >= 0.0
+            {
+                let m = if *n >= u32::MAX as f64 {
+                    u32::MAX
+                } else {
+                    *n as u32
+                };
+                out.insert(k.clone(), m);
             }
         }
         out
@@ -304,10 +305,12 @@ impl ConnectCapabilities {
         for (k, val) in pairs {
             match k.as_str() {
                 "objectEncoding" => {
-                    if let Amf0Value::Number(n) = val {
-                        if n.is_finite() && *n >= 0.0 && *n <= u8::MAX as f64 {
-                            out.object_encoding = Some(*n as u8);
-                        }
+                    if let Amf0Value::Number(n) = val
+                        && n.is_finite()
+                        && *n >= 0.0
+                        && *n <= u8::MAX as f64
+                    {
+                        out.object_encoding = Some(*n as u8);
                     }
                 }
                 "fourCcList" => {
@@ -328,14 +331,15 @@ impl ConnectCapabilities {
                     out.audio_fourcc_info_map = FourCcInfoMap::from_amf0(val);
                 }
                 "capsEx" => {
-                    if let Amf0Value::Number(n) = val {
-                        if n.is_finite() && *n >= 0.0 {
-                            out.caps_ex = if *n >= u32::MAX as f64 {
-                                u32::MAX
-                            } else {
-                                *n as u32
-                            };
-                        }
+                    if let Amf0Value::Number(n) = val
+                        && n.is_finite()
+                        && *n >= 0.0
+                    {
+                        out.caps_ex = if *n >= u32::MAX as f64 {
+                            u32::MAX
+                        } else {
+                            *n as u32
+                        };
                     }
                 }
                 _ => { /* not a capability property — ignored */ }

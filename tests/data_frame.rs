@@ -14,7 +14,7 @@ use oxideav_rtmp::message::{
     build_set_data_frame_named,
 };
 use oxideav_rtmp::{
-    amf, parse_data_frame, Amf0Value, DataFrameCommand, RtmpClient, RtmpServer, StreamPacket,
+    Amf0Value, DataFrameCommand, RtmpClient, RtmpServer, StreamPacket, amf, parse_data_frame,
 };
 
 fn sample_meta() -> Amf0Value {

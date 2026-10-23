@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use oxideav_rtmp::chunk::{ChunkReader, ChunkWriter};
 use oxideav_rtmp::message::{
-    build_user_control_ping_response, CSID_PROTOCOL_CONTROL, MSG_USER_CONTROL,
+    CSID_PROTOCOL_CONTROL, MSG_USER_CONTROL, build_user_control_ping_response,
 };
 use oxideav_rtmp::{ClientEvent, Message, RtmpClient, RtmpServer};
 

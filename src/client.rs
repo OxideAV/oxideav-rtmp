@@ -1456,10 +1456,10 @@ fn classify_command(values: Vec<Amf0Value>) -> ClientEvent {
             // §7.2.1.2: a call RPC's procedure name rides the
             // command-name field, so any non-built-in command from the
             // server is an RPC aimed at this client.
-            if !crate::message::is_reserved_command_name(name) {
-                if let Some(call) = CallCommand::parse(&values) {
-                    return ClientEvent::Call(call);
-                }
+            if !crate::message::is_reserved_command_name(name)
+                && let Some(call) = CallCommand::parse(&values)
+            {
+                return ClientEvent::Call(call);
             }
             ClientEvent::Other
         }
