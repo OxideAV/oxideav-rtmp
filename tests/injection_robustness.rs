@@ -1007,11 +1007,9 @@ fn track_info_survives_random_amf_values() {
         let mut pos = 0usize;
         if let Ok(value) = amf0_decode(&buf, &mut pos) {
             let _ = TrackInfo::from_amf0(&value);
-            let meta = OnMetaData {
-                video_track_id_info_map: Some(value.clone()),
-                audio_track_id_info_map: Some(value),
-                ..OnMetaData::default()
-            };
+            let meta = OnMetaData::default()
+                .with_video_track_id_info_map(Some(value.clone()))
+                .with_audio_track_id_info_map(Some(value));
             let _ = meta.video_track_ids();
             let _ = meta.audio_track_ids();
             for id in [0u8, 1, 2, 255] {

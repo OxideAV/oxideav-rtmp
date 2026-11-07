@@ -78,6 +78,7 @@ pub const SO_FLAG_PERSISTENT: u32 = 2;
 /// One Shared Object event (§1.2–§1.4), generic over the AMF value
 /// flavour (AMF0 for message type 19, AMF3 for message type 16).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SoEvent<V> {
     /// (1) Open/subscribe. No payload.
     Use,
@@ -135,6 +136,7 @@ impl<V> SoEvent<V> {
 /// back-to-back event sequence. Generic over the AMF value flavour —
 /// [`Amf0Value`] rides message type 19, [`Amf3Value`] message type 16.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SharedObjectMessage<V> {
     /// SO name (bare UTF-8 in the header, no AMF marker).
     pub name: String,

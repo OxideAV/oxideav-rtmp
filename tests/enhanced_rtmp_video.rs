@@ -243,18 +243,16 @@ fn build_then_parse_then_build_is_idempotent_for_all_fourccs() {
         body,
     } in cases
     {
-        let tag1 = VideoTag {
-            mod_ex: Vec::new(),
-            frame_type: ft,
-            codec_id: 0,
-            avc_packet_type: None,
-            composition_time: cts,
-            body,
-            ex_packet_type: Some(pt),
-            fourcc: Some(fcc),
-
-            multitrack: None,
-        };
+        let tag1 = VideoTag::default()
+            .with_mod_ex(Vec::new())
+            .with_frame_type(ft)
+            .with_codec_id(0)
+            .with_avc_packet_type(None)
+            .with_composition_time(cts)
+            .with_body(body)
+            .with_ex_packet_type(Some(pt))
+            .with_fourcc(Some(fcc))
+            .with_multitrack(None);
         let bytes1 = build_video(&tag1);
         let tag2 = parse_video(&bytes1).unwrap_or_else(|e| panic!("{label}: parse: {e:?}"));
         let bytes2 = build_video(&tag2);

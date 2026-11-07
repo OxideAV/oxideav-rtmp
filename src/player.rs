@@ -52,6 +52,7 @@ use crate::server::metadata_object;
 /// lets the server apply the spec default (Start −2, Duration −1,
 /// Reset false).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PlayOptions {
     /// §4.2.1 Start argument in seconds: −2 (default) = try the live
     /// stream first, then the recorded one; −1 = live only; ≥ 0 =
@@ -77,9 +78,48 @@ pub struct PlayOptions {
     pub digest_handshake: bool,
 }
 
+impl PlayOptions {
+    /// Set `start`.
+    pub fn with_start(mut self, v: Option<f64>) -> Self {
+        self.start = v;
+        self
+    }
+
+    /// Set `duration`.
+    pub fn with_duration(mut self, v: Option<f64>) -> Self {
+        self.duration = v;
+        self
+    }
+
+    /// Set `reset`.
+    pub fn with_reset(mut self, v: Option<bool>) -> Self {
+        self.reset = v;
+        self
+    }
+
+    /// Set `buffer_length_ms`.
+    pub fn with_buffer_length_ms(mut self, v: Option<u32>) -> Self {
+        self.buffer_length_ms = v;
+        self
+    }
+
+    /// Set `capabilities`.
+    pub fn with_capabilities(mut self, v: ConnectCapabilities) -> Self {
+        self.capabilities = v;
+        self
+    }
+
+    /// Set `digest_handshake`.
+    pub fn with_digest_handshake(mut self, v: bool) -> Self {
+        self.digest_handshake = v;
+        self
+    }
+}
+
 /// One event delivered to a playing client by
 /// [`RtmpPlayer::next_packet`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum PlayerPacket {
     /// An audio message on the play stream, parsed through
     /// [`crate::flv::parse_audio`].

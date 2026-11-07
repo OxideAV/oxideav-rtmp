@@ -351,6 +351,7 @@ pub fn build_user_control_ping_response(timestamp_ms: u32) -> Message {
 /// same [`Message`] the matching `build_user_control_*` builder
 /// emits, so `parse(build_x().payload) == Ok(x)` for every variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UserControlEvent {
     /// UCM type 0 — server tells the client that a stream is ready to
     /// receive messages on the given stream id. Emitted right after
@@ -995,6 +996,7 @@ pub fn build_data_message(stream_id: u32, handler: &str, value: &Amf0Value) -> M
 /// [`build_call_error`] echoing it. `command_object` is Null when the
 /// caller had no command info to attach.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CallCommand {
     /// Remote procedure name (the wire command-name field).
     pub procedure: String,
@@ -1005,6 +1007,23 @@ pub struct CallCommand {
     pub command_object: Amf0Value,
     /// Optional Arguments, verbatim.
     pub arguments: Vec<Amf0Value>,
+}
+
+impl CallCommand {
+    /// Build a [`CallCommand`] from its fields.
+    pub fn new(
+        procedure: String,
+        transaction_id: f64,
+        command_object: Amf0Value,
+        arguments: Vec<Amf0Value>,
+    ) -> Self {
+        Self {
+            procedure,
+            transaction_id,
+            command_object,
+            arguments,
+        }
+    }
 }
 
 impl CallCommand {
@@ -1151,6 +1170,7 @@ pub fn is_reserved_command_name(name: &str) -> bool {
 /// [`NetStreamCommand::Play2`]'s payload so an unusual or
 /// vendor-extended parameter set round-trips without loss.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum NetStreamCommand {
     /// §4.2.1 `play` — request a stream by name. `start` / `duration` /
     /// `reset` are optional trailing arguments (defaults −2 / −1 /

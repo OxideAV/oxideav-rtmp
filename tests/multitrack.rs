@@ -391,33 +391,31 @@ fn empty_track_body_round_trips() {
 
 /// Single-track Enhanced video tag helper.
 fn ex_video(fourcc: [u8; 4], packet_type: u8, cts: i32, body: &[u8]) -> VideoTag {
-    VideoTag {
-        frame_type: VIDEO_FRAME_KEYFRAME,
-        codec_id: 0,
-        avc_packet_type: None,
-        composition_time: cts,
-        body: body.to_vec(),
-        ex_packet_type: Some(packet_type),
-        fourcc: Some(fourcc),
-        mod_ex: Vec::new(),
-        multitrack: None,
-    }
+    VideoTag::default()
+        .with_frame_type(VIDEO_FRAME_KEYFRAME)
+        .with_codec_id(0)
+        .with_avc_packet_type(None)
+        .with_composition_time(cts)
+        .with_body(body.to_vec())
+        .with_ex_packet_type(Some(packet_type))
+        .with_fourcc(Some(fourcc))
+        .with_mod_ex(Vec::new())
+        .with_multitrack(None)
 }
 
 /// Single-track Enhanced audio tag helper.
 fn ex_audio(fourcc: [u8; 4], packet_type: u8, body: &[u8]) -> AudioTag {
-    AudioTag {
-        sound_format: 9,
-        sound_rate: 0,
-        sound_size_16bit: false,
-        stereo: false,
-        aac_packet_type: None,
-        ex_packet_type: Some(packet_type),
-        audio_fourcc: Some(fourcc),
-        body: body.to_vec(),
-        mod_ex: Vec::new(),
-        multitrack: None,
-    }
+    AudioTag::default()
+        .with_sound_format(9)
+        .with_sound_rate(0)
+        .with_sound_size_16bit(false)
+        .with_stereo(false)
+        .with_aac_packet_type(None)
+        .with_ex_packet_type(Some(packet_type))
+        .with_audio_fourcc(Some(fourcc))
+        .with_body(body.to_vec())
+        .with_mod_ex(Vec::new())
+        .with_multitrack(None)
 }
 
 #[test]
@@ -510,17 +508,16 @@ fn video_mux_rejects_mixed_packet_types_and_shared_fourcc_mismatch() {
 #[test]
 fn video_mux_rejects_legacy_nested_and_modex_tracks() {
     // A legacy (non-Enhanced) tag has no FourCC / PacketType.
-    let legacy = VideoTag {
-        frame_type: VIDEO_FRAME_KEYFRAME,
-        codec_id: 7,
-        avc_packet_type: Some(1),
-        composition_time: 0,
-        body: b"nalu".to_vec(),
-        ex_packet_type: None,
-        fourcc: None,
-        mod_ex: Vec::new(),
-        multitrack: None,
-    };
+    let legacy = VideoTag::default()
+        .with_frame_type(VIDEO_FRAME_KEYFRAME)
+        .with_codec_id(7)
+        .with_avc_packet_type(Some(1))
+        .with_composition_time(0)
+        .with_body(b"nalu".to_vec())
+        .with_ex_packet_type(None)
+        .with_fourcc(None)
+        .with_mod_ex(Vec::new())
+        .with_multitrack(None);
     let err =
         VideoTag::multitrack_from_tags(AV_MULTITRACK_TYPE_ONE_TRACK, &[(0, &legacy)]).unwrap_err();
     assert!(err.to_string().contains("Enhanced"), "{err}");
@@ -608,18 +605,17 @@ fn audio_mux_sequence_start_shared_fourcc_round_trip() {
 
 #[test]
 fn audio_mux_rejects_legacy_and_mixed_inner_types() {
-    let legacy = AudioTag {
-        sound_format: 10,
-        sound_rate: 3,
-        sound_size_16bit: true,
-        stereo: true,
-        aac_packet_type: Some(1),
-        ex_packet_type: None,
-        audio_fourcc: None,
-        body: b"frame".to_vec(),
-        mod_ex: Vec::new(),
-        multitrack: None,
-    };
+    let legacy = AudioTag::default()
+        .with_sound_format(10)
+        .with_sound_rate(3)
+        .with_sound_size_16bit(true)
+        .with_stereo(true)
+        .with_aac_packet_type(Some(1))
+        .with_ex_packet_type(None)
+        .with_audio_fourcc(None)
+        .with_body(b"frame".to_vec())
+        .with_mod_ex(Vec::new())
+        .with_multitrack(None);
     let err =
         AudioTag::multitrack_from_tags(AV_MULTITRACK_TYPE_ONE_TRACK, &[(0, &legacy)]).unwrap_err();
     assert!(err.to_string().contains("Enhanced"), "{err}");

@@ -28,36 +28,34 @@ use oxideav_rtmp::{
 };
 
 fn video_tag(keyframe: bool, body: Vec<u8>, avc_packet_type: u8) -> VideoTag {
-    VideoTag {
-        mod_ex: Vec::new(),
-        frame_type: if keyframe {
+    VideoTag::default()
+        .with_mod_ex(Vec::new())
+        .with_frame_type(if keyframe {
             VIDEO_FRAME_KEYFRAME
         } else {
             VIDEO_FRAME_INTER
-        },
-        codec_id: VIDEO_CODEC_AVC,
-        avc_packet_type: Some(avc_packet_type),
-        composition_time: 0,
-        body,
-        ex_packet_type: None,
-        fourcc: None,
-        multitrack: None,
-    }
+        })
+        .with_codec_id(VIDEO_CODEC_AVC)
+        .with_avc_packet_type(Some(avc_packet_type))
+        .with_composition_time(0)
+        .with_body(body)
+        .with_ex_packet_type(None)
+        .with_fourcc(None)
+        .with_multitrack(None)
 }
 
 fn audio_tag(body: Vec<u8>, aac_packet_type: u8) -> AudioTag {
-    AudioTag {
-        mod_ex: Vec::new(),
-        sound_format: AUDIO_FORMAT_AAC,
-        sound_rate: 3,
-        sound_size_16bit: true,
-        stereo: true,
-        aac_packet_type: Some(aac_packet_type),
-        body,
-        ex_packet_type: None,
-        audio_fourcc: None,
-        multitrack: None,
-    }
+    AudioTag::default()
+        .with_mod_ex(Vec::new())
+        .with_sound_format(AUDIO_FORMAT_AAC)
+        .with_sound_rate(3)
+        .with_sound_size_16bit(true)
+        .with_stereo(true)
+        .with_aac_packet_type(Some(aac_packet_type))
+        .with_body(body)
+        .with_ex_packet_type(None)
+        .with_audio_fourcc(None)
+        .with_multitrack(None)
 }
 
 /// Full happy path: options-carrying play setup, sequence headers +
@@ -109,13 +107,11 @@ fn player_receives_full_stream_until_eof() {
         session.close().expect("close");
     });
 
-    let opts = PlayOptions {
-        start: Some(-2.0),
-        duration: Some(-1.0),
-        reset: Some(true),
-        buffer_length_ms: Some(2500),
-        ..Default::default()
-    };
+    let opts = PlayOptions::default()
+        .with_start(Some(-2.0))
+        .with_duration(Some(-1.0))
+        .with_reset(Some(true))
+        .with_buffer_length_ms(Some(2500));
     let url = format!("rtmp://{addr}/vod/sample");
     let mut player = RtmpPlayer::connect_with_options(&url, &opts).expect("connect play");
     assert_eq!(player.stream_name(), "sample");

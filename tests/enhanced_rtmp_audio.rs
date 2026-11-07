@@ -109,19 +109,17 @@ fn flac_sequence_start_body_includes_native_signature() {
                  \xa5\xb6\xc7\xd8\xe9\xfa\x0b\x1c\
                  \x2d\x3e\x4f\x50\x61\x72\x83\x94"
         .to_vec();
-    let tag = AudioTag {
-        mod_ex: Vec::new(),
-        sound_format: AUDIO_FORMAT_EX_HEADER,
-        sound_rate: 0,
-        sound_size_16bit: false,
-        stereo: false,
-        aac_packet_type: None,
-        ex_packet_type: Some(AUDIO_PACKET_TYPE_SEQUENCE_START),
-        audio_fourcc: Some(FOURCC_FLAC),
-        body: body.clone(),
-
-        multitrack: None,
-    };
+    let tag = AudioTag::default()
+        .with_mod_ex(Vec::new())
+        .with_sound_format(AUDIO_FORMAT_EX_HEADER)
+        .with_sound_rate(0)
+        .with_sound_size_16bit(false)
+        .with_stereo(false)
+        .with_aac_packet_type(None)
+        .with_ex_packet_type(Some(AUDIO_PACKET_TYPE_SEQUENCE_START))
+        .with_audio_fourcc(Some(FOURCC_FLAC))
+        .with_body(body.clone())
+        .with_multitrack(None);
     let payload = build_audio(&tag);
     assert_eq!(payload[0], 0x90);
     // Framing FourCC.
@@ -209,19 +207,17 @@ fn build_parse_idempotence_across_all_known_pairs() {
             } else {
                 vec![0xAA, 0xBB, 0xCC, 0xDD]
             };
-            let tag = AudioTag {
-                mod_ex: Vec::new(),
-                sound_format: AUDIO_FORMAT_EX_HEADER,
-                sound_rate: 0,
-                sound_size_16bit: false,
-                stereo: false,
-                aac_packet_type: None,
-                ex_packet_type: Some(pt),
-                audio_fourcc: Some(fcc),
-                body,
-
-                multitrack: None,
-            };
+            let tag = AudioTag::default()
+                .with_mod_ex(Vec::new())
+                .with_sound_format(AUDIO_FORMAT_EX_HEADER)
+                .with_sound_rate(0)
+                .with_sound_size_16bit(false)
+                .with_stereo(false)
+                .with_aac_packet_type(None)
+                .with_ex_packet_type(Some(pt))
+                .with_audio_fourcc(Some(fcc))
+                .with_body(body)
+                .with_multitrack(None);
             let bytes = build_audio(&tag);
             let parsed = parse_audio(&bytes).expect("parse");
             let rebuilt = build_audio(&parsed);

@@ -225,6 +225,7 @@ pub enum SessionRequest {
 /// The protocol has gotten through `publish` — we know which app the
 /// client connected to and the stream name (commonly the stream key).
 /// Consumer decides whether to accept.
+#[non_exhaustive]
 pub struct PublishRequest {
     pub app: String,
     pub stream_name: String,
@@ -331,6 +332,7 @@ impl PublishRequest {
 /// The protocol has gotten through a §4.2.1 `play` command — the peer
 /// is a subscriber asking to *receive* the named stream. Consumer
 /// decides whether to serve it.
+#[non_exhaustive]
 pub struct PlayRequest {
     /// Application name from the peer's `connect` command.
     pub app: String,
@@ -479,6 +481,7 @@ impl PlayRequest {
 /// Subscriber-originated event observed by a [`PlaySession`] while
 /// serving a play stream.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum PlaySessionEvent {
     /// A §4.2 NetStream control command — `pause`, `seek`,
     /// `receiveAudio`, `receiveVideo`, or a further `play` / `play2`
@@ -1012,6 +1015,7 @@ pub struct RtmpSession {
 
 /// One media-layer event reported to the caller.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum StreamPacket {
     Audio {
         timestamp: u32,

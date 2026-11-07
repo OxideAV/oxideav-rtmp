@@ -192,10 +192,7 @@ fn player_digest_play_full_flow() {
 
     thread::sleep(Duration::from_millis(50));
     let url = format!("rtmp://{}:{}/live/digest-play", addr.ip(), addr.port());
-    let opts = PlayOptions {
-        digest_handshake: true,
-        ..PlayOptions::default()
-    };
+    let opts = PlayOptions::default().with_digest_handshake(true);
     let mut player = RtmpPlayer::connect_with_options(&url, &opts).expect("digest play connect");
     assert_eq!(
         player.handshake_kind(),

@@ -762,10 +762,31 @@ impl HdrMdcv {
 /// [`VideoTag::color_info`], and rebuild an outgoing tag with
 /// [`VideoTag::color_info_tag`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ColorInfo {
     pub color_config: Option<ColorConfig>,
     pub hdr_cll: Option<HdrCll>,
     pub hdr_mdcv: Option<HdrMdcv>,
+}
+
+impl ColorInfo {
+    /// Set `color_config`.
+    pub fn with_color_config(mut self, v: Option<ColorConfig>) -> Self {
+        self.color_config = v;
+        self
+    }
+
+    /// Set `hdr_cll`.
+    pub fn with_hdr_cll(mut self, v: Option<HdrCll>) -> Self {
+        self.hdr_cll = v;
+        self
+    }
+
+    /// Set `hdr_mdcv`.
+    pub fn with_hdr_mdcv(mut self, v: Option<HdrMdcv>) -> Self {
+        self.hdr_mdcv = v;
+        self
+    }
 }
 
 impl ColorInfo {
@@ -932,6 +953,7 @@ fn hdr_mdcv_to_amf0(mdcv: &HdrMdcv) -> Amf0Value {
 /// `["onMetaData", value]` pair) and re-encode with [`OnMetaData::to_amf0`],
 /// which produces an [`Amf0Value::EcmaArray`] as the spec requires.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct OnMetaData {
     /// Audio codec ID. A legacy single-byte FLV CodecID, or a FourCC encoded
     /// as a number (see [`OnMetaData::audio_fourcc`]).
@@ -976,6 +998,116 @@ pub struct OnMetaData {
     /// Any property not in the spec's typical-properties table, preserved in
     /// wire order so a decode/encode round-trip is lossless.
     pub extra: Vec<(String, Amf0Value)>,
+}
+
+impl OnMetaData {
+    /// Set `audiocodecid`.
+    pub fn with_audiocodecid(mut self, v: Option<f64>) -> Self {
+        self.audiocodecid = v;
+        self
+    }
+
+    /// Set `audiodatarate`.
+    pub fn with_audiodatarate(mut self, v: Option<f64>) -> Self {
+        self.audiodatarate = v;
+        self
+    }
+
+    /// Set `audiodelay`.
+    pub fn with_audiodelay(mut self, v: Option<f64>) -> Self {
+        self.audiodelay = v;
+        self
+    }
+
+    /// Set `audiosamplerate`.
+    pub fn with_audiosamplerate(mut self, v: Option<f64>) -> Self {
+        self.audiosamplerate = v;
+        self
+    }
+
+    /// Set `audiosamplesize`.
+    pub fn with_audiosamplesize(mut self, v: Option<f64>) -> Self {
+        self.audiosamplesize = v;
+        self
+    }
+
+    /// Set `can_seek_to_end`.
+    pub fn with_can_seek_to_end(mut self, v: Option<bool>) -> Self {
+        self.can_seek_to_end = v;
+        self
+    }
+
+    /// Set `creationdate`.
+    pub fn with_creationdate(mut self, v: Option<String>) -> Self {
+        self.creationdate = v;
+        self
+    }
+
+    /// Set `duration`.
+    pub fn with_duration(mut self, v: Option<f64>) -> Self {
+        self.duration = v;
+        self
+    }
+
+    /// Set `filesize`.
+    pub fn with_filesize(mut self, v: Option<f64>) -> Self {
+        self.filesize = v;
+        self
+    }
+
+    /// Set `framerate`.
+    pub fn with_framerate(mut self, v: Option<f64>) -> Self {
+        self.framerate = v;
+        self
+    }
+
+    /// Set `height`.
+    pub fn with_height(mut self, v: Option<f64>) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `stereo`.
+    pub fn with_stereo(mut self, v: Option<bool>) -> Self {
+        self.stereo = v;
+        self
+    }
+
+    /// Set `videocodecid`.
+    pub fn with_videocodecid(mut self, v: Option<f64>) -> Self {
+        self.videocodecid = v;
+        self
+    }
+
+    /// Set `videodatarate`.
+    pub fn with_videodatarate(mut self, v: Option<f64>) -> Self {
+        self.videodatarate = v;
+        self
+    }
+
+    /// Set `width`.
+    pub fn with_width(mut self, v: Option<f64>) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `audio_track_id_info_map`.
+    pub fn with_audio_track_id_info_map(mut self, v: Option<Amf0Value>) -> Self {
+        self.audio_track_id_info_map = v;
+        self
+    }
+
+    /// Set `video_track_id_info_map`.
+    pub fn with_video_track_id_info_map(mut self, v: Option<Amf0Value>) -> Self {
+        self.video_track_id_info_map = v;
+        self
+    }
+
+    /// Set `extra`.
+    pub fn with_extra(mut self, v: Vec<(String, Amf0Value)>) -> Self {
+        self.extra = v;
+        self
+    }
 }
 
 impl OnMetaData {
@@ -1089,6 +1221,7 @@ impl OnMetaData {
 /// descriptors are valid). [`TrackInfo::to_amf0`] re-encodes
 /// losslessly.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct TrackInfo {
     /// Width of this track's video, in pixels.
     pub width: Option<f64>,
@@ -1111,6 +1244,62 @@ pub struct TrackInfo {
     /// Any property outside the typical-fields list, preserved in wire
     /// order so a decode/encode round-trip is lossless.
     pub extra: Vec<(String, Amf0Value)>,
+}
+
+impl TrackInfo {
+    /// Set `width`.
+    pub fn with_width(mut self, v: Option<f64>) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    pub fn with_height(mut self, v: Option<f64>) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `videodatarate`.
+    pub fn with_videodatarate(mut self, v: Option<f64>) -> Self {
+        self.videodatarate = v;
+        self
+    }
+
+    /// Set `videocodecid`.
+    pub fn with_videocodecid(mut self, v: Option<f64>) -> Self {
+        self.videocodecid = v;
+        self
+    }
+
+    /// Set `audiodatarate`.
+    pub fn with_audiodatarate(mut self, v: Option<f64>) -> Self {
+        self.audiodatarate = v;
+        self
+    }
+
+    /// Set `channels`.
+    pub fn with_channels(mut self, v: Option<f64>) -> Self {
+        self.channels = v;
+        self
+    }
+
+    /// Set `samplerate`.
+    pub fn with_samplerate(mut self, v: Option<f64>) -> Self {
+        self.samplerate = v;
+        self
+    }
+
+    /// Set `audiocodecid`.
+    pub fn with_audiocodecid(mut self, v: Option<f64>) -> Self {
+        self.audiocodecid = v;
+        self
+    }
+
+    /// Set `extra`.
+    pub fn with_extra(mut self, v: Vec<(String, Amf0Value)>) -> Self {
+        self.extra = v;
+        self
+    }
 }
 
 impl TrackInfo {
@@ -1607,7 +1796,8 @@ fn plan_multitrack<T>(
 /// (AVC, v2), `vvc1` (VVC, v2). For `CodedFramesX` and the
 /// non-NALU FourCCs (`av01`, `vp09`, `vp08`) the field is zero
 /// and not encoded on the wire.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct VideoTag {
     pub frame_type: u8,
     pub codec_id: u8,
@@ -1654,6 +1844,62 @@ pub struct VideoTag {
     /// `ManyTracksManyCodecs`), and the tag's [`body`][VideoTag::body] is
     /// empty (track payloads sit in each [`MultitrackTrack::body`]).
     pub multitrack: Option<Multitrack>,
+}
+
+impl VideoTag {
+    /// Set `frame_type`.
+    pub fn with_frame_type(mut self, v: u8) -> Self {
+        self.frame_type = v;
+        self
+    }
+
+    /// Set `codec_id`.
+    pub fn with_codec_id(mut self, v: u8) -> Self {
+        self.codec_id = v;
+        self
+    }
+
+    /// Set `avc_packet_type`.
+    pub fn with_avc_packet_type(mut self, v: Option<u8>) -> Self {
+        self.avc_packet_type = v;
+        self
+    }
+
+    /// Set `composition_time`.
+    pub fn with_composition_time(mut self, v: i32) -> Self {
+        self.composition_time = v;
+        self
+    }
+
+    /// Set `body`.
+    pub fn with_body(mut self, v: Vec<u8>) -> Self {
+        self.body = v;
+        self
+    }
+
+    /// Set `ex_packet_type`.
+    pub fn with_ex_packet_type(mut self, v: Option<u8>) -> Self {
+        self.ex_packet_type = v;
+        self
+    }
+
+    /// Set `fourcc`.
+    pub fn with_fourcc(mut self, v: Option<[u8; 4]>) -> Self {
+        self.fourcc = v;
+        self
+    }
+
+    /// Set `mod_ex`.
+    pub fn with_mod_ex(mut self, v: Vec<ModEx>) -> Self {
+        self.mod_ex = v;
+        self
+    }
+
+    /// Set `multitrack`.
+    pub fn with_multitrack(mut self, v: Option<Multitrack>) -> Self {
+        self.multitrack = v;
+        self
+    }
 }
 
 impl VideoTag {
@@ -2438,7 +2684,8 @@ pub fn build_video(tag: &VideoTag) -> Vec<u8> {
 /// `UB[4]` bits are interpreted as an AudioPacketType". We zero
 /// them on parse for tags that arrive in Enhanced mode so callers
 /// don't accidentally read them as audio configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct AudioTag {
     pub sound_format: u8,
     /// 0 = 5.5k / 1 = 11k / 2 = 22k / 3 = 44k. Encoded in the FLV
@@ -2490,6 +2737,68 @@ pub struct AudioTag {
     /// [`body`][AudioTag::body] is empty (track payloads sit in each
     /// [`MultitrackTrack::body`]).
     pub multitrack: Option<Multitrack>,
+}
+
+impl AudioTag {
+    /// Set `sound_format`.
+    pub fn with_sound_format(mut self, v: u8) -> Self {
+        self.sound_format = v;
+        self
+    }
+
+    /// Set `sound_rate`.
+    pub fn with_sound_rate(mut self, v: u8) -> Self {
+        self.sound_rate = v;
+        self
+    }
+
+    /// Set `sound_size_16bit`.
+    pub fn with_sound_size_16bit(mut self, v: bool) -> Self {
+        self.sound_size_16bit = v;
+        self
+    }
+
+    /// Set `stereo`.
+    pub fn with_stereo(mut self, v: bool) -> Self {
+        self.stereo = v;
+        self
+    }
+
+    /// Set `aac_packet_type`.
+    pub fn with_aac_packet_type(mut self, v: Option<u8>) -> Self {
+        self.aac_packet_type = v;
+        self
+    }
+
+    /// Set `ex_packet_type`.
+    pub fn with_ex_packet_type(mut self, v: Option<u8>) -> Self {
+        self.ex_packet_type = v;
+        self
+    }
+
+    /// Set `audio_fourcc`.
+    pub fn with_audio_fourcc(mut self, v: Option<[u8; 4]>) -> Self {
+        self.audio_fourcc = v;
+        self
+    }
+
+    /// Set `body`.
+    pub fn with_body(mut self, v: Vec<u8>) -> Self {
+        self.body = v;
+        self
+    }
+
+    /// Set `mod_ex`.
+    pub fn with_mod_ex(mut self, v: Vec<ModEx>) -> Self {
+        self.mod_ex = v;
+        self
+    }
+
+    /// Set `multitrack`.
+    pub fn with_multitrack(mut self, v: Option<Multitrack>) -> Self {
+        self.multitrack = v;
+        self
+    }
 }
 
 impl AudioTag {
@@ -2997,6 +3306,7 @@ pub fn build_audio(tag: &AudioTag) -> Vec<u8> {
 /// through [`parse_audio_message`], which lifts the zero-length case
 /// to [`AudioMessage::Silence`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AudioMessage {
     /// The audio message carried a real tag (legacy framing or the
     /// Enhanced-RTMP `ExHeader` framing). Decoded via [`parse_audio`].

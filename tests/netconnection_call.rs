@@ -162,12 +162,12 @@ fn server_rpc_reaches_client_and_reply_surfaces() {
         // Server-initiated RPC at the client (the classic
         // bandwidth-check shape).
         session
-            .send_call(&CallCommand {
-                procedure: "onBWCheck".into(),
-                transaction_id: 77.0,
-                command_object: Amf0Value::Null,
-                arguments: vec![Amf0Value::Number(0.0)],
-            })
+            .send_call(&CallCommand::new(
+                "onBWCheck".into(),
+                77.0,
+                Amf0Value::Null,
+                vec![Amf0Value::Number(0.0)],
+            ))
             .expect("send_call");
         loop {
             match session.next_packet() {
@@ -219,12 +219,12 @@ fn server_rpc_reaches_client_and_reply_surfaces() {
 
 #[test]
 fn call_command_round_trips_through_message() {
-    let call = CallCommand {
-        procedure: "myProc".into(),
-        transaction_id: 9.0,
-        command_object: Amf0Value::Object(vec![("k".into(), Amf0Value::String("v".into()))]),
-        arguments: vec![Amf0Value::Number(1.0), Amf0Value::Boolean(true)],
-    };
+    let call = CallCommand::new(
+        "myProc".into(),
+        9.0,
+        Amf0Value::Object(vec![("k".into(), Amf0Value::String("v".into()))]),
+        vec![Amf0Value::Number(1.0), Amf0Value::Boolean(true)],
+    );
     let msg = call.to_message();
     assert_eq!(msg.msg_stream_id, 0, "NetConnection commands ride stream 0");
     let values = oxideav_rtmp::amf::decode_all(&msg.payload).expect("decode");
@@ -258,12 +258,12 @@ fn play_direction_rpc_both_ways() {
             .expect("timeout");
         // RPC at the subscriber.
         session
-            .send_call(&CallCommand {
-                procedure: "onBWCheck".into(),
-                transaction_id: 31.0,
-                command_object: Amf0Value::Null,
-                arguments: vec![],
-            })
+            .send_call(&CallCommand::new(
+                "onBWCheck".into(),
+                31.0,
+                Amf0Value::Null,
+                vec![],
+            ))
             .expect("send_call");
         // Pump subscriber events: expect our CallReply, then their
         // RPC, then teardown.

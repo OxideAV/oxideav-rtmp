@@ -244,6 +244,7 @@ impl DigestScheme {
 
 /// Which handshake flavour a negotiated exchange settled on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HandshakeKind {
     /// Plain echo handshake — C2/S2 mirror the peer's first packet.
     Simple,

@@ -54,67 +54,63 @@ fn registry_open_rtmp_play_url_pulls_remote_stream() {
         session
             .send_video(
                 0,
-                &VideoTag {
-                    mod_ex: Vec::new(),
-                    frame_type: VIDEO_FRAME_KEYFRAME,
-                    codec_id: VIDEO_CODEC_AVC,
-                    avc_packet_type: Some(AVC_PACKET_TYPE_SEQUENCE_HEADER),
-                    composition_time: 0,
-                    body: vec![0x01, 0x42, 0x80, 0x1E, 0x00],
-                    ex_packet_type: None,
-                    fourcc: None,
-                    multitrack: None,
-                },
+                &VideoTag::default()
+                    .with_mod_ex(Vec::new())
+                    .with_frame_type(VIDEO_FRAME_KEYFRAME)
+                    .with_codec_id(VIDEO_CODEC_AVC)
+                    .with_avc_packet_type(Some(AVC_PACKET_TYPE_SEQUENCE_HEADER))
+                    .with_composition_time(0)
+                    .with_body(vec![0x01, 0x42, 0x80, 0x1E, 0x00])
+                    .with_ex_packet_type(None)
+                    .with_fourcc(None)
+                    .with_multitrack(None),
             )
             .expect("video sh");
         session
             .send_audio(
                 0,
-                &AudioTag {
-                    mod_ex: Vec::new(),
-                    sound_format: AUDIO_FORMAT_AAC,
-                    sound_rate: 3,
-                    sound_size_16bit: true,
-                    stereo: true,
-                    aac_packet_type: Some(AAC_PACKET_TYPE_SEQUENCE_HEADER),
-                    body: vec![0x12, 0x10],
-                    ex_packet_type: None,
-                    audio_fourcc: None,
-                    multitrack: None,
-                },
+                &AudioTag::default()
+                    .with_mod_ex(Vec::new())
+                    .with_sound_format(AUDIO_FORMAT_AAC)
+                    .with_sound_rate(3)
+                    .with_sound_size_16bit(true)
+                    .with_stereo(true)
+                    .with_aac_packet_type(Some(AAC_PACKET_TYPE_SEQUENCE_HEADER))
+                    .with_body(vec![0x12, 0x10])
+                    .with_ex_packet_type(None)
+                    .with_audio_fourcc(None)
+                    .with_multitrack(None),
             )
             .expect("audio sh");
         session
             .send_video(
                 40,
-                &VideoTag {
-                    mod_ex: Vec::new(),
-                    frame_type: VIDEO_FRAME_INTER,
-                    codec_id: VIDEO_CODEC_AVC,
-                    avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
-                    composition_time: 0,
-                    body: vec![0x41, 0x9A, 0x00],
-                    ex_packet_type: None,
-                    fourcc: None,
-                    multitrack: None,
-                },
+                &VideoTag::default()
+                    .with_mod_ex(Vec::new())
+                    .with_frame_type(VIDEO_FRAME_INTER)
+                    .with_codec_id(VIDEO_CODEC_AVC)
+                    .with_avc_packet_type(Some(AVC_PACKET_TYPE_NALU))
+                    .with_composition_time(0)
+                    .with_body(vec![0x41, 0x9A, 0x00])
+                    .with_ex_packet_type(None)
+                    .with_fourcc(None)
+                    .with_multitrack(None),
             )
             .expect("video 1");
         session
             .send_audio(
                 23,
-                &AudioTag {
-                    mod_ex: Vec::new(),
-                    sound_format: AUDIO_FORMAT_AAC,
-                    sound_rate: 3,
-                    sound_size_16bit: true,
-                    stereo: true,
-                    aac_packet_type: Some(AAC_PACKET_TYPE_RAW),
-                    body: vec![0xDE, 0xAD],
-                    ex_packet_type: None,
-                    audio_fourcc: None,
-                    multitrack: None,
-                },
+                &AudioTag::default()
+                    .with_mod_ex(Vec::new())
+                    .with_sound_format(AUDIO_FORMAT_AAC)
+                    .with_sound_rate(3)
+                    .with_sound_size_16bit(true)
+                    .with_stereo(true)
+                    .with_aac_packet_type(Some(AAC_PACKET_TYPE_RAW))
+                    .with_body(vec![0xDE, 0xAD])
+                    .with_ex_packet_type(None)
+                    .with_audio_fourcc(None)
+                    .with_multitrack(None),
             )
             .expect("audio 1");
         session.close().expect("close");

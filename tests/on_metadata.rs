@@ -89,12 +89,10 @@ fn fourcc_codec_ids_decode_per_spec_note() {
 
 #[test]
 fn re_encodes_as_ecma_array_in_spec_order() {
-    let mut m = OnMetaData {
-        duration: Some(10.0),
-        width: Some(640.0),
-        videocodecid: Some(1635135537.0), // av01
-        ..Default::default()
-    };
+    let mut m = OnMetaData::default()
+        .with_duration(Some(10.0))
+        .with_width(Some(640.0))
+        .with_videocodecid(Some(1635135537.0));
     m.stereo = Some(false);
 
     let v = m.to_amf0();
@@ -169,16 +167,16 @@ fn per_track_info_maps_round_trip_verbatim() {
 fn round_trips_through_amf0_wire_codec() {
     // Encode to AMF0 bytes and decode back — the typed view survives the
     // real on-wire serialization, not just the in-memory Amf0Value.
-    let m = OnMetaData {
-        duration: Some(7.25),
-        width: Some(854.0),
-        height: Some(480.0),
-        framerate: Some(25.0),
-        videocodecid: Some(1635135537.0), // av01
-        audiocodecid: Some(1332770163.0), // Opus
-        stereo: Some(true),
-        ..Default::default()
-    };
+    let m = OnMetaData::default()
+        .with_duration(Some(7.25))
+        .with_width(Some(854.0))
+        .with_height(Some(480.0))
+        .with_framerate(Some(25.0))
+        .with_videocodecid(Some(1635135537.0))
+        // av01
+        .with_audiocodecid(Some(1332770163.0))
+        // Opus
+        .with_stereo(Some(true));
 
     let mut bytes = Vec::new();
     oxideav_rtmp::amf::encode(&mut bytes, &m.to_amf0());
@@ -321,13 +319,11 @@ fn set_track_info_upserts_and_creates_the_map() {
     let mut meta = OnMetaData::from_amf0(&ecma(vec![])).expect("empty");
     assert_eq!(meta.video_track_ids(), Vec::<u8>::new());
 
-    let rung = TrackInfo {
-        width: Some(1280.0),
-        height: Some(720.0),
-        videodatarate: Some(3000.0),
-        videocodecid: Some(fourcc_num(b"hvc1")),
-        ..TrackInfo::default()
-    };
+    let rung = TrackInfo::default()
+        .with_width(Some(1280.0))
+        .with_height(Some(720.0))
+        .with_videodatarate(Some(3000.0))
+        .with_videocodecid(Some(fourcc_num(b"hvc1")));
     meta.set_video_track_info(1, &rung);
     assert_eq!(meta.video_track_ids(), vec![1]);
     assert_eq!(
@@ -336,10 +332,7 @@ fn set_track_info_upserts_and_creates_the_map() {
     );
 
     // Upsert replaces in place.
-    let smaller = TrackInfo {
-        width: Some(640.0),
-        ..rung.clone()
-    };
+    let smaller = rung.clone().with_width(Some(640.0));
     meta.set_video_track_info(1, &smaller);
     assert_eq!(meta.video_track_ids(), vec![1]);
     assert_eq!(

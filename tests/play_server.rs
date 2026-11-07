@@ -173,30 +173,28 @@ fn play_session_serves_figure5_flow() {
             ("height".into(), Amf0Value::Number(180.0)),
         ]);
         session.send_metadata(&meta).expect("send metadata");
-        let vtag = VideoTag {
-            mod_ex: Vec::new(),
-            frame_type: VIDEO_FRAME_KEYFRAME,
-            codec_id: VIDEO_CODEC_AVC,
-            avc_packet_type: Some(AVC_PACKET_TYPE_NALU),
-            composition_time: 0,
-            body: vec![0, 0, 0, 2, 0x65, 0x88],
-            ex_packet_type: None,
-            fourcc: None,
-            multitrack: None,
-        };
+        let vtag = VideoTag::default()
+            .with_mod_ex(Vec::new())
+            .with_frame_type(VIDEO_FRAME_KEYFRAME)
+            .with_codec_id(VIDEO_CODEC_AVC)
+            .with_avc_packet_type(Some(AVC_PACKET_TYPE_NALU))
+            .with_composition_time(0)
+            .with_body(vec![0, 0, 0, 2, 0x65, 0x88])
+            .with_ex_packet_type(None)
+            .with_fourcc(None)
+            .with_multitrack(None);
         session.send_video(40, &vtag).expect("send video");
-        let atag = AudioTag {
-            mod_ex: Vec::new(),
-            sound_format: AUDIO_FORMAT_AAC,
-            sound_rate: 3,
-            sound_size_16bit: true,
-            stereo: true,
-            aac_packet_type: Some(AAC_PACKET_TYPE_RAW),
-            body: vec![0x21, 0x42, 0x63],
-            ex_packet_type: None,
-            audio_fourcc: None,
-            multitrack: None,
-        };
+        let atag = AudioTag::default()
+            .with_mod_ex(Vec::new())
+            .with_sound_format(AUDIO_FORMAT_AAC)
+            .with_sound_rate(3)
+            .with_sound_size_16bit(true)
+            .with_stereo(true)
+            .with_aac_packet_type(Some(AAC_PACKET_TYPE_RAW))
+            .with_body(vec![0x21, 0x42, 0x63])
+            .with_ex_packet_type(None)
+            .with_audio_fourcc(None)
+            .with_multitrack(None);
         session.send_audio(63, &atag).expect("send audio");
 
         // The subscriber pauses: surface the typed command, then reply

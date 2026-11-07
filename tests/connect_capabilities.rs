@@ -44,20 +44,18 @@ fn publisher_caps() -> ConnectCapabilities {
     let mut audio = FourCcInfoMap::new();
     audio.insert("*", FOURCC_INFO_CAN_FORWARD);
     audio.insert("Opus", FOURCC_INFO_CAN_DECODE | FOURCC_INFO_CAN_ENCODE);
-    ConnectCapabilities {
-        fourcc_list: vec![
+    ConnectCapabilities::default()
+        .with_fourcc_list(vec![
             "av01".into(),
             "vp09".into(),
             "hvc1".into(),
             "avc1".into(),
             "Opus".into(),
             "mp4a".into(),
-        ],
-        video_fourcc_info_map: video,
-        audio_fourcc_info_map: audio,
-        caps_ex: CAPS_EX_RECONNECT | CAPS_EX_MULTITRACK | CAPS_EX_TIMESTAMP_NANO_OFFSET,
-        ..Default::default()
-    }
+        ])
+        .with_video_fourcc_info_map(video)
+        .with_audio_fourcc_info_map(audio)
+        .with_caps_ex(CAPS_EX_RECONNECT | CAPS_EX_MULTITRACK | CAPS_EX_TIMESTAMP_NANO_OFFSET)
 }
 
 /// Build the capability block a v2-aware ingest server would echo back.
@@ -69,15 +67,12 @@ fn server_caps() -> ConnectCapabilities {
     let mut audio = FourCcInfoMap::new();
     audio.insert("Opus", FOURCC_INFO_CAN_DECODE);
     audio.insert("mp4a", FOURCC_INFO_CAN_DECODE);
-    ConnectCapabilities {
-        video_fourcc_info_map: video,
-        audio_fourcc_info_map: audio,
-        caps_ex: CAPS_EX_RECONNECT
-            | CAPS_EX_MULTITRACK
-            | CAPS_EX_MOD_EX
-            | CAPS_EX_TIMESTAMP_NANO_OFFSET,
-        ..Default::default()
-    }
+    ConnectCapabilities::default()
+        .with_video_fourcc_info_map(video)
+        .with_audio_fourcc_info_map(audio)
+        .with_caps_ex(
+            CAPS_EX_RECONNECT | CAPS_EX_MULTITRACK | CAPS_EX_MOD_EX | CAPS_EX_TIMESTAMP_NANO_OFFSET,
+        )
 }
 
 /// The legacy `_result(connect)` info object always carries
@@ -86,10 +81,7 @@ fn server_caps() -> ConnectCapabilities {
 /// Build the "as observed by the client" expected value for our
 /// [`server_caps`] block.
 fn server_caps_as_observed_by_client() -> ConnectCapabilities {
-    ConnectCapabilities {
-        object_encoding: Some(0),
-        ..server_caps()
-    }
+    server_caps().with_object_encoding(Some(0))
 }
 
 /// Both sides advertise non-default capability blocks; each one

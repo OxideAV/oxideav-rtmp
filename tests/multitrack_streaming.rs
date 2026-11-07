@@ -26,32 +26,30 @@ use oxideav_rtmp::{
 };
 
 fn ex_video(fourcc: [u8; 4], cts: i32, body: &[u8]) -> VideoTag {
-    VideoTag {
-        frame_type: VIDEO_FRAME_KEYFRAME,
-        codec_id: 0,
-        avc_packet_type: None,
-        composition_time: cts,
-        body: body.to_vec(),
-        ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
-        fourcc: Some(fourcc),
-        mod_ex: Vec::new(),
-        multitrack: None,
-    }
+    VideoTag::default()
+        .with_frame_type(VIDEO_FRAME_KEYFRAME)
+        .with_codec_id(0)
+        .with_avc_packet_type(None)
+        .with_composition_time(cts)
+        .with_body(body.to_vec())
+        .with_ex_packet_type(Some(EX_PACKET_TYPE_CODED_FRAMES))
+        .with_fourcc(Some(fourcc))
+        .with_mod_ex(Vec::new())
+        .with_multitrack(None)
 }
 
 fn ex_audio(fourcc: [u8; 4], body: &[u8]) -> AudioTag {
-    AudioTag {
-        sound_format: 9,
-        sound_rate: 0,
-        sound_size_16bit: false,
-        stereo: false,
-        aac_packet_type: None,
-        ex_packet_type: Some(AUDIO_PACKET_TYPE_CODED_FRAMES),
-        audio_fourcc: Some(fourcc),
-        body: body.to_vec(),
-        mod_ex: Vec::new(),
-        multitrack: None,
-    }
+    AudioTag::default()
+        .with_sound_format(9)
+        .with_sound_rate(0)
+        .with_sound_size_16bit(false)
+        .with_stereo(false)
+        .with_aac_packet_type(None)
+        .with_ex_packet_type(Some(AUDIO_PACKET_TYPE_CODED_FRAMES))
+        .with_audio_fourcc(Some(fourcc))
+        .with_body(body.to_vec())
+        .with_mod_ex(Vec::new())
+        .with_multitrack(None)
 }
 
 /// Publish direction: a two-track HEVC ladder + a two-codec audio

@@ -209,6 +209,7 @@ impl FourCcInfoMap {
 /// `encode_into` writes nothing, so a caller composing a legacy AVC /
 /// AAC-only `connect` command keeps the pre-2023 byte layout exactly.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConnectCapabilities {
     /// `fourCcList` — Enhanced RTMP v1 strict-array of supported FourCC
     /// strings (e.g. `"av01"`, `"hvc1"`). The v2 spec deprecates this on
@@ -225,6 +226,38 @@ pub struct ConnectCapabilities {
     pub caps_ex: u32,
     /// `objectEncoding` — 0 for AMF0-only, 3 for AMF0+AMF3.
     pub object_encoding: Option<u8>,
+}
+
+impl ConnectCapabilities {
+    /// Set `fourcc_list`.
+    pub fn with_fourcc_list(mut self, v: Vec<String>) -> Self {
+        self.fourcc_list = v;
+        self
+    }
+
+    /// Set `video_fourcc_info_map`.
+    pub fn with_video_fourcc_info_map(mut self, v: FourCcInfoMap) -> Self {
+        self.video_fourcc_info_map = v;
+        self
+    }
+
+    /// Set `audio_fourcc_info_map`.
+    pub fn with_audio_fourcc_info_map(mut self, v: FourCcInfoMap) -> Self {
+        self.audio_fourcc_info_map = v;
+        self
+    }
+
+    /// Set `caps_ex`.
+    pub fn with_caps_ex(mut self, v: u32) -> Self {
+        self.caps_ex = v;
+        self
+    }
+
+    /// Set `object_encoding`.
+    pub fn with_object_encoding(mut self, v: Option<u8>) -> Self {
+        self.object_encoding = v;
+        self
+    }
 }
 
 impl ConnectCapabilities {

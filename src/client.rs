@@ -43,6 +43,7 @@ use crate::message::*;
 /// the TCP write half — and the client should treat that as a clean
 /// stream end rather than as an unexpected FIN.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ClientEvent {
     /// The server emitted `UserControl StreamBegin(stream_id)`
     /// (UCM event type 0). Informational — most servers send this once
@@ -200,6 +201,7 @@ pub struct RtmpClient {
 
 /// Parsed RTMP URL: `rtmp://host[:port]/app/stream_name`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RtmpUrl {
     pub host: String,
     pub port: u16,

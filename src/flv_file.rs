@@ -55,17 +55,11 @@
 //!                            FlvHeaderFlags { audio: true, video: true })
 //!     .unwrap();
 //!
-//! let vsh = VideoTag {
-//!     mod_ex: Vec::new(),
-//!     frame_type: VIDEO_FRAME_KEYFRAME,
-//!     codec_id: VIDEO_CODEC_AVC,
-//!     avc_packet_type: Some(AVC_PACKET_TYPE_SEQUENCE_HEADER),
-//!     composition_time: 0,
-//!     body: vec![0x01, 0x42, 0x80, 0x1e, /* …avcC… */],
-//!     ex_packet_type: None,
-//!     fourcc: None,
-//!     multitrack: None,
-//! };
+//! let vsh = VideoTag::default()
+//!     .with_frame_type(VIDEO_FRAME_KEYFRAME)
+//!     .with_codec_id(VIDEO_CODEC_AVC)
+//!     .with_avc_packet_type(Some(AVC_PACKET_TYPE_SEQUENCE_HEADER))
+//!     .with_body(vec![0x01, 0x42, 0x80, 0x1e /* …avcC… */]);
 //! w.write_video_tag(0, &vsh).unwrap();
 //! // … more tags …
 //! let _file = w.finish().unwrap();
@@ -393,6 +387,7 @@ pub const DEFAULT_MAX_TAG_SIZE: u32 = UI24_MAX;
 /// are preserved verbatim so a forwarding consumer never silently
 /// drops a tag it doesn't recognise.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum FlvTag {
     /// `TagType = 8` audio tag, body parsed into the same
     /// [`AudioTag`] shape the RTMP ingest path uses.

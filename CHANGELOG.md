@@ -7,8 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Default` on `VideoTag` and `AudioTag`; `with_*` setters for every
+  field of `VideoTag`, `AudioTag`, `ConnectCapabilities`, `OnMetaData`,
+  `TrackInfo`, `ColorInfo` and `PlayOptions`; `CallCommand::new(..)`.
+
 ### Changed
 
+- API hygiene: `#[non_exhaustive]` on the enums `Error`, `ClientEvent`,
+  `UserControlEvent`, `NetStreamCommand`, `SoEvent`, `HandshakeKind`,
+  `PlaySessionEvent`, `StreamPacket`, `PlayerPacket`, `AudioMessage` and
+  `FlvTag`, and on the records `VideoTag`, `AudioTag`, `CallCommand`,
+  `SharedObjectMessage`, `RtmpUrl`, `PublishRequest`, `PlayRequest`,
+  `ConnectCapabilities`, `OnMetaData`, `TrackInfo`, `ColorInfo` and
+  `PlayOptions`. The AMF0 / AMF3 value enums, `SessionRequest`
+  (publish / play), `DigestScheme`, `DataFrameCommand`,
+  `MessageStreamKind`, `MultichannelConfigOrder`, `FilterParams`, the
+  chunk-level `Message` and the fixed FLV sub-records stay exhaustive.
+  No behaviour change.
 - edition 2024, MSRV 1.95
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.6...v0.0.7) - 2026-10-04

@@ -384,29 +384,27 @@ fn record_rtmp_publish_then_read_back_through_flv_reader() {
 /// expects per Annex E.
 #[test]
 fn local_videotag_audiotag_round_trip_through_writer_and_parser() {
-    let video = VideoTag {
-        mod_ex: Vec::new(),
-        frame_type: VIDEO_FRAME_KEYFRAME,
-        codec_id: VIDEO_CODEC_AVC,
-        avc_packet_type: Some(AVC_PACKET_TYPE_SEQUENCE_HEADER),
-        composition_time: 0,
-        body: vec![0x01, 0x42, 0x80, 0x1E, 0xFF, 0xE1, 0x00, 0x05],
-        ex_packet_type: None,
-        fourcc: None,
-        multitrack: None,
-    };
-    let audio = AudioTag {
-        mod_ex: Vec::new(),
-        sound_format: AUDIO_FORMAT_AAC,
-        sound_rate: 3,
-        sound_size_16bit: true,
-        stereo: true,
-        aac_packet_type: Some(AAC_PACKET_TYPE_SEQUENCE_HEADER),
-        body: vec![0x12, 0x10],
-        ex_packet_type: None,
-        audio_fourcc: None,
-        multitrack: None,
-    };
+    let video = VideoTag::default()
+        .with_mod_ex(Vec::new())
+        .with_frame_type(VIDEO_FRAME_KEYFRAME)
+        .with_codec_id(VIDEO_CODEC_AVC)
+        .with_avc_packet_type(Some(AVC_PACKET_TYPE_SEQUENCE_HEADER))
+        .with_composition_time(0)
+        .with_body(vec![0x01, 0x42, 0x80, 0x1E, 0xFF, 0xE1, 0x00, 0x05])
+        .with_ex_packet_type(None)
+        .with_fourcc(None)
+        .with_multitrack(None);
+    let audio = AudioTag::default()
+        .with_mod_ex(Vec::new())
+        .with_sound_format(AUDIO_FORMAT_AAC)
+        .with_sound_rate(3)
+        .with_sound_size_16bit(true)
+        .with_stereo(true)
+        .with_aac_packet_type(Some(AAC_PACKET_TYPE_SEQUENCE_HEADER))
+        .with_body(vec![0x12, 0x10])
+        .with_ex_packet_type(None)
+        .with_audio_fourcc(None)
+        .with_multitrack(None);
     let mut w = FlvWriter::new(
         Vec::new(),
         FlvHeaderFlags {

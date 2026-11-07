@@ -83,17 +83,17 @@ fn enhanced_command_tag_round_trips() {
 fn non_command_frames_are_not_commands() {
     // A normal HEVC CodedFrames keyframe must NOT be misclassified as a
     // command, and its SI24 CTS must still survive the round-trip.
-    let tag = VideoTag {
-        frame_type: 1, // KeyFrame
-        codec_id: 0,
-        avc_packet_type: None,
-        composition_time: 42,
-        body: vec![0xde, 0xad, 0xbe, 0xef],
-        ex_packet_type: Some(EX_PACKET_TYPE_CODED_FRAMES),
-        fourcc: Some(FOURCC_HEVC),
-        mod_ex: Vec::new(),
-        multitrack: None,
-    };
+    let tag = VideoTag::default()
+        .with_frame_type(1)
+        // KeyFrame
+        .with_codec_id(0)
+        .with_avc_packet_type(None)
+        .with_composition_time(42)
+        .with_body(vec![0xde, 0xad, 0xbe, 0xef])
+        .with_ex_packet_type(Some(EX_PACKET_TYPE_CODED_FRAMES))
+        .with_fourcc(Some(FOURCC_HEVC))
+        .with_mod_ex(Vec::new())
+        .with_multitrack(None);
     assert!(!tag.is_command());
     assert_eq!(tag.video_command(), None);
     let back = parse_video(&build_video(&tag)).unwrap();
