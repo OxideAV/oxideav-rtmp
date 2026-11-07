@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.7...v0.0.8) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] on growable enums and records
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - `Default` on `VideoTag` and `AudioTag`; `with_*` setters for every
