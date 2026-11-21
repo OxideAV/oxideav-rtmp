@@ -1,7 +1,8 @@
 //! Live black-box interop matrix.
 //!
 //! Each fixture is an FLV stream produced by the black-box tool
-//! (`ffmpeg`), then carried over a real loopback RTMP connection in
+//! (executable name in `common::TOOL`), then carried over a real
+//! loopback RTMP connection in
 //! four directions:
 //!
 //! * `ingest` — the tool publishes to this crate's server;

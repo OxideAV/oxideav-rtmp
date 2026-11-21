@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use oxideav_rtmp::chunk::{ChunkReader, ChunkWriter, Message};
-use oxideav_rtmp::flv::{build_video, parse_video};
+use oxideav_rtmp::flv::{build_video, parse_video_owned};
 use oxideav_rtmp::{
     PlayerPacket, RtmpClient, RtmpPlayer, RtmpServer, SessionRequest, StreamPacket, VideoTag,
 };
@@ -138,7 +138,7 @@ fn bench_chunk_codec(count: usize, size: usize, chunk_size: usize) {
     let before = ALLOCS.load(Ordering::Relaxed);
     for _ in 1..count {
         let m = r.read_message().expect("read");
-        let tag = parse_video(&m.payload).expect("parse");
+        let tag = parse_video_owned(m.payload).expect("parse");
         std::hint::black_box(&tag);
     }
     let ingest = ALLOCS.load(Ordering::Relaxed) - before;

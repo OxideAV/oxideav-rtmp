@@ -15,11 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ChunkWriter` lays a message's chunks out in a staging buffer and
   hands them to the stream in one `write` per 64 KiB instead of several
   per chunk; per-chunk-stream state is direct-indexed for ids below 64.
+  `flv::parse_video_owned` / `parse_audio_owned` (used by every
+  session) turn the reassembled message buffer into the tag body
+  instead of copying out of it.
   Loopback over 127.0.0.1 (`cargo bench --bench throughput`, medians):
-  128 KiB messages 847 → 5 040 MB/s publish and 750 → 3 980 MB/s play;
-  1 200-byte messages 177 k → 271 k msg/s publish and 173 k → 315 k
-  msg/s play. Ingest-path allocations per message: 16 → 2 at the
-  128-byte default chunk size, 39 → 2 for a 128 KiB message at 4 096.
+  128 KiB messages 847 → 4 240 MB/s publish and 750 → 4 980 MB/s play;
+  1 200-byte messages 177 k → 252 k msg/s publish and 173 k → 250 k
+  msg/s play. Ingest-path allocations per message: 16 → 1 at the
+  128-byte default chunk size, 39 → 1 for a 128 KiB message at 4 096.
   Wire output is byte-identical.
 
 ### Fixed
@@ -85,8 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
-- `tests/interop_matrix.rs`: live black-box interop matrix against
-  `ffmpeg` on 127.0.0.1 (runtime-skipped when the tool is absent). 42
+- `tests/interop_matrix.rs`: live interop matrix against a black-box
+  RTMP tool on 127.0.0.1 (runtime-skipped when the tool is absent). 42
   tool-generated streams — H.264 with and without B-frames, 10-bit,
   4:4:4, multi-slice, intra-only, one-frame, odd sizes, 0.4 MB and
   1.8 MB frames; AAC mono / stereo / 5.1; every legacy codec the tool

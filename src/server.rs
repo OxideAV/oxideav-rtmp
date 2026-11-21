@@ -33,7 +33,7 @@ use crate::amf3;
 use crate::caps::ConnectCapabilities;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
 use crate::error::{Error, Result, StreamEnd};
-use crate::flv::{AudioTag, VideoTag, parse_audio, parse_video};
+use crate::flv::{AudioTag, VideoTag, parse_audio_owned, parse_video_owned};
 use crate::handshake::HandshakeKind;
 use crate::message::*;
 
@@ -1565,14 +1565,14 @@ impl RtmpSession {
     fn handle_message(&mut self, msg: Message) -> Result<Option<StreamPacket>> {
         match msg.msg_type_id {
             MSG_AUDIO => {
-                let tag = parse_audio(&msg.payload)?;
+                let tag = parse_audio_owned(msg.payload)?;
                 Ok(Some(StreamPacket::Audio {
                     timestamp: msg.timestamp,
                     tag,
                 }))
             }
             MSG_VIDEO => {
-                let tag = parse_video(&msg.payload)?;
+                let tag = parse_video_owned(msg.payload)?;
                 Ok(Some(StreamPacket::Video {
                     timestamp: msg.timestamp,
                     tag,

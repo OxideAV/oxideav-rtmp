@@ -39,7 +39,7 @@ use crate::client::{
     wait_for_create_stream_result,
 };
 use crate::error::{Error, Result, StreamEnd};
-use crate::flv::{AudioTag, VideoTag, parse_audio, parse_video};
+use crate::flv::{AudioTag, VideoTag, parse_audio_owned, parse_video_owned};
 use crate::handshake::HandshakeKind;
 use crate::message::*;
 use crate::server::metadata_object;
@@ -462,14 +462,14 @@ impl RtmpPlayer {
     fn handle_message(&mut self, msg: Message) -> Result<Option<PlayerPacket>> {
         match msg.msg_type_id {
             MSG_AUDIO => {
-                let tag = parse_audio(&msg.payload)?;
+                let tag = parse_audio_owned(msg.payload)?;
                 Ok(Some(PlayerPacket::Audio {
                     timestamp: msg.timestamp,
                     tag,
                 }))
             }
             MSG_VIDEO => {
-                let tag = parse_video(&msg.payload)?;
+                let tag = parse_video_owned(msg.payload)?;
                 Ok(Some(PlayerPacket::Video {
                     timestamp: msg.timestamp,
                     tag,

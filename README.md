@@ -9,6 +9,86 @@ stream to a remote server (publish client), serve subscribers
 (§4.2.1 `play`), and pull a remote stream (play client). Zero
 external dependencies, blocking-thread-per-connection.
 
+## Interop status
+
+Measured against a live black-box peer — an external command-line
+tool run as RTMP publisher, player and server — on 127.0.0.1
+(`tests/interop_matrix.rs`, skipped at runtime when the tool is not
+installed).
+
+**42 tool-generated streams × 8 directions: 334 of 334 cells pass**,
+every received elementary stream compared packet-for-packet (bytes,
+timestamps, order) with the tool's own FLV rendition of the stream.
+
+* Streams: H.264 (with and without B-frames, 10-bit, 4:4:4,
+  multi-slice, intra-only, one frame, odd sizes, 0.4 MB and 1.8 MB
+  frames), AAC mono / stereo / 5.1, Sorenson H.263, Screen Video 1 / 2,
+  MP3, PCM, G.711 A-law / µ-law, Nellymoser, ADPCM, and the Enhanced
+  RTMP family the tool writes — HEVC, AV1, VP9, Opus, FLAC, AC-3,
+  E-AC-3, multichannel configuration, `colorInfo` metadata, and
+  Multitrack (two audio tracks, two video tracks, mixed codecs) —
+  plus timestamps crossing and far beyond the 24-bit boundary and a
+  5 170-message run.
+* Directions: the tool publishes to this server; this play client
+  pulls from the tool's server (simple and digest handshake offered);
+  this publish client pushes to the tool's server (simple, digest
+  offered, and with Set Chunk Size changing every five messages); this
+  server serves the tool Aggregate Messages; and tool → this relay →
+  tool.
+* Three more live tests: a publisher killed mid-stream (the ingest
+  ends promptly, reports a lost connection, and holds an intact prefix)
+  and a late join through [`relay::LateJoinCache`] with and without the
+  group-of-pictures cache (the tool's recording is the exact tail of
+  the stream from a key frame and decodes without errors).
+
+What the outside peer could **not** verify, because it never produces
+or accepts it — covered by this crate's own loopback tests only:
+
+* the digest handshake beyond its first leg: the tool's client opens
+  with a digested C1 (detected, answered with a digested S1 and
+  chained S2, accepted) but replies with a plain-echo C2, and the
+  tool's server only speaks the simple handshake (this client falls
+  back, as designed). Chained C2 / S2 *verification* has never met an
+  outside implementation;
+* AMF3 commands and data (message types 15 / 16 / 17), Shared Objects,
+  `@clearDataFrame`, NetConnection `call`, the Reconnect Request, and
+  Abort Messages — the tool emits none of them;
+* Aggregate Messages *from* a publisher (the tool's server does not
+  take them), `ModEx` / nanosecond timestamp offsets, VVC, VP8 and
+  `avc1` FourCC video, `.mp3` / `mp4a` FourCC audio;
+* serving a multi-megabyte burst from the tool's own server: it stalls
+  near the end of an 18 MB stream (its own play client hangs on it the
+  same way), so the two `pull` cells of that one stream are left out.
+
+One open observation: with several sub-messages per aggregate at the
+very start of a stream, the tool's recorder stamps the first one to
+three frames of each track with an earlier timestamp (payload bytes
+intact; exact from then on, and exact throughout when the stream's
+first dozen frames travel one per aggregate, which is how the matrix
+cell sends them). The RTMP specification's renormalisation rule gives
+the timestamps this crate writes.
+
+## Performance
+
+`cargo bench --bench throughput` (release build, 127.0.0.1, medians;
+measured on a machine shared with other builds):
+
+| Path | Before | After |
+|------|-------:|------:|
+| publish → ingest, 128 KiB messages | 847 MB/s | 4 240 MB/s |
+| serve → play, 128 KiB messages | 750 MB/s | 4 980 MB/s |
+| publish → ingest, 1 200-byte messages | 177 k msg/s | 252 k msg/s |
+| serve → play, 1 200-byte messages | 173 k msg/s | 250 k msg/s |
+| heap allocations per ingested message, default 128-byte chunks | 16 | 1 |
+| heap allocations per ingested 128 KiB message, 4 096-byte chunks | 39 | 1 |
+
+The chunk reader goes through a 16 KiB receive buffer (one `read` per
+buffer-full instead of several per chunk) and reassembles a message
+into one exact-size allocation that then becomes the tag body; the
+chunk writer stages a message's chunks and hands them over in one
+`write` per 64 KiB. Wire output is byte-identical. Everything is
+blocking I/O on the caller's thread — no worker threads, no polling.
+
 ## Server (accept a publisher)
 
 ```rust
@@ -170,6 +250,33 @@ client.close()?;
   ingested packet. Graceful teardown on every path drains the socket
   until the peer's FIN (bounded) so the close-time RST can never
   discard in-flight final frames.
+- **Late join.** [`relay::LateJoinCache`] keeps what a subscriber
+  joining a live relay needs first — the stored data frames, each
+  track's decoder configuration (legacy sequence headers, Enhanced
+  `SequenceStart`, `MultichannelConfig`, the latest `colorInfo`), and
+  optionally the group of pictures since the last key frame within a
+  byte budget — and [`relay::KeyframeGate`] holds a newcomer's live
+  coded frames back until the first video key frame.
+- **Ends, timeouts and limits.** Every packet pump reports the end of
+  a stream as `Ok(None)`; `end_reason()` then says whether the peer
+  signalled it, closed between messages, vanished mid-message, or the
+  connection was reset ([`StreamEnd`]). Server negotiation runs under
+  a deadline (30 s by default, `RtmpServer::set_negotiation_timeout`)
+  and client / player setup steps are bounded, so a stalled peer
+  cannot pin an accept loop or a `connect`; `RtmpServer::negotiate`
+  serves applications that own their accept loop. A read timeout set
+  on a session is resumable — the chunk reader loses nothing when one
+  fires mid-message. Memory a peer can pin is bounded: partially
+  received messages share a 64 MiB budget
+  (`ChunkReader::set_max_in_flight_bytes`,
+  `set_max_message_size`), AMF reference expansion is budgeted, and
+  nested aggregates are refused.
+- **Protocol control.** Set Chunk Size is honoured in both directions
+  and can be changed mid-stream (`set_chunk_size` on the publish
+  client and the play session); Abort Messages discard the named chunk
+  stream's partial message on every surface; Window Acknowledgement
+  Size / Set Peer Bandwidth / Acknowledgement and User Control
+  PingRequest → PingResponse are handled inside the pumps.
 - **AMF0 + AMF3 command flow.** The AMF0 codec covers every
   serializable marker from the spec — Number, Boolean, String, Object,
   Null, Undefined, Reference (`0x07`), ECMA array, strict array, Date,
@@ -370,11 +477,13 @@ client.close()?;
   running count crosses each window, re-arming only after another full
   window. `ChunkReader::ack_due` is the public hook. With no window
   negotiated the obligation stays dormant.
-- **Injection-robust parser surface.** Every public decode entry point —
-  AMF0, AMF3, FLV, the chunk-stream reader, both handshake directions —
-  is fuzzed against deterministic random byte streams and
-  structurally-corrupted frames (`tests/injection_robustness.rs`).
-  Every call returns `Result`, never panics, spins, or over-allocates.
+- **Fuzzed parser surface.** Seven cargo-fuzz targets under `fuzz/`
+  (run daily): chunk-stream reassembly, handshake, AMF0, AMF3,
+  message-body decoders, FLV tags, and the whole-session state
+  machines over a loopback socket — next to the deterministic
+  random-input sweeps in `tests/injection_robustness.rs`. Every decode
+  entry point returns `Result`; none panics, spins, or allocates past
+  its budget on hostile lengths.
   `amf::MAX_DECODE_DEPTH` and `amf3::MAX_DECODE_DEPTH` (both 64) cap
   nested-container recursion before the call stack runs out.
 - **NetConnection `connect` capability negotiation.**
@@ -466,7 +575,10 @@ non-standard:
   `Message::stream_kind()` lifts `msg_stream_id` into a typed view;
   `validate_protocol_control_invariants()` enforces the §5 rule that
   protocol-control messages carry stream id 0;
-  `ChunkReader::abort_partial(csid)` applies an inbound Abort Message.
+  `ChunkReader::abort_partial(csid)` applies an inbound Abort Message
+  (the sessions call it for you). The reader buffers its input, is
+  resumable across read timeouts, and budgets partially received
+  messages; the writer hands a whole message to the stream per call.
   The writer implements the full §5.3.1.3 extended-timestamp matrix
   (December 2012 revision): the ext field rides every fmt-3 chunk —
   head or continuation — whose most recent fmt-0/1/2 chunk indicated
@@ -478,9 +590,13 @@ non-standard:
   and stream-id override. Routed end-to-end: `next_packet` /
   `poll_event` decompose incoming aggregates into the same
   `StreamPacket` the publisher would have produced individually, and
-  `RtmpClient::send_aggregate(&[Message])` is the outbound helper.
+  `RtmpClient::send_aggregate(&[Message])` /
+  `PlaySession::send_aggregate` are the outbound helpers.
+- `relay::{LateJoinCache, KeyframeGate}` — late-join state for relays.
 - `handshake::{client_handshake, server_handshake}`
 - `flv::{parse_video, build_video, parse_audio, build_audio, ModEx}`
+  (`parse_video_owned` / `parse_audio_owned` reuse the message buffer
+  as the tag body)
 - `flv_file::{FlvWriter, FlvReader, FlvTag, FlvHeaderFlags,
   build_flv_header, build_flv_tag, DEFAULT_MAX_TAG_SIZE}` — FLV file /
   byte-stream serializer + parser. `FlvWriter<W>` frames tags into the

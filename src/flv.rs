@@ -2351,6 +2351,26 @@ fn sign_extend_si24(raw: i32) -> i32 {
 /// nibble in the struct (callers decide whether to ignore the
 /// tag or fail).
 pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
+    let (mut tag, body_start) = parse_video_at(payload)?;
+    tag.body = payload[body_start..].to_vec();
+    Ok(tag)
+}
+
+/// [`parse_video`] for a payload the caller owns: the tag's `body`
+/// reuses the payload's allocation instead of copying out of it — the
+/// form the sessions use for every received video message.
+pub fn parse_video_owned(mut payload: Vec<u8>) -> Result<VideoTag> {
+    let (mut tag, body_start) = parse_video_at(&payload)?;
+    // Slide the body to the front of the buffer the message arrived
+    // in and keep that buffer, rather than copying into a fresh one.
+    payload.drain(..body_start);
+    tag.body = payload;
+    Ok(tag)
+}
+
+/// Parse everything but the body: the returned tag has an empty
+/// `body`, and the offset says where the body starts in `payload`.
+fn parse_video_at(payload: &[u8]) -> Result<(VideoTag, usize)> {
     if payload.is_empty() {
         return Err(Error::Other("FLV video tag: empty".into()));
     }
@@ -2444,17 +2464,20 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
         // body), so the outer parser only consumes the track list.
         if let Some(mt_type) = multitrack_type {
             let mt = Multitrack::parse(&payload[pos..], mt_type)?;
-            return Ok(VideoTag {
-                frame_type,
-                codec_id: 0,
-                avc_packet_type: None,
-                composition_time: 0,
-                body: Vec::new(),
-                ex_packet_type: Some(packet_type),
-                fourcc: fcc_opt,
-                mod_ex,
-                multitrack: Some(mt),
-            });
+            return Ok((
+                VideoTag {
+                    frame_type,
+                    codec_id: 0,
+                    avc_packet_type: None,
+                    composition_time: 0,
+                    body: Vec::new(),
+                    ex_packet_type: Some(packet_type),
+                    fourcc: fcc_opt,
+                    mod_ex,
+                    multitrack: Some(mt),
+                },
+                payload.len(),
+            ));
         }
 
         // SI24 CompositionTime is on the wire only for the
@@ -2495,17 +2518,20 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
             (0, pos)
         };
 
-        Ok(VideoTag {
-            frame_type,
-            codec_id: 0, // reserved in extended mode; legacy nibble unused.
-            avc_packet_type: None,
-            composition_time: cts,
-            body: payload[body_start..].to_vec(),
-            ex_packet_type: Some(packet_type),
-            fourcc: Some(fcc),
-            mod_ex,
-            multitrack: None,
-        })
+        Ok((
+            VideoTag {
+                frame_type,
+                codec_id: 0, // reserved in extended mode; legacy nibble unused.
+                avc_packet_type: None,
+                composition_time: cts,
+                body: Vec::new(),
+                ex_packet_type: Some(packet_type),
+                fourcc: Some(fcc),
+                mod_ex,
+                multitrack: None,
+            },
+            body_start,
+        ))
     } else {
         // --- Legacy pre-2023 framing ---
         let frame_type = b0 >> 4;
@@ -2517,17 +2543,20 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
             // AVC packet-type + SI24 CTS prefix is absent even when
             // CodecID == 7. Keep the command byte in `body[0]` so
             // [`VideoTag::video_command`] lifts it.
-            Ok(VideoTag {
-                frame_type,
-                codec_id,
-                avc_packet_type: None,
-                composition_time: 0,
-                body: payload[1..].to_vec(),
-                ex_packet_type: None,
-                fourcc: None,
-                mod_ex: Vec::new(),
-                multitrack: None,
-            })
+            Ok((
+                VideoTag {
+                    frame_type,
+                    codec_id,
+                    avc_packet_type: None,
+                    composition_time: 0,
+                    body: Vec::new(),
+                    ex_packet_type: None,
+                    fourcc: None,
+                    mod_ex: Vec::new(),
+                    multitrack: None,
+                },
+                1,
+            ))
         } else if codec_id == VIDEO_CODEC_AVC {
             if payload.len() < 5 {
                 return Err(Error::Other("FLV/AVC tag: need 5+ bytes".into()));
@@ -2535,29 +2564,35 @@ pub fn parse_video(payload: &[u8]) -> Result<VideoTag> {
             let apt = payload[1];
             let cts_raw =
                 ((payload[2] as i32) << 16) | ((payload[3] as i32) << 8) | (payload[4] as i32);
-            Ok(VideoTag {
-                frame_type,
-                codec_id,
-                avc_packet_type: Some(apt),
-                composition_time: sign_extend_si24(cts_raw),
-                body: payload[5..].to_vec(),
-                ex_packet_type: None,
-                fourcc: None,
-                mod_ex: Vec::new(),
-                multitrack: None,
-            })
+            Ok((
+                VideoTag {
+                    frame_type,
+                    codec_id,
+                    avc_packet_type: Some(apt),
+                    composition_time: sign_extend_si24(cts_raw),
+                    body: Vec::new(),
+                    ex_packet_type: None,
+                    fourcc: None,
+                    mod_ex: Vec::new(),
+                    multitrack: None,
+                },
+                5,
+            ))
         } else {
-            Ok(VideoTag {
-                frame_type,
-                codec_id,
-                avc_packet_type: None,
-                composition_time: 0,
-                body: payload[1..].to_vec(),
-                ex_packet_type: None,
-                fourcc: None,
-                mod_ex: Vec::new(),
-                multitrack: None,
-            })
+            Ok((
+                VideoTag {
+                    frame_type,
+                    codec_id,
+                    avc_packet_type: None,
+                    composition_time: 0,
+                    body: Vec::new(),
+                    ex_packet_type: None,
+                    fourcc: None,
+                    mod_ex: Vec::new(),
+                    multitrack: None,
+                },
+                1,
+            ))
         }
     }
 }
@@ -3064,6 +3099,26 @@ impl AudioTag {
 /// | trackId(UI8) | (sizeOfAudioTrack(UI24) if not OneTrack) | body`)
 /// is decoded into [`AudioTag::multitrack`].
 pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
+    let (mut tag, body_start) = parse_audio_at(payload)?;
+    tag.body = payload[body_start..].to_vec();
+    Ok(tag)
+}
+
+/// [`parse_audio`] for a payload the caller owns: the tag's `body`
+/// reuses the payload's allocation instead of copying out of it — the
+/// form the sessions use for every received audio message.
+pub fn parse_audio_owned(mut payload: Vec<u8>) -> Result<AudioTag> {
+    let (mut tag, body_start) = parse_audio_at(&payload)?;
+    // Slide the body to the front of the buffer the message arrived
+    // in and keep that buffer, rather than copying into a fresh one.
+    payload.drain(..body_start);
+    tag.body = payload;
+    Ok(tag)
+}
+
+/// Parse everything but the body: the returned tag has an empty
+/// `body`, and the offset says where the body starts in `payload`.
+fn parse_audio_at(payload: &[u8]) -> Result<(AudioTag, usize)> {
     if payload.is_empty() {
         return Err(Error::Other("FLV audio tag: empty".into()));
     }
@@ -3150,33 +3205,39 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
 
         if let Some(mt_type) = multitrack_type {
             let mt = Multitrack::parse(&payload[pos..], mt_type)?;
-            return Ok(AudioTag {
+            return Ok((
+                AudioTag {
+                    sound_format,
+                    sound_rate: 0,
+                    sound_size_16bit: false,
+                    stereo: false,
+                    aac_packet_type: None,
+                    ex_packet_type: Some(packet_type),
+                    audio_fourcc: fcc_opt,
+                    body: Vec::new(),
+                    mod_ex,
+                    multitrack: Some(mt),
+                },
+                payload.len(),
+            ));
+        }
+
+        let fcc = fcc_opt.expect("non-Multitrack audio tag requires shared FourCC slot");
+        Ok((
+            AudioTag {
                 sound_format,
                 sound_rate: 0,
                 sound_size_16bit: false,
                 stereo: false,
                 aac_packet_type: None,
                 ex_packet_type: Some(packet_type),
-                audio_fourcc: fcc_opt,
+                audio_fourcc: Some(fcc),
                 body: Vec::new(),
                 mod_ex,
-                multitrack: Some(mt),
-            });
-        }
-
-        let fcc = fcc_opt.expect("non-Multitrack audio tag requires shared FourCC slot");
-        Ok(AudioTag {
-            sound_format,
-            sound_rate: 0,
-            sound_size_16bit: false,
-            stereo: false,
-            aac_packet_type: None,
-            ex_packet_type: Some(packet_type),
-            audio_fourcc: Some(fcc),
-            body: payload[pos..].to_vec(),
-            mod_ex,
-            multitrack: None,
-        })
+                multitrack: None,
+            },
+            pos,
+        ))
     } else {
         // --- Legacy pre-2023 framing ---
         let sound_rate = (b0 >> 2) & 0x03;
@@ -3186,31 +3247,37 @@ pub fn parse_audio(payload: &[u8]) -> Result<AudioTag> {
             if payload.len() < 2 {
                 return Err(Error::Other("FLV/AAC tag: need 2+ bytes".into()));
             }
-            Ok(AudioTag {
-                sound_format,
-                sound_rate,
-                sound_size_16bit,
-                stereo,
-                aac_packet_type: Some(payload[1]),
-                ex_packet_type: None,
-                audio_fourcc: None,
-                body: payload[2..].to_vec(),
-                mod_ex: Vec::new(),
-                multitrack: None,
-            })
+            Ok((
+                AudioTag {
+                    sound_format,
+                    sound_rate,
+                    sound_size_16bit,
+                    stereo,
+                    aac_packet_type: Some(payload[1]),
+                    ex_packet_type: None,
+                    audio_fourcc: None,
+                    body: Vec::new(),
+                    mod_ex: Vec::new(),
+                    multitrack: None,
+                },
+                2,
+            ))
         } else {
-            Ok(AudioTag {
-                sound_format,
-                sound_rate,
-                sound_size_16bit,
-                stereo,
-                aac_packet_type: None,
-                ex_packet_type: None,
-                audio_fourcc: None,
-                body: payload[1..].to_vec(),
-                mod_ex: Vec::new(),
-                multitrack: None,
-            })
+            Ok((
+                AudioTag {
+                    sound_format,
+                    sound_rate,
+                    sound_size_16bit,
+                    stereo,
+                    aac_packet_type: None,
+                    ex_packet_type: None,
+                    audio_fourcc: None,
+                    body: Vec::new(),
+                    mod_ex: Vec::new(),
+                    multitrack: None,
+                },
+                1,
+            ))
         }
     }
 }
