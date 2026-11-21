@@ -26,15 +26,16 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::aggregate::parse_aggregate;
 use crate::amf::{self, Amf0Value};
 use crate::amf3;
 use crate::caps::ConnectCapabilities;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, StreamEnd};
 use crate::flv::{AudioTag, VideoTag, parse_audio, parse_video};
+use crate::handshake::HandshakeKind;
 use crate::message::*;
 
 /// After-connect server chunk size. Larger = fewer chunk headers per
@@ -56,7 +57,15 @@ pub struct RtmpServer {
     /// the pre-2023 byte layout exactly. Mutate with
     /// [`set_capabilities`](Self::set_capabilities).
     capabilities: ConnectCapabilities,
+    /// Deadline for a connection to get from TCP accept to its
+    /// `publish` / `play` command.
+    negotiation_timeout: Option<Duration>,
 }
+
+/// Default time a freshly accepted connection gets to complete the
+/// handshake and reach its `publish` / `play` command — see
+/// [`RtmpServer::set_negotiation_timeout`].
+pub const DEFAULT_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl RtmpServer {
     pub fn bind(addr: impl ToSocketAddrs) -> Result<Self> {
@@ -64,7 +73,28 @@ impl RtmpServer {
         Ok(Self {
             listener,
             capabilities: ConnectCapabilities::default(),
+            negotiation_timeout: Some(DEFAULT_NEGOTIATION_TIMEOUT),
         })
+    }
+
+    /// Bound how long one connection may take to get from TCP accept
+    /// through the handshake, `connect` and `createStream` to its
+    /// `publish` / `play` command. A peer that connects and then
+    /// stalls (or drips bytes) is dropped once the deadline passes
+    /// instead of pinning [`accept`](Self::accept) /
+    /// [`accept_any`](Self::accept_any) — or a
+    /// [`serve_sessions`](Self::serve_sessions) thread — forever.
+    /// Default [`DEFAULT_NEGOTIATION_TIMEOUT`]; `None` waits without
+    /// limit. The deadline covers negotiation only: an accepted
+    /// session has no read timeout until the caller sets one.
+    pub fn set_negotiation_timeout(&mut self, timeout: Option<Duration>) -> &mut Self {
+        self.negotiation_timeout = timeout;
+        self
+    }
+
+    /// The current negotiation deadline.
+    pub fn negotiation_timeout(&self) -> Option<Duration> {
+        self.negotiation_timeout
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -127,7 +157,12 @@ impl RtmpServer {
             // server — log via Err(...) once, then keep listening. A
             // caller that wants fine-grained control uses `incoming()`
             // plus their own handshake.
-            match drive_until_request(stream, peer_addr, &self.capabilities) {
+            match drive_until_request(
+                stream,
+                peer_addr,
+                &self.capabilities,
+                self.negotiation_timeout,
+            ) {
                 Ok(req) => return Ok(req),
                 Err(e) => {
                     eprintln!("oxideav-rtmp: dropped connection from {peer_addr}: {e}");
@@ -179,6 +214,7 @@ impl RtmpServer {
         use std::sync::Arc;
         let handler = Arc::new(handler);
         let caps = Arc::new(self.capabilities.clone());
+        let timeout = self.negotiation_timeout;
         for conn in self.listener.incoming() {
             let stream = match conn {
                 Ok(s) => s,
@@ -195,12 +231,14 @@ impl RtmpServer {
             let c = caps.clone();
             thread::Builder::new()
                 .name(format!("oxideav-rtmp-session-{peer_addr}"))
-                .spawn(move || match drive_until_request(stream, peer_addr, &c) {
-                    Ok(req) => h(req),
-                    Err(e) => {
-                        eprintln!("oxideav-rtmp: dropped connection from {peer_addr}: {e}");
-                    }
-                })
+                .spawn(
+                    move || match drive_until_request(stream, peer_addr, &c, timeout) {
+                        Ok(req) => h(req),
+                        Err(e) => {
+                            eprintln!("oxideav-rtmp: dropped connection from {peer_addr}: {e}");
+                        }
+                    },
+                )
                 .map_err(|e| Error::Other(format!("spawn session thread: {e}")))?;
         }
         Ok(())
@@ -250,6 +288,7 @@ struct PendingSession {
     reader: ChunkReader<TcpStream>,
     writer: ChunkWriter<TcpStream>,
     stream_id: u32,
+    handshake_kind: HandshakeKind,
     /// Kept in the struct so a future "send _result for publish"
     /// tweak can reference the right tx id. Currently we skip the
     /// _result and go straight to onStatus.
@@ -258,6 +297,13 @@ struct PendingSession {
 }
 
 impl PublishRequest {
+    /// Which handshake the peer negotiated — the plain echo exchange
+    /// or the digest (HMAC-SHA256) one, and for the latter whether the
+    /// peer's response digest verified.
+    pub fn handshake_kind(&self) -> HandshakeKind {
+        self.pending.handshake_kind
+    }
+
     /// Take the stream: send `NetStream.Publish.Start` and return a
     /// session the caller pumps via [`RtmpSession::next_packet`].
     pub fn accept(self) -> Result<RtmpSession> {
@@ -275,6 +321,7 @@ impl PublishRequest {
             reader,
             mut writer,
             stream_id,
+            handshake_kind,
             publish_tx_id: _,
         } = pending;
 
@@ -303,6 +350,8 @@ impl PublishRequest {
             peer_addr,
             stream_id,
             ended: false,
+            end: None,
+            handshake_kind,
             pending_subs: VecDeque::new(),
             peer_bw: PeerBandwidthLimiter::new(),
             data_frames: Vec::new(),
@@ -365,6 +414,13 @@ pub struct PlayRequest {
 }
 
 impl PlayRequest {
+    /// Which handshake the peer negotiated — the plain echo exchange
+    /// or the digest (HMAC-SHA256) one, and for the latter whether the
+    /// peer's response digest verified.
+    pub fn handshake_kind(&self) -> HandshakeKind {
+        self.pending.handshake_kind
+    }
+
     /// Serve the subscriber a **live** stream: run the §4.2.1
     /// Figure 5 acceptance sequence — `UserControl StreamBegin`,
     /// `onStatus(NetStream.Play.Reset)` (only when the peer's play
@@ -405,6 +461,7 @@ impl PlayRequest {
             reader,
             mut writer,
             stream_id,
+            handshake_kind,
             publish_tx_id: _,
         } = pending;
 
@@ -451,6 +508,8 @@ impl PlayRequest {
             peer_addr,
             stream_id,
             ended: false,
+            end: None,
+            handshake_kind,
             pending_subs: VecDeque::new(),
             peer_bw: PeerBandwidthLimiter::new(),
         })
@@ -531,6 +590,8 @@ pub struct PlaySession {
     peer_addr: SocketAddr,
     stream_id: u32,
     ended: bool,
+    end: Option<StreamEnd>,
+    handshake_kind: HandshakeKind,
     /// Sub-messages decomposed out of an Aggregate Message (type 22)
     /// per RTMP 1.0 §7.1.6 but not yet dispatched.
     pending_subs: VecDeque<Message>,
@@ -540,6 +601,19 @@ pub struct PlaySession {
 }
 
 impl PlaySession {
+    /// Why the receive side stopped, once the packet pump has
+    /// returned `Ok(None)`: a protocol-level end, an orderly TCP close
+    /// between messages, a mid-message truncation, or a reset
+    /// connection. `None` while the stream is still live.
+    pub fn end_reason(&self) -> Option<StreamEnd> {
+        self.end
+    }
+
+    /// Which handshake the peer negotiated.
+    pub fn handshake_kind(&self) -> HandshakeKind {
+        self.handshake_kind
+    }
+
     pub fn app(&self) -> &str {
         &self.app
     }
@@ -771,20 +845,14 @@ impl PlaySession {
             }
             let msg = match self.reader.read_message() {
                 Ok(m) => m,
-                Err(Error::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    self.ended = true;
-                    return Ok(None);
-                }
-                Err(Error::UnexpectedEof) => {
-                    self.ended = true;
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
+                Err(e) => match crate::error::read_end(&e, self.reader.is_idle()) {
+                    Some(end) => {
+                        self.ended = true;
+                        self.end = Some(end);
+                        return Ok(None);
+                    }
+                    None => return Err(e),
+                },
             };
             self.maybe_send_ack()?;
             if let Some(ev) = self.handle_event_message(msg)? {
@@ -829,6 +897,13 @@ impl PlaySession {
                 self.reader.set_chunk_size(size as usize);
                 Ok(None)
             }
+            MSG_ABORT => {
+                // §5.4.2: discard the partially received message on
+                // the named chunk stream.
+                let csid = read_u32_be(&msg.payload)?;
+                self.reader.abort_partial(csid);
+                Ok(None)
+            }
             MSG_WINDOW_ACK_SIZE => {
                 let size = read_u32_be(&msg.payload)?;
                 self.reader.set_window_ack_size(size);
@@ -868,6 +943,7 @@ impl PlaySession {
                 // The server does not send any response." The §7.2.1
                 // NetConnection `close` ends the session the same way.
                 self.ended = true;
+                self.end = Some(StreamEnd::Signalled);
                 return Ok(None);
             }
             if let Some(cmd) = NetStreamCommand::parse(values)? {
@@ -991,6 +1067,8 @@ pub struct RtmpSession {
     peer_addr: SocketAddr,
     stream_id: u32,
     ended: bool,
+    end: Option<StreamEnd>,
+    handshake_kind: HandshakeKind,
     /// Sub-messages decomposed out of an Aggregate Message (type 22)
     /// per RTMP 1.0 §7.1.6 but not yet surfaced as a [`StreamPacket`].
     /// When [`next_packet`](Self::next_packet) sees a `MSG_AGGREGATE`
@@ -1082,6 +1160,19 @@ pub enum StreamPacket {
 }
 
 impl RtmpSession {
+    /// Why the receive side stopped, once the packet pump has
+    /// returned `Ok(None)`: a protocol-level end, an orderly TCP close
+    /// between messages, a mid-message truncation, or a reset
+    /// connection. `None` while the stream is still live.
+    pub fn end_reason(&self) -> Option<StreamEnd> {
+        self.end
+    }
+
+    /// Which handshake the peer negotiated.
+    pub fn handshake_kind(&self) -> HandshakeKind {
+        self.handshake_kind
+    }
+
     pub fn app(&self) -> &str {
         &self.app
     }
@@ -1254,8 +1345,11 @@ impl RtmpSession {
     }
 
     /// Read the next audio / video / metadata packet from the
-    /// publisher. Returns `Ok(None)` when the peer cleanly closed the
-    /// stream (via `closeStream` / `deleteStream` / `FCUnpublish`).
+    /// publisher. Returns `Ok(None)` once the stream is over: the peer
+    /// closed it at the protocol level (`closeStream` / `deleteStream`
+    /// / `FCUnpublish`), or the connection ended — orderly, truncated
+    /// mid-message, or reset. [`end_reason`](Self::end_reason) tells
+    /// these apart.
     ///
     /// Aggregate Messages (RTMP 1.0 §7.1.6, message type id `22`) are
     /// decomposed transparently: the sub-messages enter an internal
@@ -1276,15 +1370,14 @@ impl RtmpSession {
             }
             let msg = match self.reader.read_message() {
                 Ok(m) => m,
-                Err(Error::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
+                Err(e) => match crate::error::read_end(&e, self.reader.is_idle()) {
+                    Some(end) => {
+                        self.ended = true;
+                        self.end = Some(end);
+                        return Ok(None);
+                    }
+                    None => return Err(e),
+                },
             };
             // §5.3: once the publisher has sent a full window of bytes,
             // owe it an Acknowledgement carrying the running sequence
@@ -1471,6 +1564,13 @@ impl RtmpSession {
                 self.reader.set_chunk_size(size as usize);
                 Ok(None)
             }
+            MSG_ABORT => {
+                // §5.4.2: discard the partially received message on
+                // the named chunk stream.
+                let csid = read_u32_be(&msg.payload)?;
+                self.reader.abort_partial(csid);
+                Ok(None)
+            }
             MSG_WINDOW_ACK_SIZE => {
                 // §5.5: the peer is telling us which window size to use
                 // when sending Acknowledgements. Honour it so our §5.3
@@ -1493,9 +1593,24 @@ impl RtmpSession {
                 }
                 Ok(None)
             }
-            MSG_ACK | MSG_USER_CONTROL => {
-                // Informational — the peer's §5.3 sequence number (ACK)
-                // or a user-control event we don't surface as a packet.
+            MSG_USER_CONTROL => {
+                // §7.1.7: answer a PingRequest with a PingResponse
+                // carrying the same timestamp, so a publisher probing
+                // liveness / round-trip time gets its echo. Other
+                // user-control events are not surfaced as packets.
+                if let Ok(UserControlEvent::PingRequest { timestamp_ms }) =
+                    UserControlEvent::parse(&msg.payload)
+                {
+                    self.writer.write_message(
+                        CSID_PROTOCOL_CONTROL,
+                        &build_user_control_ping_response(timestamp_ms),
+                    )?;
+                    self.writer.flush()?;
+                }
+                Ok(None)
+            }
+            MSG_ACK => {
+                // Informational — the peer's §5.3 sequence number.
                 Ok(None)
             }
             _ => {
@@ -1522,6 +1637,7 @@ impl RtmpSession {
                 // NetConnection `close` all end the session; none get
                 // a response.
                 self.ended = true;
+                self.end = Some(StreamEnd::Signalled);
                 return Ok(None);
             }
             if let Some(cmd) = NetStreamCommand::parse(values)? {
@@ -1603,6 +1719,43 @@ fn drive_until_request(
     stream: TcpStream,
     peer_addr: SocketAddr,
     server_caps: &ConnectCapabilities,
+    timeout: Option<Duration>,
+) -> Result<SessionRequest> {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    arm_deadline(&stream, deadline)?;
+    let req = negotiate(stream, peer_addr, server_caps, deadline)
+        .map_err(crate::error::timeout_to_error)?;
+    // The deadline covers negotiation only: hand the session over
+    // with blocking reads / writes, as before.
+    let sock = match &req {
+        SessionRequest::Publish(r) => &r.pending.stream,
+        SessionRequest::Play(r) => &r.pending.stream,
+    };
+    sock.set_read_timeout(None)?;
+    sock.set_write_timeout(None)?;
+    Ok(req)
+}
+
+/// Point the socket's read / write timeouts at the time left until
+/// `deadline`; [`Error::Timeout`] once it has passed.
+fn arm_deadline(stream: &TcpStream, deadline: Option<Instant>) -> Result<()> {
+    let Some(deadline) = deadline else {
+        return Ok(());
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(Error::Timeout);
+    }
+    stream.set_read_timeout(Some(left))?;
+    stream.set_write_timeout(Some(left))?;
+    Ok(())
+}
+
+fn negotiate(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    server_caps: &ConnectCapabilities,
+    deadline: Option<Instant>,
 ) -> Result<SessionRequest> {
     // TCP-level defaults: nodelay (RTMP is command-heavy during setup),
     // keepalive so idle publishers are detected.
@@ -1611,7 +1764,7 @@ fn drive_until_request(
     // Run the handshake on a plain clone of the stream (no chunk state
     // yet).
     let mut hs_stream = stream.try_clone()?;
-    crate::handshake::server_handshake(&mut hs_stream)?;
+    let handshake_kind = crate::handshake::server_handshake_negotiated(&mut hs_stream)?;
 
     // Reader / writer share the same TCP stream via `try_clone`.
     let reader_stream = stream.try_clone()?;
@@ -1625,11 +1778,18 @@ fn drive_until_request(
     let app;
     let client_capabilities;
     loop {
+        arm_deadline(&stream, deadline)?;
         let msg = reader.read_message()?;
         match msg.msg_type_id {
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 reader.set_chunk_size(size as usize);
+            }
+            MSG_ABORT => {
+                // §5.4.2: discard the partially received message on
+                // the named chunk stream.
+                let csid = read_u32_be(&msg.payload)?;
+                reader.abort_partial(csid);
             }
             MSG_WINDOW_ACK_SIZE => {
                 let size = read_u32_be(&msg.payload)?;
@@ -1722,11 +1882,19 @@ fn drive_until_request(
     // can honour the subscriber's requested buffer depth.
     let mut buffer_length_ms: Option<u32> = None;
     loop {
+        arm_deadline(&stream, deadline)?;
         let msg = reader.read_message()?;
         match msg.msg_type_id {
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 reader.set_chunk_size(size as usize);
+                continue;
+            }
+            MSG_ABORT => {
+                // §5.4.2: discard the partially received message on
+                // the named chunk stream.
+                let csid = read_u32_be(&msg.payload)?;
+                reader.abort_partial(csid);
                 continue;
             }
             MSG_WINDOW_ACK_SIZE => {
@@ -1815,6 +1983,7 @@ fn drive_until_request(
                                 reader,
                                 writer,
                                 stream_id: msg.msg_stream_id.max(1),
+                                handshake_kind,
                                 publish_tx_id: tx_id,
                             },
                         }));
@@ -1851,6 +2020,7 @@ fn drive_until_request(
                                 reader,
                                 writer,
                                 stream_id: msg.msg_stream_id.max(1),
+                                handshake_kind,
                                 publish_tx_id: tx_id,
                             },
                         }));

@@ -39,7 +39,7 @@ use crate::client::{
     CLIENT_CHUNK_SIZE, FLASH_VER, RtmpUrl, extract_server_caps, read_u32_be,
     wait_for_create_stream_result,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, StreamEnd};
 use crate::flv::{AudioTag, VideoTag, parse_audio, parse_video};
 use crate::handshake::HandshakeKind;
 use crate::message::*;
@@ -179,6 +179,7 @@ pub struct RtmpPlayer {
     /// Latched once the server signals end-of-stream (`UserControl
     /// StreamEOF` per §7.1.7, or TCP EOF).
     ended: bool,
+    end: Option<StreamEnd>,
     /// True once the server has announced `StreamIsRecorded` (§3.7
     /// UCM 4) for the play stream.
     is_recorded: bool,
@@ -217,7 +218,17 @@ impl RtmpPlayer {
             .ok_or_else(|| Error::Other(format!("resolved no addresses for {}", u.host)))?;
         let stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(15))?;
         let _ = stream.set_nodelay(true);
+        // Bound the whole setup exchange: a server that accepts the
+        // TCP connection and then stalls must not wedge the caller.
+        stream.set_read_timeout(Some(crate::client::SETUP_TIMEOUT))?;
+        stream.set_write_timeout(Some(crate::client::SETUP_TIMEOUT))?;
+        let player = Self::setup(stream, u, opts).map_err(crate::error::timeout_to_error)?;
+        player.stream.set_read_timeout(None)?;
+        player.stream.set_write_timeout(None)?;
+        Ok(player)
+    }
 
+    fn setup(stream: TcpStream, u: RtmpUrl, opts: &PlayOptions) -> Result<Self> {
         let mut hs = stream.try_clone()?;
         let handshake_kind = if opts.digest_handshake {
             crate::handshake::client_handshake_digest(
@@ -287,12 +298,22 @@ impl RtmpPlayer {
             stream_name: u.stream_name,
             server_caps,
             ended: false,
+            end: None,
             is_recorded,
             pending_subs: VecDeque::new(),
             peer_bw: PeerBandwidthLimiter::new(),
             next_tx: 10.0,
             handshake_kind,
         })
+    }
+
+    /// Why the receive side stopped, once
+    /// [`next_packet`](Self::next_packet) has returned `Ok(None)`: the
+    /// server's `StreamEOF`, an orderly TCP close between messages, a
+    /// mid-message truncation, or a reset connection (after which the
+    /// tail of the stream may be missing). `None` while live.
+    pub fn end_reason(&self) -> Option<StreamEnd> {
+        self.end
     }
 
     /// Which handshake flavour the connection settled on
@@ -419,20 +440,14 @@ impl RtmpPlayer {
             }
             let msg = match self.reader.read_message() {
                 Ok(m) => m,
-                Err(Error::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    self.ended = true;
-                    return Ok(None);
-                }
-                Err(Error::UnexpectedEof) => {
-                    self.ended = true;
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
+                Err(e) => match crate::error::read_end(&e, self.reader.is_idle()) {
+                    Some(end) => {
+                        self.ended = true;
+                        self.end = Some(end);
+                        return Ok(None);
+                    }
+                    None => return Err(e),
+                },
             };
             // §5.3: a playing client receives the bulk of the byte
             // flow, so the ack obligation matters here even more than
@@ -485,6 +500,7 @@ impl RtmpPlayer {
                     // §7.1.7: playback is over as requested. Latch and
                     // report the clean end.
                     self.ended = true;
+                    self.end = Some(StreamEnd::Signalled);
                     Ok(None)
                 }
                 UserControlEvent::PingRequest { timestamp_ms } => {
@@ -504,6 +520,13 @@ impl RtmpPlayer {
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 self.reader.set_chunk_size(size as usize);
+                Ok(None)
+            }
+            MSG_ABORT => {
+                // §5.4.2: discard the partially received message on
+                // the named chunk stream.
+                let csid = read_u32_be(&msg.payload)?;
+                self.reader.abort_partial(csid);
                 Ok(None)
             }
             MSG_WINDOW_ACK_SIZE => {
@@ -759,6 +782,10 @@ fn wait_for_play_start<R: Read, W: Write>(
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 reader.set_chunk_size(size as usize);
+            }
+            MSG_ABORT => {
+                let csid = read_u32_be(&msg.payload)?;
+                reader.abort_partial(csid);
             }
             MSG_WINDOW_ACK_SIZE => {
                 let size = read_u32_be(&msg.payload)?;

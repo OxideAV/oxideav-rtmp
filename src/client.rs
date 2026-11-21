@@ -25,7 +25,7 @@ use crate::amf::{self, Amf0Value};
 use crate::amf3;
 use crate::caps::ConnectCapabilities;
 use crate::chunk::{ChunkReader, ChunkWriter, Message};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, StreamEnd};
 use crate::flv::{self, AudioTag, VideoTag};
 use crate::handshake::HandshakeKind;
 use crate::message::*;
@@ -147,6 +147,11 @@ pub enum ClientEvent {
 }
 
 pub(crate) const CLIENT_CHUNK_SIZE: u32 = 4096;
+
+/// Deadline for each blocking step of a client-side connection setup
+/// (handshake, `connect`, `createStream`, `publish` / `play`). Cleared
+/// once the session is established.
+pub(crate) const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const FLASH_VER: &str = "FMLE/3.0 (compatible; oxideav-rtmp)";
 
 pub struct RtmpClient {
@@ -167,6 +172,10 @@ pub struct RtmpClient {
     /// normally sends `StreamEOF` *first* then a trailing onStatus, so
     /// `poll_event` keeps reading until the kernel reports EOF.
     read_eof: bool,
+    end: Option<StreamEnd>,
+    /// The server announced `StreamEOF`; the TCP close that follows is
+    /// then the tail of a protocol-level end.
+    saw_stream_eof: bool,
     /// Enhanced RTMP capability block lifted from the server's
     /// `_result(connect)` info object. Empty when the server didn't
     /// advertise any v1+v2 capabilities (the historical pre-2023
@@ -304,6 +313,15 @@ impl RtmpClient {
         Self::connect_parsed(&parsed, publish_type, caps, true)
     }
 
+    /// Why the receive side stopped, once
+    /// [`poll_event`](Self::poll_event) has returned `Ok(None)`:
+    /// [`StreamEnd::Signalled`] when the server announced `StreamEOF`
+    /// before closing, otherwise how the TCP connection ended. `None`
+    /// while live.
+    pub fn end_reason(&self) -> Option<StreamEnd> {
+        self.end
+    }
+
     /// Which handshake flavour the connection settled on
     /// ([`HandshakeKind::Simple`] unless the client was built via
     /// [`connect_with_digest_handshake`](Self::connect_with_digest_handshake)
@@ -366,7 +384,24 @@ impl RtmpClient {
             .ok_or_else(|| Error::Other(format!("resolved no addresses for {}", u.host)))?;
         let stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(15))?;
         let _ = stream.set_nodelay(true);
+        // Bound the whole setup exchange: a server that accepts the
+        // TCP connection and then stalls must not wedge the caller.
+        stream.set_read_timeout(Some(SETUP_TIMEOUT))?;
+        stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
+        let client = Self::setup(stream, u, publish_type, caps, digest_handshake)
+            .map_err(crate::error::timeout_to_error)?;
+        client.stream.set_read_timeout(None)?;
+        client.stream.set_write_timeout(None)?;
+        Ok(client)
+    }
 
+    fn setup(
+        stream: TcpStream,
+        u: &RtmpUrl,
+        publish_type: &str,
+        caps: &ConnectCapabilities,
+        digest_handshake: bool,
+    ) -> Result<Self> {
         // Handshake on a fresh clone — no chunk state is shared with
         // it.
         let mut hs = stream.try_clone()?;
@@ -445,6 +480,8 @@ impl RtmpClient {
             stream_id,
             next_tx: 10.0,
             read_eof: false,
+            end: None,
+            saw_stream_eof: false,
             server_caps,
             tc_url: u.tc_url.clone(),
             pending_subs: VecDeque::new(),
@@ -828,20 +865,18 @@ impl RtmpClient {
             }
             let msg = match self.reader.read_message() {
                 Ok(m) => m,
-                Err(Error::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    self.read_eof = true;
-                    return Ok(None);
-                }
-                Err(Error::UnexpectedEof) => {
-                    self.read_eof = true;
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
+                Err(e) => match crate::error::read_end(&e, self.reader.is_idle()) {
+                    Some(end) => {
+                        self.read_eof = true;
+                        self.end = Some(if self.saw_stream_eof && end == StreamEnd::PeerClosed {
+                            StreamEnd::Signalled
+                        } else {
+                            end
+                        });
+                        return Ok(None);
+                    }
+                    None => return Err(e),
+                },
             };
             // §5.3: acknowledge once the server has sent a full window
             // of bytes since our last ack (window set by the server's
@@ -870,6 +905,13 @@ impl RtmpClient {
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 self.reader.set_chunk_size(size as usize);
+                Ok(ClientEvent::Other)
+            }
+            MSG_ABORT => {
+                // §5.4.2: discard the partially received message on
+                // the named chunk stream.
+                let csid = read_u32_be(&msg.payload)?;
+                self.reader.abort_partial(csid);
                 Ok(ClientEvent::Other)
             }
             MSG_WINDOW_ACK_SIZE => {
@@ -913,6 +955,7 @@ impl RtmpClient {
                         // StreamEOF, then half-closes; we let the
                         // subsequent read drain those and report EOF
                         // naturally.
+                        self.saw_stream_eof = true;
                         Ok(ClientEvent::StreamEof { stream_id: sid })
                     }
                     USR_STREAM_DRY => {
@@ -1172,6 +1215,10 @@ pub(crate) fn wait_for_result<R: Read, W: Write>(
             MSG_SET_CHUNK_SIZE => {
                 let size = read_u32_be(&msg.payload)? & 0x7FFF_FFFF;
                 reader.set_chunk_size(size as usize);
+            }
+            MSG_ABORT => {
+                let csid = read_u32_be(&msg.payload)?;
+                reader.abort_partial(csid);
             }
             MSG_WINDOW_ACK_SIZE => {
                 // §5.5: capture the server's window during setup so the

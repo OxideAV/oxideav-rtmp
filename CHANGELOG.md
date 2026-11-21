@@ -24,6 +24,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Abort Message (RTMP 1.0 §5.4.2, type 2) was ignored by every
+  session: the message was reassembled and dropped, so a peer that
+  abandoned a message and continued on the same chunk stream with a
+  Type 3 chunk had the new message spliced onto the abandoned one and
+  the chunk stream desynchronised. All four surfaces (and the setup
+  loops) now discard the named chunk stream's partial message.
+- The ingest session (`RtmpSession`) never answered a User Control
+  `PingRequest` (§7.1.7), so `RtmpClient::send_ping_request` got no
+  echo from this crate's own server. It now replies with the matching
+  `PingResponse`.
+- A peer that opened a TCP connection and then stalled — before,
+  during or after the handshake — pinned `RtmpServer::accept` /
+  `accept_any` (and leaked a `serve_sessions` thread) forever, blocking
+  every later connection on a single-threaded accept loop. Negotiation
+  now runs under a deadline (`DEFAULT_NEGOTIATION_TIMEOUT`, 30 s;
+  `RtmpServer::set_negotiation_timeout`). `RtmpClient` / `RtmpPlayer`
+  bound each blocking step of their own setup the same way and return
+  `Error::Timeout` instead of hanging on a silent server.
+- `RtmpSession::next_packet` kept re-reading the socket after an
+  end-of-file instead of latching the end.
 - `ChunkReader`: a socket read timeout (`WouldBlock` / `TimedOut`) in
   the middle of a chunk header or payload no longer loses the bytes
   already consumed — the next `read_message` resumes where the failed
@@ -35,6 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `StreamEnd` + `end_reason()` on `RtmpSession`, `PlaySession`,
+  `RtmpPlayer` and `RtmpClient`: once a packet pump has returned
+  `Ok(None)` it tells a protocol-level end (`Signalled`) from an
+  orderly TCP close between messages (`PeerClosed`), a close in the
+  middle of a message (`Truncated`) and a reset connection
+  (`ConnectionReset`). The pumps reported all four as the same
+  `Ok(None)` and documented it as a clean close.
+- `handshake_kind()` on `PublishRequest`, `PlayRequest`, `RtmpSession`
+  and `PlaySession`: which handshake the peer negotiated with the
+  server.
 - `ChunkReader::set_max_message_size` / `set_max_in_flight_bytes`
   (default `DEFAULT_MAX_IN_FLIGHT_BYTES`, 64 MiB): the declared lengths
   of all partially received messages are budgeted, so a peer cannot pin

@@ -103,7 +103,7 @@ pub use caps::{
 };
 pub use chunk::{Message, MessageStreamKind};
 pub use client::{ClientEvent, RtmpClient, RtmpUrl, resolve_tc_url};
-pub use error::{Error, Result};
+pub use error::{Error, Result, StreamEnd};
 pub use flv::{
     AudioMessage, AudioTag, ColorConfig, ColorInfo, HdrCll, HdrMdcv, ModEx, MultichannelConfig,
     MultichannelConfigOrder, Multitrack, MultitrackTrack, OnMetaData, TrackInfo, VideoTag,
@@ -123,7 +123,7 @@ pub use message::{
 };
 pub use player::{PlayOptions, PlayerPacket, RtmpPlayer};
 pub use server::{
-    PlayRequest, PlaySession, PlaySessionEvent, PublishRequest, RtmpServer, RtmpSession,
-    SessionRequest, StreamPacket,
+    DEFAULT_NEGOTIATION_TIMEOUT, PlayRequest, PlaySession, PlaySessionEvent, PublishRequest,
+    RtmpServer, RtmpSession, SessionRequest, StreamPacket,
 };
 pub use shared_object::{SO_FLAG_PERSISTENT, SharedObjectMessage, SoEvent, parse_shared_object};
