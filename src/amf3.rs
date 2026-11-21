@@ -307,6 +307,124 @@ fn amf3_key_to_string(k: &Amf3Value) -> String {
 /// any real `onMetaData` / shared-object payload.
 pub const MAX_DECODE_DEPTH: usize = 64;
 
+/// Ceiling on what string / object references may expand to within one
+/// decoder's tables, in approximate bytes of materialised value. A
+/// reference costs one or two wire bytes and resolves to a copy of an
+/// earlier value, so without a bound a short message could unfold into
+/// gigabytes.
+pub const MAX_REFERENCE_EXPANSION: usize = 16 * 1024 * 1024;
+
+/// Ceiling on the number of AMF0 values one AMF3 value may bridge to.
+/// A `ByteArray` or numeric `Vector` bridges to one AMF0 Number per
+/// element — many times its wire size.
+pub const MAX_BRIDGED_VALUES: usize = 1 << 20;
+
+/// Approximate in-memory weight and nesting height of a decoded
+/// value. Recursion is bounded: every value the decoder builds stays
+/// within [`MAX_DECODE_DEPTH`] levels.
+fn measure(v: &Amf3Value) -> (usize, usize) {
+    fn fold<'a>(items: impl Iterator<Item = &'a Amf3Value>) -> (usize, usize) {
+        let mut weight = 0;
+        let mut height = 0;
+        for item in items {
+            let (w, h) = measure(item);
+            weight += w;
+            height = height.max(h);
+        }
+        (weight, height)
+    }
+    match v {
+        Amf3Value::String(s) | Amf3Value::Xml(s) | Amf3Value::XmlDocument(s) => (16 + s.len(), 1),
+        Amf3Value::Array { dense, assoc } => {
+            let (w1, h1) = fold(dense.iter());
+            let (w2, h2) = fold(assoc.iter().map(|(_, v)| v));
+            let keys: usize = assoc.iter().map(|(k, _)| k.len() + 8).sum();
+            (16 + w1 + w2 + keys, 1 + h1.max(h2))
+        }
+        Amf3Value::Object {
+            class_name,
+            sealed,
+            dynamic_members,
+            externalizable_body,
+            ..
+        } => {
+            let (w, h) = fold(sealed.iter().chain(dynamic_members.iter()).map(|(_, v)| v));
+            let keys: usize = sealed
+                .iter()
+                .chain(dynamic_members.iter())
+                .map(|(k, _)| k.len() + 8)
+                .sum();
+            let body = externalizable_body.as_ref().map_or(0, Vec::len);
+            (16 + class_name.len() + w + keys + body, 1 + h)
+        }
+        Amf3Value::ByteArray(b) => (16 + b.len(), 1),
+        Amf3Value::VectorInt { items, .. } => (16 + 4 * items.len(), 1),
+        Amf3Value::VectorUInt { items, .. } => (16 + 4 * items.len(), 1),
+        Amf3Value::VectorDouble { items, .. } => (16 + 8 * items.len(), 1),
+        Amf3Value::VectorObject {
+            object_type_name,
+            items,
+            ..
+        } => {
+            let (w, h) = fold(items.iter());
+            (16 + object_type_name.len() + w, 1 + h)
+        }
+        Amf3Value::Dictionary { entries, .. } => {
+            let (w, h) = fold(entries.iter().flat_map(|(k, v)| [k, v]));
+            (16 + w, 1 + h)
+        }
+        _ => (16, 1),
+    }
+}
+
+/// Number of AMF0 values [`Amf3Value::to_amf0`] would create.
+fn bridged_values(v: &Amf3Value) -> usize {
+    match v {
+        Amf3Value::Array { dense, assoc } => {
+            1 + dense.iter().map(bridged_values).sum::<usize>()
+                + assoc.iter().map(|(_, v)| bridged_values(v)).sum::<usize>()
+        }
+        Amf3Value::Object {
+            sealed,
+            dynamic_members,
+            ..
+        } => {
+            1 + sealed
+                .iter()
+                .chain(dynamic_members.iter())
+                .map(|(_, v)| bridged_values(v))
+                .sum::<usize>()
+        }
+        Amf3Value::ByteArray(b) => 1 + b.len(),
+        Amf3Value::VectorInt { items, .. } => 1 + items.len(),
+        Amf3Value::VectorUInt { items, .. } => 1 + items.len(),
+        Amf3Value::VectorDouble { items, .. } => 1 + items.len(),
+        Amf3Value::VectorObject { items, .. } => {
+            1 + items.iter().map(bridged_values).sum::<usize>()
+        }
+        Amf3Value::Dictionary { entries, .. } => {
+            1 + entries
+                .iter()
+                .map(|(_, v)| bridged_values(v))
+                .sum::<usize>()
+        }
+        _ => 1,
+    }
+}
+
+/// [`Amf3Value::to_amf0`] for values that came off the wire: refuses a
+/// value that would bridge to more than [`MAX_BRIDGED_VALUES`] AMF0
+/// values instead of allocating them.
+pub fn bridge_to_amf0(v: &Amf3Value) -> Result<crate::amf::Amf0Value> {
+    let n = bridged_values(v);
+    if n > MAX_BRIDGED_VALUES {
+        return Err(Error::InvalidAmf0(format!(
+            "amf3: value bridges to {n} AMF0 values (limit {MAX_BRIDGED_VALUES})"
+        )));
+    }
+    Ok(v.to_amf0())
+}
+
 /// Body-length resolver for an externalizable AMF3 class (§3.12
 /// `U29O-traits-ext`).
 ///
@@ -340,6 +458,9 @@ pub struct Decoder {
     /// decremented on return. Exceeding [`MAX_DECODE_DEPTH`] returns a
     /// controlled error instead of overflowing the stack.
     depth: usize,
+    /// What resolved references have materialised so far (see
+    /// [`MAX_REFERENCE_EXPANSION`]).
+    expanded: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +514,18 @@ impl Decoder {
         self.objects.clear();
         self.traits.clear();
         self.depth = 0;
+        self.expanded = 0;
+    }
+
+    /// Charge `weight` bytes of reference expansion to the budget.
+    fn charge(&mut self, weight: usize) -> Result<()> {
+        self.expanded = self.expanded.saturating_add(weight);
+        if self.expanded > MAX_REFERENCE_EXPANSION {
+            return Err(Error::InvalidAmf0(format!(
+                "amf3: references expand past {MAX_REFERENCE_EXPANSION} bytes"
+            )));
+        }
+        Ok(())
     }
 
     /// Decode one AMF3 value from `buf` starting at `*pos`. Advances
@@ -449,8 +582,10 @@ impl Decoder {
             let s = self
                 .strings
                 .get(idx)
-                .ok_or_else(|| Error::InvalidAmf0(format!("amf3 string ref {idx} out of range")))?;
-            Ok(s.clone())
+                .ok_or_else(|| Error::InvalidAmf0(format!("amf3 string ref {idx} out of range")))?
+                .clone();
+            self.charge(s.len())?;
+            Ok(s)
         } else {
             let len = (header >> 1) as usize;
             let s = read_utf8_body(buf, pos, len)?;
@@ -476,7 +611,11 @@ impl Decoder {
                 .get(idx)
                 .ok_or_else(|| Error::InvalidAmf0(format!("amf3 xml ref {idx} out of range")))?;
             match v {
-                Amf3Value::Xml(s) | Amf3Value::XmlDocument(s) => Ok(s.clone()),
+                Amf3Value::Xml(s) | Amf3Value::XmlDocument(s) => {
+                    let s = s.clone();
+                    self.charge(s.len())?;
+                    Ok(s)
+                }
                 _ => Err(Error::InvalidAmf0(format!(
                     "amf3 xml ref {idx} resolved to non-xml value"
                 ))),
@@ -764,11 +903,21 @@ impl Decoder {
         Ok(v)
     }
 
-    fn lookup_object(&self, idx: usize) -> Result<Amf3Value> {
-        self.objects
+    fn lookup_object(&mut self, idx: usize) -> Result<Amf3Value> {
+        let v = self
+            .objects
             .get(idx)
-            .cloned()
-            .ok_or_else(|| Error::InvalidAmf0(format!("amf3 object ref {idx} out of range")))
+            .ok_or_else(|| Error::InvalidAmf0(format!("amf3 object ref {idx} out of range")))?;
+        let (weight, height) = measure(v);
+        // `self.depth` already counts the value being decoded.
+        if self.depth + height > MAX_DECODE_DEPTH + 1 {
+            return Err(Error::InvalidAmf0(format!(
+                "amf3: object reference would nest deeper than {MAX_DECODE_DEPTH} levels"
+            )));
+        }
+        let v = v.clone();
+        self.charge(weight)?;
+        Ok(v)
     }
 }
 
@@ -866,10 +1015,10 @@ pub fn decode_message_to_amf0(buf: &[u8]) -> Result<Vec<crate::amf::Amf0Value>> 
     if buf.first() == Some(&FORMAT_SELECTOR_AMF0) {
         return crate::amf::decode_all(&buf[1..]);
     }
-    Ok(decode_data_message(buf)?
+    decode_data_message(buf)?
         .iter()
-        .map(Amf3Value::to_amf0)
-        .collect())
+        .map(bridge_to_amf0)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2125,5 +2274,61 @@ mod tests {
         assert!(decode_message_to_amf0(&[FORMAT_SELECTOR_AMF0, 0x02]).is_err());
         // Selector + dangling avmplus switch.
         assert!(decode_message_to_amf0(&[FORMAT_SELECTOR_AMF0, AVMPLUS_OBJECT_MARKER]).is_err());
+    }
+
+    /// A two-byte string reference resolves to a copy of the string:
+    /// a long string referenced many times is refused by the
+    /// expansion budget instead of being materialised.
+    #[test]
+    fn string_reference_flood_is_refused_by_the_expansion_budget() {
+        let mut buf = vec![M_STRING];
+        write_u29(&mut buf, (60_000 << 1) | 1);
+        buf.extend(std::iter::repeat_n(b'A', 60_000));
+        buf.push(M_ARRAY);
+        write_u29(&mut buf, (100_000 << 1) | 1);
+        buf.push(0x01); // empty key: no associative part
+        for _ in 0..100_000 {
+            buf.extend_from_slice(&[M_STRING, 0x00]); // reference 0
+        }
+        match decode_all(&buf) {
+            Err(Error::InvalidAmf0(m)) => assert!(m.contains("expand past"), "{m}"),
+            other => panic!(
+                "expected the expansion error, got {:?}",
+                other.map(|v| v.len())
+            ),
+        }
+    }
+
+    /// Object references that wrap one another cannot build a value
+    /// deeper than the depth cap.
+    #[test]
+    fn object_reference_chain_cannot_exceed_the_depth_cap() {
+        // Value k: a dense array of one element — a reference to
+        // value k-1 (array marker + U29 reference header).
+        let mut buf = vec![M_ARRAY, 0x01, 0x01]; // empty array, object 0
+        for k in 0u32..(MAX_DECODE_DEPTH as u32 + 10) {
+            buf.extend_from_slice(&[M_ARRAY, 0x03, 0x01, M_ARRAY]);
+            write_u29(&mut buf, k << 1);
+        }
+        match decode_all(&buf) {
+            Err(Error::InvalidAmf0(m)) => assert!(m.contains("nest deeper"), "{m}"),
+            other => panic!("expected the depth error, got {:?}", other.map(|v| v.len())),
+        }
+    }
+
+    /// A ByteArray bridges to one AMF0 Number per byte; a large one is
+    /// refused on the bridged paths rather than inflated.
+    #[test]
+    fn oversize_byte_array_is_not_bridged_to_amf0() {
+        let big = Amf3Value::ByteArray(vec![0; MAX_BRIDGED_VALUES + 1]);
+        assert!(bridge_to_amf0(&big).is_err());
+        let small = Amf3Value::ByteArray(vec![1, 2, 3]);
+        assert!(bridge_to_amf0(&small).is_ok());
+        // Through the message decoder (format selector absent, value
+        // introduced by the avmplus marker).
+        let mut msg = vec![0x11, M_BYTE_ARRAY];
+        write_u29(&mut msg, (((MAX_BRIDGED_VALUES + 1) as u32) << 1) | 1);
+        msg.extend(std::iter::repeat_n(0u8, MAX_BRIDGED_VALUES + 1));
+        assert!(decode_message_to_amf0(&msg).is_err());
     }
 }

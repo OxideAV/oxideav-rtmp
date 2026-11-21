@@ -24,6 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- AMF0 / AMF3 decoders: a reference resolves to a copy of an earlier
+  value, so a few hundred bytes of nested references could unfold into
+  gigabytes (each level holding two references to the previous one),
+  and references wrapping references could build a value deep enough
+  to overflow the stack when it is cloned or dropped — both reachable
+  from any command or data message. Reference expansion is now
+  budgeted (`MAX_REFERENCE_EXPANSION`, 16 MiB per decode context) and
+  the nesting cap applies to resolved values.
+- AMF3 → AMF0 bridge: a `ByteArray` / numeric `Vector` bridges to one
+  AMF0 Number per element; a 16 MiB message could demand about a
+  gigabyte. The wire-facing paths (`decode_message_to_amf0`, the
+  inline `0x11` switch in the AMF0 decoder) refuse values that bridge
+  to more than `MAX_BRIDGED_VALUES` (`amf3::bridge_to_amf0`).
+- AMF0 encoder: a property with an empty name (reachable through the
+  AMF3 bridge) was written as a zero-length key, which every decoder —
+  ours included — reads as the object terminator, corrupting the rest
+  of the message; names longer than 65 535 bytes had their length
+  truncated. Properties whose name the format cannot express are now
+  left out (and not counted in the ECMA-array length); an overlong
+  typed-object class name is cut at a character boundary. Found by the
+  new `amf0` fuzz target.
 - Abort Message (RTMP 1.0 §5.4.2, type 2) was ignored by every
   session: the message was reassembled and dropped, so a peer that
   abandoned a message and continued on the same chunk stream with a
@@ -76,6 +97,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `fuzz/`: seven cargo-fuzz targets — `chunk_stream` (hostile
+  reassembly under small budgets + writer → reader round trip),
+  `handshake` (all four roles + the digest helpers), `amf0`, `amf3`
+  (decode + encode fixed point), `command_decode` (commands, data
+  frames, user control, shared objects, aggregates, capability and
+  metadata views), `flv_tags` (legacy + Enhanced tag bodies with
+  parse → build fixed point, the FLV reader) and `session` (the
+  negotiation driver and all four packet pumps over a loopback socket)
+  — plus a daily workflow.
+- `RtmpServer::negotiate`: run the handshake + negotiation on a
+  connection the caller accepted itself, returning the negotiation
+  error instead of logging it.
 - `relay` module — `LateJoinCache` + `KeyframeGate`: what a relay must
   replay to a subscriber that joins a live stream part-way through
   (stored data frames, every track's current decoder configuration —

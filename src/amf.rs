@@ -138,6 +138,52 @@ impl Amf0Value {
 /// even reach the byte cursor.
 pub const MAX_DECODE_DEPTH: usize = 64;
 
+/// Ceiling on what object references may expand to within one decode
+/// context, in approximate bytes of materialised value. A reference
+/// (marker `0x07`) resolves to a copy of an earlier complex value, so
+/// without a bound a few hundred bytes of nested references could
+/// unfold into gigabytes. Real metadata uses references sparingly, if
+/// at all.
+pub const MAX_REFERENCE_EXPANSION: usize = 16 * 1024 * 1024;
+
+/// Approximate in-memory weight and nesting height of a decoded
+/// value. Recursion is bounded: every value the decoder builds stays
+/// within [`MAX_DECODE_DEPTH`] levels.
+fn measure(v: &Amf0Value) -> (usize, usize) {
+    fn pairs(p: &[(String, Amf0Value)]) -> (usize, usize) {
+        let mut weight = 16;
+        let mut height = 0;
+        for (k, v) in p {
+            let (w, h) = measure(v);
+            weight += k.len() + 8 + w;
+            height = height.max(h);
+        }
+        (weight, height + 1)
+    }
+    match v {
+        Amf0Value::String(s) | Amf0Value::XmlDocument(s) => (16 + s.len(), 1),
+        Amf0Value::Object(p) | Amf0Value::EcmaArray(p) => pairs(p),
+        Amf0Value::TypedObject {
+            class_name,
+            properties,
+        } => {
+            let (w, h) = pairs(properties);
+            (w + class_name.len(), h)
+        }
+        Amf0Value::StrictArray(items) => {
+            let mut weight = 16;
+            let mut height = 0;
+            for item in items {
+                let (w, h) = measure(item);
+                weight += w;
+                height = height.max(h);
+            }
+            (weight, height + 1)
+        }
+        _ => (16, 1),
+    }
+}
+
 /// Decode one AMF0 value from `buf` starting at `*pos`. Advances `pos`
 /// past the value on success. Returns `InvalidAmf0` for unknown markers,
 /// truncated input, or container nesting deeper than
@@ -153,15 +199,53 @@ pub const MAX_DECODE_DEPTH: usize = 64;
 /// To resolve references across a multi-value packet (where the table
 /// spans the whole message), use [`decode_all`].
 pub fn decode(buf: &[u8], pos: &mut usize) -> Result<Amf0Value> {
-    let mut refs = Vec::new();
+    let mut refs = RefTable::default();
     decode_at_depth(buf, pos, 0, &mut refs)
 }
 
 /// The reference table threaded through one AMF0 serialization context.
 /// Each entry is a fully-decoded complex value, in the order the spec's
 /// "complex object" rule appends them. A `REFERENCE` (UI16) indexes into
-/// this list.
-type RefTable = Vec<Amf0Value>;
+/// this list. `expanded` totals what resolved references have
+/// materialised so far (see [`MAX_REFERENCE_EXPANSION`]).
+#[derive(Default)]
+struct RefTable {
+    entries: Vec<Amf0Value>,
+    expanded: usize,
+}
+
+impl RefTable {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn push(&mut self, v: Amf0Value) {
+        self.entries.push(v);
+    }
+
+    /// Resolve reference `idx` for a value sitting `depth` levels deep.
+    fn resolve(&mut self, idx: usize, depth: usize) -> Result<Amf0Value> {
+        let total = self.entries.len();
+        let v = self.entries.get(idx).ok_or_else(|| {
+            Error::InvalidAmf0(format!(
+                "AMF0 reference index {idx} out of range (table has {total} entries)"
+            ))
+        })?;
+        let (weight, height) = measure(v);
+        if depth + height > MAX_DECODE_DEPTH {
+            return Err(Error::InvalidAmf0(format!(
+                "AMF0 reference would nest deeper than {MAX_DECODE_DEPTH} levels"
+            )));
+        }
+        self.expanded = self.expanded.saturating_add(weight);
+        if self.expanded > MAX_REFERENCE_EXPANSION {
+            return Err(Error::InvalidAmf0(format!(
+                "AMF0 references expand past {MAX_REFERENCE_EXPANSION} bytes"
+            )));
+        }
+        Ok(v.clone())
+    }
+}
 
 fn decode_at_depth(
     buf: &[u8],
@@ -198,7 +282,7 @@ fn decode_at_depth(
             refs.push(Amf0Value::Object(Vec::new()));
             let body = read_object_body_at_depth(buf, pos, depth + 1, refs)?;
             let v = Amf0Value::Object(body);
-            refs[slot] = v.clone();
+            refs.entries[slot] = v.clone();
             Ok(v)
         }
         M_ECMA_ARRAY => {
@@ -211,7 +295,7 @@ fn decode_at_depth(
             refs.push(Amf0Value::EcmaArray(Vec::new()));
             let body = read_object_body_at_depth(buf, pos, depth + 1, refs)?;
             let v = Amf0Value::EcmaArray(body);
-            refs[slot] = v.clone();
+            refs.entries[slot] = v.clone();
             Ok(v)
         }
         M_STRICT_ARRAY => {
@@ -223,7 +307,7 @@ fn decode_at_depth(
                 out.push(decode_at_depth(buf, pos, depth + 1, refs)?);
             }
             let v = Amf0Value::StrictArray(out);
-            refs[slot] = v.clone();
+            refs.entries[slot] = v.clone();
             Ok(v)
         }
         M_DATE => {
@@ -245,7 +329,7 @@ fn decode_at_depth(
             // point into an AMF3 sub-context and vice versa.
             let v = crate::amf3::decode(buf, pos)
                 .map_err(|e| Error::InvalidAmf0(format!("embedded AMF3 value: {e}")))?;
-            Ok(v.to_amf0())
+            crate::amf3::bridge_to_amf0(&v)
         }
         M_UNSUPPORTED => Ok(Amf0Value::Unsupported),
         M_XML_DOCUMENT => {
@@ -272,7 +356,7 @@ fn decode_at_depth(
                 class_name,
                 properties: body,
             };
-            refs[slot] = v.clone();
+            refs.entries[slot] = v.clone();
             Ok(v)
         }
         M_REFERENCE => {
@@ -280,12 +364,7 @@ fn decode_at_depth(
             // index into the table of complex objects serialized so far
             // in this context. Resolve by cloning the referenced value.
             let idx = read_u16_be(buf, pos)? as usize;
-            refs.get(idx).cloned().ok_or_else(|| {
-                Error::InvalidAmf0(format!(
-                    "AMF0 reference index {idx} out of range (table has {} entries)",
-                    refs.len()
-                ))
-            })
+            refs.resolve(idx, depth)
         }
         other => Err(Error::InvalidAmf0(format!("unknown marker {other:#x}"))),
     }
@@ -302,7 +381,7 @@ fn decode_at_depth(
 pub fn decode_all(buf: &[u8]) -> Result<Vec<Amf0Value>> {
     let mut pos = 0;
     let mut out = Vec::new();
-    let mut refs = Vec::new();
+    let mut refs = RefTable::default();
     while pos < buf.len() {
         out.push(decode_at_depth(buf, &mut pos, 0, &mut refs)?);
     }
@@ -447,7 +526,8 @@ pub fn encode(out: &mut Vec<u8>, v: &Amf0Value) {
         }
         Amf0Value::EcmaArray(pairs) => {
             out.push(M_ECMA_ARRAY);
-            out.extend_from_slice(&(pairs.len() as u32).to_be_bytes());
+            let count = pairs.iter().filter(|(k, _)| encodable_key(k)).count();
+            out.extend_from_slice(&(count as u32).to_be_bytes());
             write_object_body(out, pairs);
         }
         Amf0Value::StrictArray(items) => {
@@ -474,15 +554,34 @@ pub fn encode(out: &mut Vec<u8>, v: &Amf0Value) {
             properties,
         } => {
             out.push(M_TYPED_OBJECT);
-            out.extend_from_slice(&(class_name.len() as u16).to_be_bytes());
-            out.extend_from_slice(class_name.as_bytes());
+            // The class name is a 16-bit-length string: an overlong
+            // one is cut at the last character boundary that fits.
+            let mut end = class_name.len().min(u16::MAX as usize);
+            while !class_name.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.extend_from_slice(&(end as u16).to_be_bytes());
+            out.extend_from_slice(&class_name.as_bytes()[..end]);
             write_object_body(out, properties);
         }
     }
 }
 
+/// Whether a property name can be written: the wire form is a
+/// 16-bit-length string, and the empty name is reserved — an empty
+/// name followed by `0x09` is the object terminator (§2.5 / §2.11).
+fn encodable_key(k: &str) -> bool {
+    !k.is_empty() && k.len() <= u16::MAX as usize
+}
+
+/// Properties whose name the format cannot express (empty, or longer
+/// than 65 535 bytes) are left out rather than emitted as a stream no
+/// decoder can read back.
 fn write_object_body(out: &mut Vec<u8>, pairs: &[(String, Amf0Value)]) {
     for (k, v) in pairs {
+        if !encodable_key(k) {
+            continue;
+        }
         out.extend_from_slice(&(k.len() as u16).to_be_bytes());
         out.extend_from_slice(k.as_bytes());
         encode(out, v);
@@ -812,5 +911,78 @@ mod tests {
         let b = [M_REFERENCE, 0x00, 0x00];
         let mut p = 0;
         assert!(matches!(decode(&b, &mut p), Err(Error::InvalidAmf0(_))));
+    }
+
+    /// Each value holds two references to the previous one: 11 bytes
+    /// per level, doubling in size. The expansion budget stops it long
+    /// before memory does.
+    #[test]
+    fn reference_doubling_is_refused_by_the_expansion_budget() {
+        let mut buf = vec![M_STRICT_ARRAY, 0, 0, 0, 1, M_NULL];
+        for k in 0u16..40 {
+            buf.extend_from_slice(&[M_STRICT_ARRAY, 0, 0, 0, 2]);
+            for _ in 0..2 {
+                buf.push(M_REFERENCE);
+                buf.extend_from_slice(&k.to_be_bytes());
+            }
+        }
+        let started = std::time::Instant::now();
+        match decode_all(&buf) {
+            Err(Error::InvalidAmf0(m)) => assert!(m.contains("expand past"), "{m}"),
+            other => panic!(
+                "expected the expansion error, got {:?}",
+                other.map(|v| v.len())
+            ),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    /// Each value wraps a reference to the previous one, so nesting
+    /// grows by one per value without any container ever being nested
+    /// on the wire. The depth cap applies to the resolved value.
+    #[test]
+    fn reference_chain_cannot_exceed_the_depth_cap() {
+        let mut buf = vec![M_STRICT_ARRAY, 0, 0, 0, 1, M_NULL];
+        for k in 0u16..(MAX_DECODE_DEPTH as u16 + 10) {
+            buf.extend_from_slice(&[M_STRICT_ARRAY, 0, 0, 0, 1, M_REFERENCE]);
+            buf.extend_from_slice(&k.to_be_bytes());
+        }
+        match decode_all(&buf) {
+            Err(Error::InvalidAmf0(m)) => assert!(m.contains("nest deeper"), "{m}"),
+            other => panic!("expected the depth error, got {:?}", other.map(|v| v.len())),
+        }
+        // Just inside the cap decodes fine.
+        let mut ok = vec![M_STRICT_ARRAY, 0, 0, 0, 1, M_NULL];
+        for k in 0u16..10 {
+            ok.extend_from_slice(&[M_STRICT_ARRAY, 0, 0, 0, 1, M_REFERENCE]);
+            ok.extend_from_slice(&k.to_be_bytes());
+        }
+        assert_eq!(decode_all(&ok).unwrap().len(), 11);
+    }
+
+    /// An empty property name cannot be written — on the wire it is
+    /// the object terminator — and neither can one longer than the
+    /// 16-bit length field. Such properties are left out so the output
+    /// always decodes.
+    #[test]
+    fn unrepresentable_property_names_are_not_emitted() {
+        let v = Amf0Value::EcmaArray(vec![
+            ("a".into(), Amf0Value::Number(1.0)),
+            (String::new(), Amf0Value::Number(2.0)),
+            ("x".repeat(70_000), Amf0Value::Number(3.0)),
+            ("b".into(), Amf0Value::Boolean(true)),
+        ]);
+        let mut out = Vec::new();
+        encode(&mut out, &v);
+        let back = decode_all(&out).expect("output must decode");
+        assert_eq!(
+            back,
+            vec![Amf0Value::EcmaArray(vec![
+                ("a".into(), Amf0Value::Number(1.0)),
+                ("b".into(), Amf0Value::Boolean(true)),
+            ])]
+        );
+        // The associative count matches what was written.
+        assert_eq!(&out[1..5], &[0, 0, 0, 2]);
     }
 }
