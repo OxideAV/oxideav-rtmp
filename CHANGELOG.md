@@ -32,6 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from any command or data message. Reference expansion is now
   budgeted (`MAX_REFERENCE_EXPANSION`, 16 MiB per decode context) and
   the nesting cap applies to resolved values.
+- An Aggregate Message nested inside an Aggregate Message was
+  unpacked level by level, re-copying the remaining body each time — a
+  16 MiB message of 15-byte nesting steps cost quadratic work. The
+  sessions now refuse a nested aggregate as a protocol violation (the
+  body is a list of FLV-shaped audio / video / data tags).
+- The ingest session's stored data frames and the relay cache keep at
+  most 64 distinct handlers / configuration identities
+  (`MAX_STORED_DATA_FRAMES`, `relay::MAX_CACHED_CONFIGS`), so a
+  publisher inventing names cannot grow them without end.
 - AMF3 → AMF0 bridge: a `ByteArray` / numeric `Vector` bridges to one
   AMF0 Number per element; a 16 MiB message could demand about a
   gigabyte. The wire-facing paths (`decode_message_to_amf0`, the

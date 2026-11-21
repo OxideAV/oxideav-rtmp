@@ -20,7 +20,6 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::aggregate::parse_aggregate;
 use crate::amf::{self, Amf0Value};
 use crate::amf3;
 use crate::caps::ConnectCapabilities;
@@ -916,7 +915,7 @@ impl RtmpClient {
                 // override resolved; queue them so subsequent calls
                 // surface the per-sub events in publish order. Don't
                 // return on the aggregate itself — drain the queue.
-                let subs = parse_aggregate(&msg)?;
+                let subs = crate::aggregate::session_subs(&msg)?;
                 self.pending_subs.extend(subs);
                 continue;
             }
@@ -1088,7 +1087,7 @@ impl RtmpClient {
                 // aggregate. Forward to the same queue so the next
                 // `poll_event` tick decomposes it. The wire path above
                 // already handles top-level aggregates directly.
-                let subs = parse_aggregate(&msg)?;
+                let subs = crate::aggregate::session_subs(&msg)?;
                 self.pending_subs.extend(subs);
                 Ok(ClientEvent::Other)
             }

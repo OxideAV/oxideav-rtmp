@@ -30,7 +30,6 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::aggregate::parse_aggregate;
 use crate::amf::{self, Amf0Value};
 use crate::amf3;
 use crate::caps::ConnectCapabilities;
@@ -549,7 +548,7 @@ impl RtmpPlayer {
                 Ok(None)
             }
             MSG_AGGREGATE => {
-                let subs = parse_aggregate(&msg)?;
+                let subs = crate::aggregate::session_subs(&msg)?;
                 self.pending_subs.extend(subs);
                 Ok(None)
             }

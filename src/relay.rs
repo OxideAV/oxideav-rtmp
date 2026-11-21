@@ -57,6 +57,12 @@ use crate::flv::{
 };
 use crate::server::StreamPacket;
 
+/// Most configuration packets (per kind) and data frames one cache
+/// keeps. A real stream has one per track; the cap only stops a
+/// publisher that keeps inventing codec / track identities from
+/// growing the cache without end (the oldest entry is dropped).
+pub const MAX_CACHED_CONFIGS: usize = 64;
+
 /// What part a media packet plays for a decoder joining late.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -228,7 +234,12 @@ impl LateJoinCache {
                         let key = video_key(tag, kind);
                         match self.video_config.iter_mut().find(|(k, _)| *k == key) {
                             Some((_, stored)) => *stored = tag.clone(),
-                            None => self.video_config.push((key, tag.clone())),
+                            None => {
+                                if self.video_config.len() == MAX_CACHED_CONFIGS {
+                                    self.video_config.remove(0);
+                                }
+                                self.video_config.push((key, tag.clone()));
+                            }
                         }
                     }
                     Role::Coded => {
@@ -252,7 +263,12 @@ impl LateJoinCache {
                         let key = audio_key(tag, kind);
                         match self.audio_config.iter_mut().find(|(k, _)| *k == key) {
                             Some((_, stored)) => *stored = tag.clone(),
-                            None => self.audio_config.push((key, tag.clone())),
+                            None => {
+                                if self.audio_config.len() == MAX_CACHED_CONFIGS {
+                                    self.audio_config.remove(0);
+                                }
+                                self.audio_config.push((key, tag.clone()));
+                            }
                         }
                     }
                     Role::Coded => {
@@ -268,9 +284,10 @@ impl LateJoinCache {
     }
 
     fn store_data_frame(&mut self, handler: &str, value: &Amf0Value) {
-        match self.data_frames.iter_mut().find(|(h, _)| h == handler) {
-            Some((_, stored)) => *stored = value.clone(),
-            None => self.data_frames.push((handler.to_owned(), value.clone())),
+        if let Some((_, stored)) = self.data_frames.iter_mut().find(|(h, _)| h == handler) {
+            *stored = value.clone();
+        } else if self.data_frames.len() < MAX_CACHED_CONFIGS {
+            self.data_frames.push((handler.to_owned(), value.clone()));
         }
     }
 

@@ -376,3 +376,51 @@ fn unknown_and_out_of_order_commands_are_tolerated() {
     assert_eq!(video, vec![(0, vec![0x01; 10]), (40, vec![0x02; 10])]);
     assert_eq!(end, Some(StreamEnd::Signalled));
 }
+
+#[test]
+fn nested_aggregate_is_refused() {
+    use oxideav_rtmp::{Error, build_aggregate};
+    let (server, addr) = bind();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut session = server
+            .accept()
+            .expect("accept")
+            .accept()
+            .expect("accept publish");
+        session
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut seen = 0usize;
+        let outcome = loop {
+            match session.next_packet() {
+                Ok(Some(_)) => seen += 1,
+                Ok(None) => break Ok(seen),
+                Err(e) => break Err((seen, e)),
+            }
+        };
+        let _ = tx.send(outcome);
+    });
+    let mut p = RawPublisher::open(addr, "nested-key");
+    let frame = Message {
+        msg_type_id: MSG_VIDEO,
+        msg_stream_id: 1,
+        timestamp: 40,
+        payload: video_payload(8, 0x44),
+    };
+    // A plain aggregate is fine…
+    let flat = build_aggregate(1, &[frame.clone(), frame.clone()]).expect("aggregate");
+    p.writer.write_message(6, &flat).expect("flat aggregate");
+    // …an aggregate carrying an aggregate is a protocol violation.
+    let nested = build_aggregate(1, &[frame, flat]).expect("nested aggregate");
+    p.writer
+        .write_message(6, &nested)
+        .expect("nested aggregate");
+    match rx.recv_timeout(Duration::from_secs(10)).expect("ingest") {
+        Err((seen, Error::ProtocolViolation(m))) => {
+            assert_eq!(seen, 2, "the flat aggregate's two frames were delivered");
+            assert!(m.contains("nested"), "{m}");
+        }
+        other => panic!("expected a protocol violation, got {other:?}"),
+    }
+}

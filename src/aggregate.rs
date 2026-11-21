@@ -65,6 +65,22 @@ pub const BACK_POINTER_SIZE: usize = 4;
 /// "Length: Three-byte field".
 const UI24_MAX: u32 = 0x00FF_FFFF;
 
+/// [`parse_aggregate`] as the sessions consume it: a sub-message that
+/// is itself an Aggregate Message is a protocol violation. The body is
+/// a list of FLV-shaped tags (§7.1.6 "to match the format of FLV
+/// file") — audio, video, data — and a peer nesting aggregates inside
+/// aggregates could otherwise make a receiver re-copy the remaining
+/// body once per nesting level.
+pub(crate) fn session_subs(msg: &Message) -> Result<Vec<Message>> {
+    let subs = parse_aggregate(msg)?;
+    if subs.iter().any(|s| s.msg_type_id == MSG_AGGREGATE) {
+        return Err(Error::ProtocolViolation(
+            "aggregate message nested inside an aggregate message".into(),
+        ));
+    }
+    Ok(subs)
+}
+
 /// Split an Aggregate Message (`msg_type_id == 22`) into its component
 /// sub-messages.
 ///

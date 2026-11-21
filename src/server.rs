@@ -28,7 +28,6 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::aggregate::parse_aggregate;
 use crate::amf::{self, Amf0Value};
 use crate::amf3;
 use crate::caps::ConnectCapabilities;
@@ -44,6 +43,10 @@ const SERVER_CHUNK_SIZE: u32 = 4096;
 /// Initial window-ack size advertised to the peer. Values of this
 /// order are what "normal" RTMP servers announce.
 const WINDOW_ACK_SIZE: u32 = 5_000_000;
+/// How many distinct `@setDataFrame` handlers one ingest session
+/// retains for replay (`onMetaData` plus a few cue-point style frames
+/// in practice).
+pub const MAX_STORED_DATA_FRAMES: usize = 64;
 /// `limit_type` for SetPeerBandwidth — 2 = "dynamic".
 const PEER_BW_LIMIT_DYNAMIC: u8 = 2;
 
@@ -986,7 +989,7 @@ impl PlaySession {
                 Ok(None)
             }
             MSG_AGGREGATE => {
-                let subs = parse_aggregate(&msg)?;
+                let subs = crate::aggregate::session_subs(&msg)?;
                 self.pending_subs.extend(subs);
                 Ok(None)
             }
@@ -1544,9 +1547,13 @@ impl RtmpSession {
     }
 
     fn store_data_frame(&mut self, handler: &str, value: Amf0Value) {
-        match self.data_frames.iter_mut().find(|(h, _)| h == handler) {
-            Some((_, stored)) => *stored = value,
-            None => self.data_frames.push((handler.to_owned(), value)),
+        if let Some((_, stored)) = self.data_frames.iter_mut().find(|(h, _)| h == handler) {
+            *stored = value;
+        } else if self.data_frames.len() < MAX_STORED_DATA_FRAMES {
+            // A publisher inventing handler names without end must not
+            // grow the stored state without end: past the cap a new
+            // handler is still surfaced live, just not retained.
+            self.data_frames.push((handler.to_owned(), value));
         }
     }
 
@@ -1617,7 +1624,7 @@ impl RtmpSession {
                 // `MSG_AGGREGATE` arm so a bounded depth of nesting
                 // resolves transparently; an unbounded chain would
                 // surface as repeated parser work, not stack growth.
-                let subs = parse_aggregate(&msg)?;
+                let subs = crate::aggregate::session_subs(&msg)?;
                 self.pending_subs.extend(subs);
                 Ok(None)
             }
