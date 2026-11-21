@@ -7,7 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Chunk stream: `ChunkReader` reads through an internal 16 KiB receive
+  buffer (one `read` per buffer-full instead of four to six per chunk)
+  and reassembles each message into one exact-size allocation;
+  `ChunkWriter` lays a message's chunks out in a staging buffer and
+  hands them to the stream in one `write` per 64 KiB instead of several
+  per chunk; per-chunk-stream state is direct-indexed for ids below 64.
+  Loopback over 127.0.0.1 (`cargo bench --bench throughput`, medians):
+  128 KiB messages 847 → 5 040 MB/s publish and 750 → 3 980 MB/s play;
+  1 200-byte messages 177 k → 271 k msg/s publish and 173 k → 315 k
+  msg/s play. Ingest-path allocations per message: 16 → 2 at the
+  128-byte default chunk size, 39 → 2 for a 128 KiB message at 4 096.
+  Wire output is byte-identical.
+
+### Fixed
+
+- `ChunkReader`: a socket read timeout (`WouldBlock` / `TimedOut`) in
+  the middle of a chunk header or payload no longer loses the bytes
+  already consumed — the next `read_message` resumes where the failed
+  call stopped. Previously any timeout that fired mid-message
+  desynchronised the chunk stream for good.
+- `ChunkWriter::write_message` refuses a chunk stream id outside
+  2..=65599 and a payload above the 24-bit length field before writing
+  anything (the length used to be truncated into a corrupt header).
+
 ### Added
+
+- `ChunkReader::set_max_message_size` / `set_max_in_flight_bytes`
+  (default `DEFAULT_MAX_IN_FLIGHT_BYTES`, 64 MiB): the declared lengths
+  of all partially received messages are budgeted, so a peer cannot pin
+  memory by starting 16 MiB messages on thousands of chunk streams.
+  `ChunkReader::is_idle` reports whether the reader sits on a message
+  boundary. `MAX_MESSAGE_LENGTH` names the 24-bit wire limit.
+- `benches/throughput.rs`: chunk codec, publish and play loopback
+  throughput plus heap allocations per message.
 
 - `Default` on `VideoTag` and `AudioTag`; `with_*` setters for every
   field of `VideoTag`, `AudioTag`, `ConnectCapabilities`, `OnMetaData`,

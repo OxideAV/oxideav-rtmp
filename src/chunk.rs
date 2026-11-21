@@ -131,7 +131,53 @@ impl Message {
 }
 
 // ---------------------------------------------------------------------------
-// Per-csid state (reader)
+// Per-csid state tables
+// ---------------------------------------------------------------------------
+
+/// Chunk stream ids below this bound are addressed by direct index
+/// (they are the ids the one-byte basic header can express, and the
+/// ones every commodity peer uses); the rest live in a map.
+const DIRECT_CSIDS: usize = 64;
+
+/// Per-chunk-stream state table: direct-indexed for the one-byte
+/// basic-header range, hashed for the two- and three-byte forms.
+struct CsidTable<T> {
+    low: Vec<Option<T>>,
+    high: HashMap<u32, T>,
+}
+
+impl<T: Default> CsidTable<T> {
+    fn new() -> Self {
+        Self {
+            low: (0..DIRECT_CSIDS).map(|_| None).collect(),
+            high: HashMap::new(),
+        }
+    }
+
+    fn get(&self, csid: u32) -> Option<&T> {
+        match self.low.get(csid as usize) {
+            Some(slot) => slot.as_ref(),
+            None => self.high.get(&csid),
+        }
+    }
+
+    fn get_mut(&mut self, csid: u32) -> Option<&mut T> {
+        match self.low.get_mut(csid as usize) {
+            Some(slot) => slot.as_mut(),
+            None => self.high.get_mut(&csid),
+        }
+    }
+
+    fn entry(&mut self, csid: u32) -> &mut T {
+        match self.low.get_mut(csid as usize) {
+            Some(slot) => slot.get_or_insert_with(T::default),
+            None => self.high.entry(csid).or_default(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reader
 // ---------------------------------------------------------------------------
 
 #[derive(Default, Debug, Clone)]
@@ -139,24 +185,64 @@ struct InState {
     msg_type_id: u8,
     msg_stream_id: u32,
     msg_length: u32,
-    /// Absolute timestamp in ms. fmt 1/2 add a delta to this; fmt 3
-    /// re-uses it verbatim (unless the previous message had an
-    /// extended timestamp, in which case we re-read 4 bytes — see
-    /// [`ExtendedTsMode`]).
+    /// Absolute timestamp in ms. fmt 1/2 add a delta to this; a fmt 3
+    /// chunk that starts a new message adds the last delta again.
     timestamp: u32,
     last_delta: u32,
-    /// Whether the last completed fmt 0/1/2 chunk for this csid used
-    /// an extended timestamp. fmt 3 follow-ups must then also read
-    /// the 4-byte extended timestamp even though they normally don't.
+    /// Whether the most recent fmt 0/1/2 chunk for this csid used an
+    /// extended timestamp. fmt 3 chunks then also carry the 4-byte
+    /// extended timestamp field (§5.3.1.3).
     last_had_ext_ts: bool,
+    /// A message is being reassembled on this csid: its declared
+    /// length is charged to the reader's in-flight budget until the
+    /// message completes, is aborted, or is superseded.
+    assembling: bool,
     /// Partial payload while a multi-chunk message is being received.
     partial: Vec<u8>,
 }
 
+/// The chunk whose header has been consumed and whose payload is
+/// still (partly) on the wire.
+#[derive(Debug, Clone, Copy)]
+struct CurrentChunk {
+    csid: u32,
+    remaining: usize,
+}
+
+/// Size of the reader's internal receive buffer.
+const READ_BUF_LEN: usize = 16 * 1024;
+
+/// Default ceiling on the summed declared lengths of all messages
+/// being reassembled at once — see
+/// [`ChunkReader::set_max_in_flight_bytes`].
+pub const DEFAULT_MAX_IN_FLIGHT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Largest message length the 24-bit chunk message-header field can
+/// declare (§5.3.1.2.1).
+pub const MAX_MESSAGE_LENGTH: usize = 0x00FF_FFFF;
+
+/// Reassembles RTMP messages from a chunk stream.
+///
+/// The reader keeps a small internal receive buffer, so it may pull
+/// more bytes off `R` than the message it returns needed; anything
+/// read ahead is served to the following calls. A read error that
+/// leaves the stream usable — notably the `WouldBlock` / `TimedOut`
+/// of a socket read timeout — does not lose data: every byte received
+/// so far is kept, and the next [`read_message`](Self::read_message)
+/// resumes exactly where the failed one stopped.
 pub struct ChunkReader<R: Read> {
     stream: R,
+    buf: Box<[u8]>,
+    pos: usize,
+    end: usize,
     chunk_size: usize,
-    states: HashMap<u32, InState>,
+    states: CsidTable<InState>,
+    current: Option<CurrentChunk>,
+    /// Sum of the declared lengths of the messages currently being
+    /// reassembled.
+    in_flight_bytes: usize,
+    max_message_size: usize,
+    max_in_flight_bytes: usize,
     /// Cumulative number of bytes consumed off the wire — basic
     /// headers, message headers, extended timestamps, and payload all
     /// count. This is the running "sequence number" the §5.3
@@ -175,26 +261,27 @@ pub struct ChunkReader<R: Read> {
     last_ack_bytes: u32,
 }
 
+fn eof() -> Error {
+    Error::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+}
+
 impl<R: Read> ChunkReader<R> {
     pub fn new(stream: R) -> Self {
         Self {
             stream,
+            buf: vec![0u8; READ_BUF_LEN].into_boxed_slice(),
+            pos: 0,
+            end: 0,
             chunk_size: DEFAULT_CHUNK_SIZE,
-            states: HashMap::new(),
+            states: CsidTable::new(),
+            current: None,
+            in_flight_bytes: 0,
+            max_message_size: MAX_MESSAGE_LENGTH,
+            max_in_flight_bytes: DEFAULT_MAX_IN_FLIGHT_BYTES,
             received_bytes: 0,
             window_ack_size: 0,
             last_ack_bytes: 0,
         }
-    }
-
-    /// Read exactly `buf.len()` bytes off the wire, charging them to
-    /// the §5.3 received-byte sequence counter. Every wire read in the
-    /// reader funnels through here so the Acknowledgement sequence
-    /// number stays exact regardless of chunk framing.
-    fn read_exact_counted(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.stream.read_exact(buf)?;
-        self.received_bytes = self.received_bytes.wrapping_add(buf.len() as u32);
-        Ok(())
     }
 
     /// Total bytes consumed off the wire so far (the §5.3 sequence
@@ -266,6 +353,47 @@ impl<R: Read> ChunkReader<R> {
         self.chunk_size
     }
 
+    /// Refuse any message whose declared length exceeds `bytes`
+    /// (clamped to the 24-bit wire maximum, which is also the
+    /// default). A server that only expects ordinary audio / video /
+    /// command traffic can lower this to shed hostile length fields
+    /// before any payload is buffered.
+    pub fn set_max_message_size(&mut self, bytes: usize) {
+        self.max_message_size = bytes.min(MAX_MESSAGE_LENGTH);
+    }
+
+    /// The current per-message length ceiling.
+    pub fn max_message_size(&self) -> usize {
+        self.max_message_size
+    }
+
+    /// Bound the memory a peer can pin by starting messages it never
+    /// finishes: the declared lengths of all messages being
+    /// reassembled at once (one per chunk stream id) may not sum past
+    /// `bytes`. A chunk that would cross the bound is an
+    /// [`Error::InvalidChunk`]. Default
+    /// [`DEFAULT_MAX_IN_FLIGHT_BYTES`]. Values below one maximum-size
+    /// message are honoured as given, so they also cap the largest
+    /// acceptable message.
+    pub fn set_max_in_flight_bytes(&mut self, bytes: usize) {
+        self.max_in_flight_bytes = bytes;
+    }
+
+    /// The current in-flight reassembly budget.
+    pub fn max_in_flight_bytes(&self) -> usize {
+        self.max_in_flight_bytes
+    }
+
+    /// `true` when the reader sits exactly on a message boundary:
+    /// no chunk is half-read, no message is partially reassembled on
+    /// any chunk stream, and nothing is buffered. An end-of-file
+    /// reported by [`read_message`](Self::read_message) while idle is
+    /// an orderly close between messages; otherwise the peer vanished
+    /// mid-message.
+    pub fn is_idle(&self) -> bool {
+        self.current.is_none() && self.in_flight_bytes == 0 && self.pos == self.end
+    }
+
     /// React to an inbound Abort Message (RTMP 1.0 §5.2) by discarding the
     /// partially-received message on the named chunk stream id.
     ///
@@ -292,16 +420,27 @@ impl<R: Read> ChunkReader<R> {
     /// [`MSG_ABORT`](crate::message::MSG_ABORT) message's 4-byte
     /// big-endian chunk stream id here.
     pub fn abort_partial(&mut self, chunk_stream_id: u32) -> bool {
-        match self.states.get_mut(&chunk_stream_id) {
-            Some(st) if !st.partial.is_empty() => {
-                st.partial.clear();
-                true
+        if matches!(self.current, Some(c) if c.csid == chunk_stream_id) {
+            // The abort names the chunk stream whose chunk payload is
+            // still arriving; those bytes stay on the wire and must be
+            // skipped as framing, so leave that chunk alone.
+            return false;
+        }
+        match self.states.get_mut(chunk_stream_id) {
+            Some(st) if st.assembling => {
+                st.assembling = false;
+                self.in_flight_bytes -= st.msg_length as usize;
+                let had = !st.partial.is_empty();
+                st.partial = Vec::new();
+                had
             }
             _ => false,
         }
     }
 
     /// Borrow the underlying reader (for splitting, timeout config, …).
+    /// Do not read from it directly: the chunk reader may already
+    /// hold bytes it pulled ahead.
     pub fn inner_mut(&mut self) -> &mut R {
         &mut self.stream
     }
@@ -310,184 +449,266 @@ impl<R: Read> ChunkReader<R> {
     /// Blocks until at least one complete message is available.
     pub fn read_message(&mut self) -> Result<Message> {
         loop {
-            let (csid, fmt) = self.read_basic_header()?;
-            match fmt {
-                0 => self.read_fmt0_header(csid)?,
-                1 => self.read_fmt1_header(csid)?,
-                2 => self.read_fmt2_header(csid)?,
-                3 => self.read_fmt3_header(csid)?,
-                _ => unreachable!("fmt is 2 bits"),
+            if self.current.is_none() {
+                self.begin_chunk()?;
             }
-            // Read up to `chunk_size` bytes of payload (or the
-            // remaining message length, whichever is smaller). Compute
-            // the take size from a short immutable lookup, do the
-            // counted wire read into a scratch buffer (so the
-            // `&mut self` ack-accounting borrow doesn't overlap the
-            // per-csid state borrow), then append to the partial.
-            let take = {
-                let state = self.states.get(&csid).ok_or_else(|| {
-                    Error::InvalidChunk(format!(
-                        "fmt {fmt} chunk on csid {csid} without prior fmt-0 state"
-                    ))
-                })?;
-                let need = state.msg_length as usize - state.partial.len();
-                need.min(self.chunk_size)
-            };
-            let mut buf = vec![0u8; take];
-            self.read_exact_counted(&mut buf)?;
-            let state = self
-                .states
-                .get_mut(&csid)
-                .expect("csid state present (checked immediately above)");
-            state.partial.extend_from_slice(&buf);
-
-            if state.partial.len() as u32 >= state.msg_length {
-                let payload = std::mem::take(&mut state.partial);
-                let msg = Message {
-                    msg_type_id: state.msg_type_id,
-                    msg_stream_id: state.msg_stream_id,
-                    timestamp: state.timestamp,
-                    payload,
-                };
+            if let Some(msg) = self.pull_payload()? {
                 return Ok(msg);
             }
         }
     }
 
-    fn read_basic_header(&mut self) -> Result<(u32, u8)> {
-        let mut b = [0u8; 1];
-        self.read_exact_counted(&mut b)?;
-        let fmt = (b[0] >> 6) & 0x03;
-        let low = b[0] & 0x3F;
-        let csid = match low {
+    /// One `read` into the free tail of the receive buffer.
+    fn fill(&mut self) -> Result<()> {
+        if self.pos == self.end {
+            self.pos = 0;
+            self.end = 0;
+        } else if self.end == self.buf.len() {
+            self.buf.copy_within(self.pos..self.end, 0);
+            self.end -= self.pos;
+            self.pos = 0;
+        }
+        loop {
+            match self.stream.read(&mut self.buf[self.end..]) {
+                Ok(0) => return Err(eof()),
+                Ok(n) => {
+                    self.end += n;
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+    }
+
+    /// Make at least `n` unread bytes available in the receive buffer
+    /// (`n` is a chunk-header size, far below the buffer length).
+    fn ensure(&mut self, n: usize) -> Result<()> {
+        while self.end - self.pos < n {
+            self.fill()?;
+        }
+        Ok(())
+    }
+
+    /// Parse one complete chunk header (basic header, message header
+    /// and extended timestamp) and register the chunk as current.
+    /// Nothing is consumed until the whole header is buffered, so a
+    /// read error part-way leaves the reader resumable.
+    fn begin_chunk(&mut self) -> Result<()> {
+        self.ensure(1)?;
+        let b0 = self.buf[self.pos];
+        let fmt = b0 >> 6;
+        let basic_len = match b0 & 0x3F {
+            0 => 2,
+            1 => 3,
+            _ => 1,
+        };
+        self.ensure(basic_len)?;
+        let p = self.pos;
+        let csid = match b0 & 0x3F {
+            0 => self.buf[p + 1] as u32 + 64,
+            // §5.3.1.1: "(the third byte) * 256 + (the second byte) + 64".
+            1 => self.buf[p + 1] as u32 + (self.buf[p + 2] as u32) * 256 + 64,
+            low => low as u32,
+        };
+        let header_len = match fmt {
+            0 => 11,
+            1 => 7,
+            2 => 3,
+            _ => 0,
+        };
+        self.ensure(basic_len + header_len)?;
+        let h = self.pos + basic_len;
+        let u24 = |b: &[u8]| ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        let has_ext = if fmt == 3 {
+            self.states
+                .get(csid)
+                .ok_or_else(|| Error::InvalidChunk("fmt 3 without prior fmt 0/1/2".into()))?
+                .last_had_ext_ts
+        } else {
+            u24(&self.buf[h..h + 3]) == 0x00FF_FFFF
+        };
+        let total = basic_len + header_len + if has_ext { 4 } else { 0 };
+        self.ensure(total)?;
+        let h = self.pos + basic_len;
+        let hdr = &self.buf[h..h + header_len];
+        let ext_at = h + header_len;
+        let ext = if has_ext {
+            u32::from_be_bytes([
+                self.buf[ext_at],
+                self.buf[ext_at + 1],
+                self.buf[ext_at + 2],
+                self.buf[ext_at + 3],
+            ])
+        } else {
+            0
+        };
+
+        // Does this chunk start a new message, and with what header?
+        let (starts_message, length) = match fmt {
             0 => {
-                let mut b1 = [0u8; 1];
-                self.read_exact_counted(&mut b1)?;
-                b1[0] as u32 + 64
+                let ts = if has_ext { ext } else { u24(&hdr[0..3]) };
+                let len = u24(&hdr[3..6]);
+                let ty = hdr[6];
+                // msg_stream_id is little-endian — the only such field
+                // in the chunk format (§5.3.1.2.1).
+                let stream_id = u32::from_le_bytes([hdr[7], hdr[8], hdr[9], hdr[10]]);
+                let st = self.states.entry(csid);
+                st.msg_type_id = ty;
+                st.msg_stream_id = stream_id;
+                st.timestamp = ts;
+                st.last_delta = ts;
+                st.last_had_ext_ts = has_ext;
+                (true, len)
             }
             1 => {
-                let mut b2 = [0u8; 2];
-                self.read_exact_counted(&mut b2)?;
-                // spec: second byte is high order, third byte low — but
-                // commodity peers in the wild interpret it the other way;
-                // the official spec reads "2nd + 3rd byte * 256" which is
-                // little-endian.
-                b2[0] as u32 + (b2[1] as u32) * 256 + 64
+                let delta = if has_ext { ext } else { u24(&hdr[0..3]) };
+                let len = u24(&hdr[3..6]);
+                let ty = hdr[6];
+                let st = self
+                    .states
+                    .get_mut(csid)
+                    .ok_or_else(|| Error::InvalidChunk("fmt 1 without prior fmt 0".into()))?;
+                st.msg_type_id = ty;
+                st.timestamp = st.timestamp.wrapping_add(delta);
+                st.last_delta = delta;
+                st.last_had_ext_ts = has_ext;
+                (true, len)
             }
-            other => other as u32,
+            2 => {
+                let delta = if has_ext { ext } else { u24(&hdr[0..3]) };
+                let st = self
+                    .states
+                    .get_mut(csid)
+                    .ok_or_else(|| Error::InvalidChunk("fmt 2 without prior fmt 0/1".into()))?;
+                st.timestamp = st.timestamp.wrapping_add(delta);
+                st.last_delta = delta;
+                st.last_had_ext_ts = has_ext;
+                (true, st.msg_length)
+            }
+            _ => {
+                // fmt 3 carries no message header. When the most recent
+                // fmt 0/1/2 chunk on the csid used an extended
+                // timestamp the 4-byte field is repeated here (already
+                // accounted for in `total`). A fmt 3 chunk either
+                // continues the message being reassembled or starts a
+                // new one with the previous header, advancing the
+                // timestamp by the registered delta (§5.3.1.2.4).
+                let st = self
+                    .states
+                    .get_mut(csid)
+                    .expect("csid state present (checked above)");
+                if st.assembling {
+                    (false, st.msg_length)
+                } else {
+                    st.timestamp = st.timestamp.wrapping_add(st.last_delta);
+                    (true, st.msg_length)
+                }
+            }
         };
-        Ok((csid, fmt))
-    }
 
-    fn read_u24_be(&mut self) -> Result<u32> {
-        let mut b = [0u8; 3];
-        self.read_exact_counted(&mut b)?;
-        Ok(((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32))
-    }
+        self.pos += total;
+        self.received_bytes = self.received_bytes.wrapping_add(total as u32);
 
-    fn read_u32_le_stream_id(&mut self) -> Result<u32> {
-        let mut b = [0u8; 4];
-        self.read_exact_counted(&mut b)?;
-        // msg_stream_id is explicitly little-endian — only field in
-        // the RTMP wire format that is.
-        Ok(u32::from_le_bytes(b))
-    }
-
-    fn read_fmt0_header(&mut self, csid: u32) -> Result<()> {
-        let mut ts = self.read_u24_be()?;
-        let len = self.read_u24_be()?;
-        let mut t = [0u8; 1];
-        self.read_exact_counted(&mut t)?;
-        let ty = t[0];
-        let stream_id = self.read_u32_le_stream_id()?;
-        let had_ext_ts = ts == 0x00FF_FFFF;
-        if had_ext_ts {
-            ts = self.read_u32_be()?;
-        }
-        let st = self.states.entry(csid).or_default();
-        // fmt 0 wipes any half-received message on this csid.
-        st.partial.clear();
-        st.msg_type_id = ty;
-        st.msg_stream_id = stream_id;
-        st.msg_length = len;
-        st.timestamp = ts;
-        st.last_delta = ts;
-        st.last_had_ext_ts = had_ext_ts;
-        Ok(())
-    }
-
-    fn read_fmt1_header(&mut self, csid: u32) -> Result<()> {
-        let mut delta = self.read_u24_be()?;
-        let len = self.read_u24_be()?;
-        let mut t = [0u8; 1];
-        self.read_exact_counted(&mut t)?;
-        let ty = t[0];
-        let had_ext_ts = delta == 0x00FF_FFFF;
-        if had_ext_ts {
-            delta = self.read_u32_be()?;
-        }
+        let max_message = self.max_message_size.min(self.max_in_flight_bytes);
         let st = self
             .states
-            .get_mut(&csid)
-            .ok_or_else(|| Error::InvalidChunk("fmt 1 without prior fmt 0".into()))?;
-        st.msg_type_id = ty;
-        st.msg_length = len;
-        st.timestamp = st.timestamp.wrapping_add(delta);
-        st.last_delta = delta;
-        st.last_had_ext_ts = had_ext_ts;
-        // fmt 1 also starts a new message.
-        st.partial.clear();
+            .get_mut(csid)
+            .expect("csid state present (set above)");
+        if starts_message {
+            // A fresh header supersedes any half-received message on
+            // this csid.
+            if st.assembling {
+                st.assembling = false;
+                self.in_flight_bytes -= st.msg_length as usize;
+            }
+            st.partial.clear();
+            st.msg_length = length;
+            let len = length as usize;
+            if len > max_message {
+                return Err(Error::InvalidChunk(format!(
+                    "message length {len} on csid {csid} exceeds the {max_message}-byte limit"
+                )));
+            }
+            if self.in_flight_bytes + len > self.max_in_flight_bytes {
+                return Err(Error::InvalidChunk(format!(
+                    "partially received messages would exceed the {}-byte reassembly budget",
+                    self.max_in_flight_bytes
+                )));
+            }
+            st.assembling = true;
+            self.in_flight_bytes += len;
+            // One exact allocation per message; bounded by the budget
+            // checked just above.
+            st.partial.reserve_exact(len);
+        }
+        let need = st.msg_length as usize - st.partial.len();
+        self.current = Some(CurrentChunk {
+            csid,
+            remaining: need.min(self.chunk_size),
+        });
         Ok(())
     }
 
-    fn read_fmt2_header(&mut self, csid: u32) -> Result<()> {
-        let mut delta = self.read_u24_be()?;
-        let had_ext_ts = delta == 0x00FF_FFFF;
-        if had_ext_ts {
-            delta = self.read_u32_be()?;
+    /// Move the current chunk's payload into its message. Returns the
+    /// message when this chunk completed it, `None` when the chunk is
+    /// done but the message needs more chunks.
+    fn pull_payload(&mut self) -> Result<Option<Message>> {
+        let Some(mut cur) = self.current else {
+            return Ok(None);
+        };
+        while cur.remaining > 0 {
+            if self.pos < self.end {
+                let n = cur.remaining.min(self.end - self.pos);
+                let st = self
+                    .states
+                    .get_mut(cur.csid)
+                    .expect("csid state present for the current chunk");
+                st.partial
+                    .extend_from_slice(&self.buf[self.pos..self.pos + n]);
+                self.pos += n;
+                cur.remaining -= n;
+                self.received_bytes = self.received_bytes.wrapping_add(n as u32);
+                self.current = Some(cur);
+            } else if cur.remaining >= READ_BUF_LEN {
+                // Large payload: read straight into the message buffer.
+                let st = self
+                    .states
+                    .get_mut(cur.csid)
+                    .expect("csid state present for the current chunk");
+                let before = st.partial.len();
+                let res = (&mut self.stream)
+                    .take(cur.remaining as u64)
+                    .read_to_end(&mut st.partial);
+                // `read_to_end` keeps whatever arrived before an error.
+                let got = st.partial.len() - before;
+                cur.remaining -= got;
+                self.received_bytes = self.received_bytes.wrapping_add(got as u32);
+                self.current = Some(cur);
+                res.map_err(Error::Io)?;
+                if cur.remaining > 0 {
+                    return Err(eof());
+                }
+            } else {
+                self.fill()?;
+            }
         }
+        self.current = None;
         let st = self
             .states
-            .get_mut(&csid)
-            .ok_or_else(|| Error::InvalidChunk("fmt 2 without prior fmt 0/1".into()))?;
-        st.timestamp = st.timestamp.wrapping_add(delta);
-        st.last_delta = delta;
-        st.last_had_ext_ts = had_ext_ts;
-        st.partial.clear();
-        Ok(())
-    }
-
-    fn read_fmt3_header(&mut self, csid: u32) -> Result<()> {
-        // fmt 3 reads no message header normally — but if the last
-        // message on this csid used an extended timestamp, the
-        // extended-timestamp field is repeated here too. This is the
-        // most common source of chunk-stream desync bugs in RTMP
-        // implementations.
-        let (had_ext_ts, partial_empty, last_delta) = {
-            let st = self
-                .states
-                .get(&csid)
-                .ok_or_else(|| Error::InvalidChunk("fmt 3 without prior fmt 0/1/2".into()))?;
-            (st.last_had_ext_ts, st.partial.is_empty(), st.last_delta)
-        };
-        if had_ext_ts {
-            let _dup = self.read_u32_be()?;
+            .get_mut(cur.csid)
+            .expect("csid state present for the current chunk");
+        if st.partial.len() >= st.msg_length as usize {
+            st.assembling = false;
+            self.in_flight_bytes -= st.msg_length as usize;
+            return Ok(Some(Message {
+                msg_type_id: st.msg_type_id,
+                msg_stream_id: st.msg_stream_id,
+                timestamp: st.timestamp,
+                payload: std::mem::take(&mut st.partial),
+            }));
         }
-        // If this is a continuation of a multi-chunk message (partial
-        // buffer non-empty), we keep appending; otherwise we start a
-        // new message with the same metadata as the previous one and
-        // extend the timestamp by the last recorded delta.
-        if partial_empty {
-            let st = self.states.get_mut(&csid).unwrap();
-            st.timestamp = st.timestamp.wrapping_add(last_delta);
-        }
-        Ok(())
-    }
-
-    fn read_u32_be(&mut self) -> Result<u32> {
-        let mut b = [0u8; 4];
-        self.read_exact_counted(&mut b)?;
-        Ok(u32::from_be_bytes(b))
+        Ok(None)
     }
 }
 
@@ -507,10 +728,23 @@ struct OutState {
     primed: bool,
 }
 
+/// The writer hands its staging buffer to the stream once this many
+/// bytes have accumulated, so one message costs one `write` per
+/// 64 KiB rather than several per chunk.
+const WRITE_STAGE_LEN: usize = 64 * 1024;
+
+/// Splits RTMP messages into chunks.
+///
+/// Every [`write_message`](Self::write_message) call hands the whole
+/// message to the underlying stream before it returns (in as few
+/// `write` calls as possible); nothing is held back between calls.
 pub struct ChunkWriter<W: Write> {
     stream: W,
     chunk_size: usize,
-    states: HashMap<u32, OutState>,
+    states: CsidTable<OutState>,
+    /// Staging buffer the chunk headers + payload slices are laid out
+    /// in before they are written.
+    stage: Vec<u8>,
 }
 
 impl<W: Write> ChunkWriter<W> {
@@ -518,7 +752,8 @@ impl<W: Write> ChunkWriter<W> {
         Self {
             stream,
             chunk_size: DEFAULT_CHUNK_SIZE,
-            states: HashMap::new(),
+            states: CsidTable::new(),
+            stage: Vec::new(),
         }
     }
 
@@ -549,44 +784,33 @@ impl<W: Write> ChunkWriter<W> {
     /// * same stream but different (type, length) → fmt 1;
     /// * anything else → fmt 0.
     pub fn write_message(&mut self, csid: u32, msg: &Message) -> Result<()> {
+        if !(2..=65_599).contains(&csid) {
+            return Err(Error::ProtocolViolation(format!(
+                "chunk stream id {csid} out of range"
+            )));
+        }
+        if msg.payload.len() > MAX_MESSAGE_LENGTH {
+            return Err(Error::ProtocolViolation(format!(
+                "message payload of {} bytes exceeds the 24-bit length field",
+                msg.payload.len()
+            )));
+        }
         let payload_len = msg.payload.len() as u32;
 
-        // Snapshot the state fields we need for the header decision
-        // and the continuation-chunk timestamp repeat. Dropping the
-        // borrow here lets us reach for `self.stream` / `self.chunk_size`
-        // below without NLL complaints.
-        let (prev_primed, prev_stream_id, prev_type_id, prev_length, prev_timestamp) = {
-            let st = self.states.entry(csid).or_default();
-            (
-                st.primed,
-                st.msg_stream_id,
-                st.msg_type_id,
-                st.msg_length,
-                st.timestamp,
-            )
-        };
-        // Query the sticky "most recent fmt-0/1/2 chunk used an
-        // extended timestamp" bit and the last registered delta — a
-        // fmt-3 head chunk implicitly reuses both (§5.3.1.2.4).
-        let (prev_last_had_ext_ts, prev_last_delta) = self
-            .states
-            .get(&csid)
-            .map(|s| (s.last_had_ext_ts, s.last_delta))
-            .unwrap_or((false, 0));
-
-        let delta = msg.timestamp.wrapping_sub(prev_timestamp);
+        let prev = self.states.entry(csid).clone();
+        let delta = msg.timestamp.wrapping_sub(prev.timestamp);
         // Pick the most compact fmt we can get away with.
-        let fmt = if !prev_primed
-            || prev_stream_id != msg.msg_stream_id
-            || msg.timestamp < prev_timestamp
+        let fmt = if !prev.primed
+            || prev.msg_stream_id != msg.msg_stream_id
+            || msg.timestamp < prev.timestamp
         {
             // First message on the csid, a different message stream, or
             // a timestamp that went backwards (rare, e.g. seek in the
             // source): re-prime with a full fmt 0 header.
             0
-        } else if prev_type_id != msg.msg_type_id || prev_length != payload_len {
+        } else if prev.msg_type_id != msg.msg_type_id || prev.msg_length != payload_len {
             1
-        } else if delta == prev_last_delta {
+        } else if delta == prev.last_delta {
             // §5.3.1.2.4: a fmt-3 head chunk takes *every* value from
             // the preceding chunk, including the timestamp delta — so
             // it is only valid when this message's delta equals the
@@ -605,7 +829,7 @@ impl<W: Write> ChunkWriter<W> {
         // and every continuation chunk of a message whose own head
         // chunk indicated ext.
         let fmt3_ext = if fmt == 3 {
-            prev_last_had_ext_ts
+            prev.last_had_ext_ts
         } else {
             ext_ts_needed
         };
@@ -615,15 +839,18 @@ impl<W: Write> ChunkWriter<W> {
         let ext_value = match fmt {
             0 => msg.timestamp,
             1 | 2 => delta,
-            _ => prev_last_delta,
+            _ => prev.last_delta,
         };
 
         let chunk_size = self.chunk_size;
+        let mut stage = std::mem::take(&mut self.stage);
+        stage.clear();
         let mut first_chunk_done = false;
         let mut cursor = 0usize;
+        let mut result = Ok(());
         while cursor < msg.payload.len() || !first_chunk_done {
             let chunk_fmt = if !first_chunk_done { fmt } else { 3 };
-            self.write_basic_header(chunk_fmt, csid)?;
+            push_basic_header(&mut stage, chunk_fmt, csid);
             match chunk_fmt {
                 0 => {
                     let ts_field = if ext_ts_needed {
@@ -631,34 +858,34 @@ impl<W: Write> ChunkWriter<W> {
                     } else {
                         msg.timestamp
                     };
-                    self.write_u24_be(ts_field)?;
-                    self.write_u24_be(payload_len)?;
-                    self.stream.write_all(&[msg.msg_type_id])?;
-                    self.stream.write_all(&msg.msg_stream_id.to_le_bytes())?;
+                    push_u24_be(&mut stage, ts_field);
+                    push_u24_be(&mut stage, payload_len);
+                    stage.push(msg.msg_type_id);
+                    stage.extend_from_slice(&msg.msg_stream_id.to_le_bytes());
                     if ext_ts_needed {
-                        self.stream.write_all(&msg.timestamp.to_be_bytes())?;
+                        stage.extend_from_slice(&msg.timestamp.to_be_bytes());
                     }
                 }
                 1 => {
                     let ts_field = if ext_ts_needed { 0x00FF_FFFF } else { delta };
-                    self.write_u24_be(ts_field)?;
-                    self.write_u24_be(payload_len)?;
-                    self.stream.write_all(&[msg.msg_type_id])?;
+                    push_u24_be(&mut stage, ts_field);
+                    push_u24_be(&mut stage, payload_len);
+                    stage.push(msg.msg_type_id);
                     if ext_ts_needed {
                         // §5.3.1.3: for a Type 1 chunk the field
                         // encodes the full 32-bit *delta*, not the
                         // absolute timestamp.
-                        self.stream.write_all(&ext_value.to_be_bytes())?;
+                        stage.extend_from_slice(&ext_value.to_be_bytes());
                     }
                 }
                 2 => {
                     let ts_field = if ext_ts_needed { 0x00FF_FFFF } else { delta };
-                    self.write_u24_be(ts_field)?;
+                    push_u24_be(&mut stage, ts_field);
                     if ext_ts_needed {
-                        self.stream.write_all(&ext_value.to_be_bytes())?;
+                        stage.extend_from_slice(&ext_value.to_be_bytes());
                     }
                 }
-                3 => {
+                _ => {
                     // §5.3.1.3: a Type 3 chunk (head or continuation)
                     // carries the extended-timestamp field when the
                     // most recent Type 0/1/2 chunk on the csid
@@ -669,19 +896,42 @@ impl<W: Write> ChunkWriter<W> {
                     // heads, so one flag covers every chunk of the
                     // message).
                     if fmt3_ext {
-                        self.stream.write_all(&ext_value.to_be_bytes())?;
+                        stage.extend_from_slice(&ext_value.to_be_bytes());
                     }
                 }
-                _ => unreachable!(),
             }
             let end = (cursor + chunk_size).min(msg.payload.len());
-            self.stream.write_all(&msg.payload[cursor..end])?;
+            let piece = &msg.payload[cursor..end];
+            if piece.len() >= WRITE_STAGE_LEN {
+                // A chunk this large gains nothing from staging: send
+                // the pending headers, then the payload slice itself.
+                result = self
+                    .stream
+                    .write_all(&stage)
+                    .and_then(|()| self.stream.write_all(piece));
+                stage.clear();
+            } else {
+                stage.extend_from_slice(piece);
+                if stage.len() >= WRITE_STAGE_LEN {
+                    result = self.stream.write_all(&stage);
+                    stage.clear();
+                }
+            }
+            if result.is_err() {
+                break;
+            }
             cursor = end;
             first_chunk_done = true;
         }
+        if result.is_ok() && !stage.is_empty() {
+            result = self.stream.write_all(&stage);
+        }
+        stage.clear();
+        self.stage = stage;
+        result?;
 
         // Commit the updated state.
-        let st = self.states.entry(csid).or_default();
+        let st = self.states.entry(csid);
         st.msg_type_id = msg.msg_type_id;
         st.msg_stream_id = msg.msg_stream_id;
         st.msg_length = payload_len;
@@ -695,35 +945,23 @@ impl<W: Write> ChunkWriter<W> {
         st.primed = true;
         Ok(())
     }
+}
 
-    fn write_basic_header(&mut self, fmt: u8, csid: u32) -> Result<()> {
-        match csid {
-            2..=63 => {
-                self.stream.write_all(&[(fmt << 6) | (csid as u8)])?;
-            }
-            64..=319 => {
-                self.stream.write_all(&[fmt << 6, (csid - 64) as u8])?;
-            }
-            320..=65_599 => {
-                let v = (csid - 64) as u16;
-                self.stream
-                    .write_all(&[(fmt << 6) | 1, (v & 0xFF) as u8, (v >> 8) as u8])?;
-            }
-            other => {
-                return Err(Error::ProtocolViolation(format!(
-                    "chunk stream id {other} out of range"
-                )));
-            }
+/// Append a chunk basic header (§5.3.1.1) for a csid already
+/// validated to lie in 2..=65599.
+fn push_basic_header(out: &mut Vec<u8>, fmt: u8, csid: u32) {
+    match csid {
+        2..=63 => out.push((fmt << 6) | (csid as u8)),
+        64..=319 => out.extend_from_slice(&[fmt << 6, (csid - 64) as u8]),
+        _ => {
+            let v = (csid - 64) as u16;
+            out.extend_from_slice(&[(fmt << 6) | 1, (v & 0xFF) as u8, (v >> 8) as u8]);
         }
-        Ok(())
     }
+}
 
-    fn write_u24_be(&mut self, v: u32) -> Result<()> {
-        let v = v & 0x00FF_FFFF;
-        self.stream
-            .write_all(&[(v >> 16) as u8, (v >> 8) as u8, v as u8])?;
-        Ok(())
-    }
+fn push_u24_be(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&[(v >> 16) as u8, (v >> 8) as u8, v as u8]);
 }
 
 #[cfg(test)]
@@ -1169,5 +1407,223 @@ mod tests {
         assert_eq!(second.msg_type_id, 9);
         assert_eq!(second.timestamp, 10);
         assert_eq!(second.payload.len(), 200);
+    }
+
+    /// A reader whose source hands out one byte per call and reports
+    /// a read timeout before every byte — the worst case a socket
+    /// with a short read timeout can produce.
+    struct Stutter {
+        data: Vec<u8>,
+        pos: usize,
+        ready: bool,
+    }
+
+    impl Read for Stutter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos == self.data.len() {
+                return Ok(0);
+            }
+            if !self.ready {
+                self.ready = true;
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            self.ready = false;
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    /// A read timeout anywhere — inside a basic header, a message
+    /// header, an extended timestamp or a payload — loses nothing:
+    /// retrying `read_message` resumes where the failed call stopped.
+    #[test]
+    fn read_timeouts_are_resumable_at_every_byte() {
+        // 128: every payload goes through the receive buffer; 65 536:
+        // the large message takes the direct-to-message read path.
+        for chunk_size in [128usize, 65_536] {
+            let mut wire = Vec::new();
+            let sent = vec![
+                (3u32, msg(20, 0, 5, 40)),
+                (70, msg(9, 1, 0x0100_0000, 300)),
+                (400, msg(8, 1, 0x0100_0010, 0)),
+                (70, msg(9, 1, 0x0200_0000, 300)),
+                (5, msg(9, 1, 77, 17_000)),
+            ];
+            {
+                let mut w = ChunkWriter::new(&mut wire);
+                w.set_chunk_size(chunk_size);
+                for (csid, m) in &sent {
+                    w.write_message(*csid, m).unwrap();
+                }
+            }
+            let wire_len = wire.len();
+            let mut r = ChunkReader::new(Stutter {
+                data: wire,
+                pos: 0,
+                ready: false,
+            });
+            r.set_chunk_size(chunk_size);
+            let mut got = Vec::new();
+            let mut timeouts = 0usize;
+            while got.len() < sent.len() {
+                match r.read_message() {
+                    Ok(m) => got.push(m),
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        timeouts += 1
+                    }
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+            assert_eq!(timeouts, wire_len, "one timeout per wire byte");
+            for ((_, want), have) in sent.iter().zip(&got) {
+                assert_eq!(have.msg_type_id, want.msg_type_id);
+                assert_eq!(have.msg_stream_id, want.msg_stream_id);
+                assert_eq!(have.timestamp, want.timestamp);
+                assert_eq!(have.payload, want.payload);
+            }
+            assert_eq!(r.received_bytes() as usize, wire_len);
+            assert!(r.is_idle());
+        }
+    }
+
+    /// `is_idle` is true exactly on message boundaries.
+    #[test]
+    fn idle_only_between_messages() {
+        let mut wire = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut wire);
+            w.write_message(5, &msg(9, 1, 0, 300)).unwrap();
+        }
+        // Cut inside the second chunk: EOF arrives mid-message.
+        let cut = &wire[..wire.len() - 10];
+        let mut r = ChunkReader::new(Cursor::new(cut));
+        assert!(r.is_idle());
+        assert!(r.read_message().is_err());
+        assert!(
+            !r.is_idle(),
+            "a truncated message leaves the reader mid-flight"
+        );
+        // The whole message: idle again afterwards, and the EOF that
+        // follows is a clean boundary.
+        let mut r = ChunkReader::new(Cursor::new(&wire));
+        r.read_message().unwrap();
+        assert!(r.is_idle());
+        assert!(r.read_message().is_err());
+        assert!(r.is_idle());
+    }
+
+    /// A declared length above the configured ceiling is refused from
+    /// the 12 header bytes alone — before any payload is buffered.
+    #[test]
+    fn oversize_message_length_is_refused_from_the_header() {
+        // fmt 0, csid 3, ts 0, length 0xFFFFFF, type 9, stream 1.
+        let header = [3u8, 0, 0, 0, 0xFF, 0xFF, 0xFF, 9, 1, 0, 0, 0];
+        let mut r = ChunkReader::new(Cursor::new(&header[..]));
+        r.set_max_message_size(1 << 20);
+        assert_eq!(r.max_message_size(), 1 << 20);
+        assert!(matches!(r.read_message(), Err(Error::InvalidChunk(_))));
+        // At the default ceiling the same header is acceptable and the
+        // reader simply waits for payload (EOF here).
+        let mut r = ChunkReader::new(Cursor::new(&header[..]));
+        assert!(matches!(r.read_message(), Err(Error::Io(_))));
+    }
+
+    /// Messages started on many chunk streams and never finished
+    /// cannot pin more than the in-flight budget.
+    #[test]
+    fn in_flight_budget_bounds_unfinished_messages() {
+        // Each csid: fmt-0 header declaring 60 000 bytes, then one
+        // 128-byte chunk of it.
+        let mut wire = Vec::new();
+        for csid in 3u8..40 {
+            wire.extend_from_slice(&[csid, 0, 0, 0, 0x00, 0xEA, 0x60, 9, 1, 0, 0, 0]);
+            wire.extend_from_slice(&[0x5A; 128]);
+        }
+        // An unrelated short message at the end.
+        wire.extend_from_slice(&[2, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 16, 0]);
+        // Generous budget: every partial is held, the short message
+        // still comes through.
+        let mut r = ChunkReader::new(Cursor::new(&wire));
+        let m = r.read_message().unwrap();
+        assert_eq!((m.msg_type_id, m.payload.len()), (1, 4));
+        // 256 KiB budget: the fifth 60 000-byte message crosses it.
+        let mut r = ChunkReader::new(Cursor::new(&wire));
+        r.set_max_in_flight_bytes(256 * 1024);
+        assert_eq!(r.max_in_flight_bytes(), 256 * 1024);
+        match r.read_message() {
+            Err(Error::InvalidChunk(m)) => assert!(m.contains("reassembly budget"), "{m}"),
+            other => panic!("expected the budget error, got {other:?}"),
+        }
+    }
+
+    /// Finishing, superseding or aborting a message returns its bytes
+    /// to the budget.
+    #[test]
+    fn in_flight_budget_is_released() {
+        let mut wire = Vec::new();
+        for round in 0..50u8 {
+            // Start a 60 000-byte message on csid 3 (first chunk only)…
+            wire.extend_from_slice(&[3, 0, 0, 0, 0x00, 0xEA, 0x60, 9, 1, 0, 0, 0]);
+            wire.extend_from_slice(&[round; 128]);
+            // …and supersede it with a complete 4-byte one.
+            wire.extend_from_slice(&[3, 0, 0, 0, 0, 0, 4, 9, 1, 0, 0, 0, 1, 2, 3, round]);
+        }
+        let mut r = ChunkReader::new(Cursor::new(&wire));
+        r.set_max_in_flight_bytes(64 * 1024);
+        for round in 0..50u8 {
+            let m = r.read_message().unwrap();
+            assert_eq!(m.payload, vec![1, 2, 3, round]);
+        }
+        assert!(r.is_idle());
+    }
+
+    /// The writer refuses what the wire cannot express instead of
+    /// emitting a corrupt header.
+    #[test]
+    fn writer_rejects_unrepresentable_messages() {
+        let mut out = Vec::new();
+        let mut w = ChunkWriter::new(&mut out);
+        for csid in [0u32, 1, 65_600, u32::MAX] {
+            assert!(matches!(
+                w.write_message(csid, &msg(9, 1, 0, 4)),
+                Err(Error::ProtocolViolation(_))
+            ));
+        }
+        let huge = Message {
+            msg_type_id: 9,
+            msg_stream_id: 1,
+            timestamp: 0,
+            payload: vec![0; MAX_MESSAGE_LENGTH + 1],
+        };
+        assert!(matches!(
+            w.write_message(5, &huge),
+            Err(Error::ProtocolViolation(_))
+        ));
+        assert!(out.is_empty(), "nothing reaches the wire on a refusal");
+    }
+
+    /// Two- and three-byte basic headers at the edges of their ranges
+    /// (§5.3.1.1: ids 64–319 and 64–65599).
+    #[test]
+    fn extended_csid_forms_roundtrip() {
+        let ids = [2u32, 63, 64, 65, 319, 320, 321, 1000, 65_598, 65_599];
+        let mut wire = Vec::new();
+        {
+            let mut w = ChunkWriter::new(&mut wire);
+            w.set_chunk_size(50);
+            for (i, csid) in ids.iter().enumerate() {
+                w.write_message(*csid, &msg(9, 1, i as u32 * 10, 120))
+                    .unwrap();
+            }
+        }
+        let mut r = ChunkReader::new(Cursor::new(&wire));
+        r.set_chunk_size(50);
+        for i in 0..ids.len() {
+            let m = r.read_message().unwrap();
+            assert_eq!(m.timestamp, i as u32 * 10);
+            assert_eq!(m.payload.len(), 120);
+        }
+        assert!(r.is_idle());
     }
 }
