@@ -778,6 +778,32 @@ impl RtmpClient {
         Ok(())
     }
 
+    /// Change the chunk size used for everything this side sends from
+    /// now on (RTMP 1.0 §5.4.1 Set Chunk Size): the peer is told
+    /// first, then the writer switches. Larger chunks mean fewer chunk
+    /// headers per message; a chunk can never usefully exceed the
+    /// 16 777 215-byte message limit, so that is the upper bound.
+    /// Each direction keeps its own chunk size — this does not affect
+    /// what the peer sends.
+    pub fn set_chunk_size(&mut self, size: u32) -> Result<()> {
+        if size == 0 || size as usize > crate::chunk::MAX_CHUNK_SIZE {
+            return Err(Error::ProtocolViolation(format!(
+                "chunk size {size} outside 1..={}",
+                crate::chunk::MAX_CHUNK_SIZE
+            )));
+        }
+        self.writer
+            .write_message(CSID_PROTOCOL_CONTROL, &build_set_chunk_size(size))?;
+        self.writer.set_chunk_size(size as usize);
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// The chunk size this side currently sends with.
+    pub fn chunk_size(&self) -> usize {
+        self.writer.chunk_size()
+    }
+
     /// Send a `UserControl PingRequest` (RTMP 1.0 §3.7, UCM type 6)
     /// carrying the supplied 4-byte timestamp.
     ///

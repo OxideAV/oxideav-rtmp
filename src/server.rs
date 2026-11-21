@@ -717,6 +717,24 @@ impl PlaySession {
         Ok(())
     }
 
+    /// Send several messages to the subscriber as one Aggregate
+    /// Message (RTMP 1.0 Commands-Messages §3.6 / §7.1.6, type 22):
+    /// one chunk-stream message carrying FLV-shaped sub-messages, so a
+    /// burst of audio / video / data frames costs one message header
+    /// and — with a large chunk size — very few chunk headers. Every
+    /// sub-message is restamped onto this play stream's id; the
+    /// aggregate carries the first sub-message's timestamp. An empty
+    /// slice is a no-op.
+    pub fn send_aggregate(&mut self, subs: &[Message]) -> Result<()> {
+        if subs.is_empty() {
+            return Ok(());
+        }
+        let agg = crate::aggregate::build_aggregate(self.stream_id, subs)?;
+        self.writer.write_message(CSID_DATA, &agg)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Relay one publisher-side [`StreamPacket`] to this subscriber —
     /// the core of an RTMP fan-out: `Audio` / `Video` re-frame on this
     /// session's stream id at the packet's original timestamp,
@@ -813,6 +831,32 @@ impl PlaySession {
         )?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    /// Change the chunk size used for everything this side sends from
+    /// now on (RTMP 1.0 §5.4.1 Set Chunk Size): the peer is told
+    /// first, then the writer switches. Larger chunks mean fewer chunk
+    /// headers per message; a chunk can never usefully exceed the
+    /// 16 777 215-byte message limit, so that is the upper bound.
+    /// Each direction keeps its own chunk size — this does not affect
+    /// what the peer sends.
+    pub fn set_chunk_size(&mut self, size: u32) -> Result<()> {
+        if size == 0 || size as usize > crate::chunk::MAX_CHUNK_SIZE {
+            return Err(Error::ProtocolViolation(format!(
+                "chunk size {size} outside 1..={}",
+                crate::chunk::MAX_CHUNK_SIZE
+            )));
+        }
+        self.writer
+            .write_message(CSID_PROTOCOL_CONTROL, &build_set_chunk_size(size))?;
+        self.writer.set_chunk_size(size as usize);
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// The chunk size this side currently sends with.
+    pub fn chunk_size(&self) -> usize {
+        self.writer.chunk_size()
     }
 
     /// Emit a `UserControl PingRequest(timestamp_ms)` (§3.7 UCM 6) to

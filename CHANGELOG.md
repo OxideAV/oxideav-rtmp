@@ -55,6 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `relay` module — `LateJoinCache` + `KeyframeGate`: what a relay must
+  replay to a subscriber that joins a live stream part-way through
+  (stored data frames, every track's current decoder configuration —
+  legacy AVC / AAC sequence headers, Enhanced RTMP `SequenceStart`,
+  `MultichannelConfig`, the latest `colorInfo` metadata frame — and,
+  optionally, the group of pictures since the last key frame within a
+  byte budget), plus the per-subscriber gate that holds live coded
+  frames back until the first video key frame.
+- `RtmpClient::set_chunk_size` / `PlaySession::set_chunk_size` (and
+  `chunk_size()`): change the sending chunk size mid-stream (§5.4.1) —
+  the peer is told, then the writer switches.
+- `PlaySession::send_aggregate`: serve subscribers Aggregate Messages
+  (§7.1.6), the mirror of `RtmpClient::send_aggregate`.
 - `StreamEnd` + `end_reason()` on `RtmpSession`, `PlaySession`,
   `RtmpPlayer` and `RtmpClient`: once a packet pump has returned
   `Ok(None)` it tells a protocol-level end (`Signalled`) from an

@@ -84,6 +84,7 @@ mod hmac;
 pub mod message;
 mod netutil;
 pub mod player;
+pub mod relay;
 pub mod server;
 pub mod shared_object;
 
@@ -122,6 +123,7 @@ pub use message::{
     RECONNECT_REQUEST_CODE, SET_DATA_FRAME, UserControlEvent, parse_data_frame,
 };
 pub use player::{PlayOptions, PlayerPacket, RtmpPlayer};
+pub use relay::{KeyframeGate, LateJoinCache};
 pub use server::{
     DEFAULT_NEGOTIATION_TIMEOUT, PlayRequest, PlaySession, PlaySessionEvent, PublishRequest,
     RtmpServer, RtmpSession, SessionRequest, StreamPacket,
