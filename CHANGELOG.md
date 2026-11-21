@@ -53,6 +53,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2..=65599 and a payload above the 24-bit length field before writing
   anything (the length used to be truncated into a corrupt header).
 
+### Tests
+
+- `tests/interop_matrix.rs`: live black-box interop matrix against
+  `ffmpeg` on 127.0.0.1 (runtime-skipped when the tool is absent). 42
+  tool-generated streams — H.264 with and without B-frames, 10-bit,
+  4:4:4, multi-slice, intra-only, one-frame, odd sizes, 0.4 MB and
+  1.8 MB frames; AAC mono / stereo / 5.1; every legacy codec the tool
+  can write to FLV (Sorenson H.263, Screen Video 1 / 2, MP3, PCM,
+  G.711, Nellymoser, ADPCM); Enhanced RTMP HEVC / AV1 / VP9 / Opus /
+  FLAC / AC-3 / E-AC-3 including multichannel and Multitrack; streams
+  crossing and far beyond the 24-bit timestamp; a 5 170-message run —
+  each carried in eight directions (tool publishes to our server; our
+  play client pulls from the tool's server with either handshake; our
+  publish client pushes to the tool's server with either handshake and
+  with the chunk size changing every five messages; our server serves
+  the tool Aggregate Messages; tool → our relay → tool) and compared
+  packet-for-packet (bytes, timestamps, order) with the tool's own FLV
+  rendition: 334 of 334 cells pass. Three more live tests cover a
+  publisher killed mid-stream and a late join with and without the
+  group-of-pictures cache.
+
 ### Added
 
 - `relay` module — `LateJoinCache` + `KeyframeGate`: what a relay must
