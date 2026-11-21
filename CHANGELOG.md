@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-rtmp/compare/v0.0.7...v0.0.8) - 2026-11-21
+
+### Other
+
+- session harness skips an iteration when the loopback is out of ports
+- only coded frames travel unflagged; packet-source interop test
+- state the TLS limitation as it is; interop test header lists all eight directions
+- owned tag parsers reuse the message buffer; README interop + performance sections
+- refuse nested aggregates; cap stored data frames and cached configurations
+- seven targets + daily workflow; RtmpServer::negotiate
+- bound reference expansion and bridging; never emit unrepresentable property names
+- live black-box interop matrix (42 streams x 8 directions, 334/334)
+- late-join cache + key-frame gate; mid-stream Set Chunk Size; play-side aggregates
+- honour Abort, answer PingRequest, negotiation deadline, end reasons
+- buffered reader + staged writer, resumable read timeouts, in-flight budget
+- API hygiene: #[non_exhaustive] on growable enums and records
+- edition 2024, MSRV 1.95
+
 ### Performance
 
 - Chunk stream: `ChunkReader` reads through an internal 16 KiB receive
