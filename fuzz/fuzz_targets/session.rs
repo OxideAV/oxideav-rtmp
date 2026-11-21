@@ -67,7 +67,9 @@ fn chunked(msgs: &[(u32, Message)]) -> Vec<u8> {
 /// The fuzz input acts as a client of this crate's server.
 fn as_client(prefix: &[u8], body: &[u8]) {
     let env = env();
-    let addr = env.listener.local_addr().expect("addr");
+    let Ok(addr) = env.listener.local_addr() else {
+        return;
+    };
     let Ok(mut client) = TcpStream::connect(addr) else {
         return;
     };
@@ -126,8 +128,15 @@ fn as_client(prefix: &[u8], body: &[u8]) {
 /// The fuzz input acts as a server; `run` drives one of this crate's
 /// clients against it.
 fn as_server(prefix: Vec<u8>, body: &[u8], run: impl FnOnce(&str)) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
+    // Thousands of short-lived loopback connections a second can
+    // leave the machine briefly out of ephemeral ports; that is the
+    // harness's problem, not a finding — skip the iteration.
+    let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+        return;
+    };
+    let Ok(addr) = listener.local_addr() else {
+        return;
+    };
     let mut script = vec![3u8];
     script.resize(1 + 2 * 1536, 0);
     script.extend_from_slice(&prefix);
