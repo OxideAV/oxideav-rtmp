@@ -41,6 +41,13 @@ timestamps, order) with the tool's own FLV rendition of the stream.
   group-of-pictures cache (the tool's recording is the exact tail of
   the stream from a key frame and decodes without errors).
 
+The pipeline entry point is covered too
+(`tests/interop_packet_source.rs`): the tool publishes five codec pairs
+(H.264 + AAC, HEVC + Opus, AV1 + FLAC, Sorenson H.263 + MP3, VP9 +
+AC-3) into the `rtmp://` listen source, which must name the codecs
+from the stream alone and hand out every coded frame exactly once on a
+monotonic decode timeline.
+
 What the outside peer could **not** verify, because it never produces
 or accepts it — covered by this crate's own loopback tests only:
 

@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from any command or data message. Reference expansion is now
   budgeted (`MAX_REFERENCE_EXPANSION`, 16 MiB per decode context) and
   the nesting cap applies to resolved values.
+- `PacketSource` adapters: an Enhanced RTMP `MultichannelConfig`
+  audio packet (the channel-layout record a publisher sends next to
+  the sequence header) was handed out as an ordinary frame, so a
+  decoder downstream received it as coded audio; likewise video
+  seek-command frames, the Enhanced `SequenceEnd` / MPEG-2 TS sequence
+  start and the legacy AVC end-of-sequence marker. All of them are now
+  header-flagged — only coded frames travel unflagged. Found by
+  publishing the black-box tool's Opus stream into the `rtmp://`
+  source (`tests/interop_packet_source.rs`: five codec pairs, codecs
+  detected from the stream, every coded frame delivered once on a
+  monotonic decode timeline).
 - An Aggregate Message nested inside an Aggregate Message was
   unpacked level by level, re-copying the remaining body each time — a
   16 MiB message of 15-byte nesting steps cost quadratic work. The

@@ -822,13 +822,12 @@ fn audio_to_packet_at(
     let (data, is_header) = if tag.audio_fourcc.is_some() {
         // Enhanced RTMP v2: body is the codec's data verbatim
         // (per `ExAudioTagBody`). No AAC marker — that's a legacy
-        // discriminator. SequenceStart is the header signal; the
-        // SequenceEnd variant gets `header = true` too so the
-        // downstream can recognise a flush boundary.
-        let header = matches!(
-            tag.ex_packet_type,
-            Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_START) | Some(flv::AUDIO_PACKET_TYPE_SEQUENCE_END)
-        );
+        // discriminator. Only `CodedFrames` carries codec data for
+        // the decoder: SequenceStart (the configuration record),
+        // SequenceEnd (a flush boundary), MultichannelConfig (the
+        // channel layout) and any reserved type are header-flagged so
+        // a consumer never feeds them to a decoder as a frame.
+        let header = tag.ex_packet_type != Some(flv::AUDIO_PACKET_TYPE_CODED_FRAMES);
         (tag.body.clone(), header)
     } else {
         let mut data = Vec::with_capacity(tag.body.len() + 1);
@@ -920,9 +919,24 @@ fn video_to_packet_at(
     // decoder. Per spec, FrameType bits are ignored when this
     // is set, so suppress the keyframe flag too.
     let is_metadata = tag.is_ex_metadata();
+    // Everything that is not coded picture data is header-flagged as
+    // well, so a consumer never feeds it to a decoder as a frame:
+    // seek-command frames (a single command byte), the Enhanced
+    // SequenceEnd / MPEG-2 TS sequence start, and the legacy AVC
+    // end-of-sequence marker.
+    let is_coded = !tag.is_command()
+        && match tag.ex_packet_type {
+            Some(t) => {
+                t == flv::EX_PACKET_TYPE_CODED_FRAMES || t == flv::EX_PACKET_TYPE_CODED_FRAMES_X
+            }
+            None => {
+                tag.codec_id != VIDEO_CODEC_AVC
+                    || tag.avc_packet_type == Some(flv::AVC_PACKET_TYPE_NALU)
+            }
+        };
     let flags = oxideav_core::packet::PacketFlags {
         keyframe: !is_metadata && tag.is_keyframe(),
-        header: is_header || is_metadata,
+        header: is_header || is_metadata || !is_coded,
         ..Default::default()
     };
     Packet {
@@ -2228,5 +2242,76 @@ mod tests {
         assert!(err.to_string().contains("track 0"), "{err}");
         // No stream was registered for the failed message.
         assert!(streams.is_empty());
+    }
+
+    /// Only `CodedFrames` is frame data: a MultichannelConfig (the
+    /// channel-layout record sent next to the sequence header) or a
+    /// SequenceEnd must never reach a decoder as a frame.
+    #[test]
+    fn ex_audio_non_coded_packet_types_are_header_flagged() {
+        let tag = |packet_type: u8| {
+            AudioTag::default()
+                .with_sound_format(flv::AUDIO_FORMAT_EX_HEADER)
+                .with_ex_packet_type(Some(packet_type))
+                .with_audio_fourcc(Some(*b"Opus"))
+                .with_body(vec![1, 2, 3])
+        };
+        let header = |packet_type: u8| audio_to_packet(0, &tag(packet_type)).flags.header;
+        assert!(header(flv::AUDIO_PACKET_TYPE_SEQUENCE_START));
+        assert!(header(flv::AUDIO_PACKET_TYPE_SEQUENCE_END));
+        assert!(header(flv::AUDIO_PACKET_TYPE_MULTICHANNEL_CONFIG));
+        assert!(!header(flv::AUDIO_PACKET_TYPE_CODED_FRAMES));
+    }
+
+    /// Seek-command frames, the Enhanced SequenceEnd and the legacy
+    /// AVC end-of-sequence marker are not pictures.
+    #[test]
+    fn video_non_coded_packets_are_header_flagged() {
+        let legacy = |frame_type: u8, avc_packet_type: u8| {
+            VideoTag::default()
+                .with_frame_type(frame_type)
+                .with_codec_id(VIDEO_CODEC_AVC)
+                .with_avc_packet_type(Some(avc_packet_type))
+                .with_body(vec![9])
+        };
+        assert!(
+            !video_to_packet(0, &legacy(1, flv::AVC_PACKET_TYPE_NALU))
+                .flags
+                .header
+        );
+        assert!(
+            video_to_packet(0, &legacy(1, flv::AVC_PACKET_TYPE_END_OF_SEQUENCE))
+                .flags
+                .header
+        );
+        let command = VideoTag::command_tag(VIDEO_CODEC_AVC, flv::VIDEO_COMMAND_START_SEEK);
+        assert!(video_to_packet(0, &command).flags.header);
+        let ex = |packet_type: u8| {
+            VideoTag::default()
+                .with_frame_type(1)
+                .with_ex_packet_type(Some(packet_type))
+                .with_fourcc(Some(*b"hvc1"))
+                .with_body(vec![9])
+        };
+        assert!(
+            !video_to_packet(0, &ex(flv::EX_PACKET_TYPE_CODED_FRAMES))
+                .flags
+                .header
+        );
+        assert!(
+            !video_to_packet(0, &ex(flv::EX_PACKET_TYPE_CODED_FRAMES_X))
+                .flags
+                .header
+        );
+        assert!(
+            video_to_packet(0, &ex(flv::EX_PACKET_TYPE_SEQUENCE_END))
+                .flags
+                .header
+        );
+        assert!(
+            video_to_packet(0, &ex(flv::EX_PACKET_TYPE_MPEG2TS_SEQUENCE_START))
+                .flags
+                .header
+        );
     }
 }
