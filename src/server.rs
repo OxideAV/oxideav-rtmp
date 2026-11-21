@@ -145,6 +145,24 @@ impl RtmpServer {
         }
     }
 
+    /// Run the handshake and negotiation on a connection the caller
+    /// accepted itself — for applications that own the accept loop
+    /// (their own listener, connection limits, per-address policy) —
+    /// and return the peer's request. Unlike
+    /// [`accept_any`](Self::accept_any), which logs a failed
+    /// negotiation and moves on to the next connection, the error is
+    /// returned to the caller. This server's capability block and
+    /// negotiation deadline apply.
+    pub fn negotiate(&self, stream: TcpStream) -> Result<SessionRequest> {
+        let peer_addr = stream.peer_addr()?;
+        drive_until_request(
+            stream,
+            peer_addr,
+            &self.capabilities,
+            self.negotiation_timeout,
+        )
+    }
+
     /// Accept one connection and drive it until the peer announces its
     /// direction: `publish` (it wants to send us a stream) or `play`
     /// (it wants to receive one). Returns the matching request so the

@@ -1,0 +1,80 @@
+[package]
+name = "oxideav-rtmp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-rtmp]
+path = ".."
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# Chunk-stream reassembly: arbitrary bytes through `ChunkReader` under
+# small memory budgets (with Set Chunk Size / Abort applied the way a
+# session applies them), plus a writer → reader round trip of
+# fuzzer-shaped messages across chunk sizes and chunk stream ids.
+[[bin]]
+name = "chunk_stream"
+path = "fuzz_targets/chunk_stream.rs"
+test = false
+doc = false
+
+# Both handshake directions and both flavours over arbitrary peer
+# bytes, and the digest helpers over arbitrary 1536-byte packets.
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+
+# AMF0 decode, and decode → encode → decode stability.
+[[bin]]
+name = "amf0"
+path = "fuzz_targets/amf0.rs"
+test = false
+doc = false
+
+# AMF3 decode (plain, data-message and format-selector framings), and
+# decode → encode → decode stability.
+[[bin]]
+name = "amf3"
+path = "fuzz_targets/amf3.rs"
+test = false
+doc = false
+
+# Message-body decoders: commands, data frames, user control, shared
+# objects, aggregates, capability blocks, typed metadata views.
+[[bin]]
+name = "command_decode"
+path = "fuzz_targets/command_decode.rs"
+test = false
+doc = false
+
+# FLV tag bodies (legacy + Enhanced RTMP) with parse → build → parse
+# stability, the encryption envelope, and the FLV file reader.
+[[bin]]
+name = "flv_tags"
+path = "fuzz_targets/flv_tags.rs"
+test = false
+doc = false
+
+# Whole-session state machine over a real loopback socket: handshake,
+# negotiation and the publish / play packet pumps fed arbitrary chunk
+# streams.
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
