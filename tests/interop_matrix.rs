@@ -2,13 +2,17 @@
 //!
 //! Each fixture is an FLV stream produced by the black-box tool
 //! (executable name in `common::TOOL`), then carried over a real
-//! loopback RTMP connection in
-//! four directions:
+//! loopback RTMP connection in eight directions:
 //!
 //! * `ingest` — the tool publishes to this crate's server;
-//! * `pull`   — this crate's play client pulls from the tool's server;
-//! * `push`   — this crate's publish client pushes to the tool's server;
-//! * `relay`  — the tool publishes to this crate's server, which fans
+//! * `pull/simple`, `pull/digest` — this crate's play client pulls
+//!   from the tool's server, offering either handshake;
+//! * `push/simple`, `push/digest`, `push/chunk-sizes` — this crate's
+//!   publish client pushes to the tool's server, offering either
+//!   handshake, or changing its chunk size every five messages;
+//! * `serve/aggregate` — this crate's server serves the tool's play
+//!   client Aggregate Messages;
+//! * `relay` — the tool publishes to this crate's server, which fans
 //!   the stream out to the tool playing from the same server.
 //!
 //! The received elementary streams are compared packet-for-packet

@@ -63,8 +63,10 @@
 //!
 //! Out of scope for this release:
 //!
-//! * RTMPS (TLS). Consumers who need it can wrap our `Read + Write`
-//!   with rustls. We may add an `rtmps` feature later.
+//! * RTMPS (TLS). The session types own a `TcpStream`; only the
+//!   lower layers ([`handshake`], [`chunk`], [`message`], [`amf`]) are
+//!   generic over `Read` / `Write` and usable over a caller-supplied
+//!   TLS stream.
 //! * RTMFP and RTMP Encrypted (the RC4/DH transport cipher that the
 //!   digest handshake's key block feeds).
 

@@ -237,8 +237,11 @@ client.close()?;
 
 ## Scope
 
-- **Transport.** RTMP (`rtmp://`, plain TCP port 1935). No RTMPS yet —
-  wrap our `Read + Write` with rustls if you need it.
+- **Transport.** RTMP (`rtmp://`, plain TCP port 1935). No RTMPS: the
+  four session types own a `TcpStream`, so TLS cannot be slipped
+  underneath them today. Only the lower layers — `handshake`, `chunk`,
+  `message`, `amf` — are generic over `Read` / `Write` and can be
+  driven over a caller-supplied TLS stream.
 - **Direction.** Both. Publish: the server accepts incoming
   publishers (`RtmpSession`) and the client pushes to remote servers
   (`RtmpClient`). Play (RTMP 1.0 §4.2.1): the server serves
